@@ -32,7 +32,7 @@ jobs:
           rm -rf www
           mkdir -p www
           if [ -f "package.json" ] && [ -d "src" ]; then
-            npm install
+            npm install --legacy-peer-deps
             npm run build
             cp -r dist/* www/
             rm -f www/window-calc.html www/measure-calc.html
@@ -71,7 +71,7 @@ jobs:
             }
           }
           EOF
-          npm install --no-save @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/filesystem@7 @capacitor/share@7
+          npm install --no-save --legacy-peer-deps @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 @capacitor/filesystem@7 @capacitor/share@7
           rm -rf android
           npx cap add android
           mkdir -p android/app/src/main/java/com/measurecalc/app

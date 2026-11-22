@@ -1966,12 +1966,14 @@ body.is-dragging {
   margin-bottom: 8px;
   flex-wrap: wrap;
 }
-.rrow label {
+.rrow label,
+.rrow .rfld {
   flex: 1 1 130px;
   min-width: 0;
   display: block;
 }
-.rrow label > span:first-child {
+.rrow label > span:first-child,
+.rrow .rfld > span:first-child {
   display: block;
   font-size: 13px;
   color: var(--mut);

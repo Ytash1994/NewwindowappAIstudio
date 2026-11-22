@@ -31,119 +31,138 @@ export const SIG_NAME = 'يوسف القرعان " أبو فارس "';
 export const SIG_PHONE = "+962795467235";
 
 export const BASE_FIELDS: [string, string, string][] = [
-  ["A", "", "عمود"],
-  ["B", "الحصيرة", "ارتفاع"],
-  ["C", "الحصيرة", "عرض"],
-  ["D", "صندوق", "اباجور"],
-  ["E", "صندوق", "طول"],
-  ["F", "صندوق", "عرض"],
-  ["G", "زجاج", "طول"],
-  ["H", "زجاج", "عرض"],
+  ["M", "حلق", "طول"],
+  ["N", "حلق", "عرض"],
+  ["L", "", "زرفيل سكين"],
+  ["K", "", "أرضية درفة"],
   ["I", "منخل", "طول"],
   ["J", "منخل", "عرض"],
-  ["K", "", "راسية ظرفة (أرضية ظرفة)"],
-  ["L", "", "سكين أو زرفيل"],
-  ["M", "", "جنب الحلق"],
-  ["N", "", "راسية حلق (أرضية حلق)"],
-  ["AW", "", "مساحة الشباك"],
-  ["AB", "الحصيرة", "مساحة الحصيرة"],
-  ["AE", "صندوق", "مساحة الصندوق"],
+  ["G", "زجاج", "طول"],
+  ["H", "زجاج", "عرض"],
   ["AG", "زجاج", "مساحة الزجاج"],
-  ["AI", "منخل", "مساحة المنخل"],
+  ["FF", "", "F"],
+  ["D", "", "U"],
+  ["E", "صندوق", "طول"],
+  ["F", "صندوق", "عرض"],
+  ["A", "", "عامود"],
+  ["KL", "كشفة", "طول"],
+  ["KW", "كشفة", "عرض"],
+  ["B", "حصيرة", "طول"],
+  ["C", "حصيرة", "عرض"],
+  ["AW", "", "مساحة الشباك"],
 ];
 
-export const AREA_KEYS = new Set(["AW", "AB", "AE", "AG", "AI"]);
+export const AREA_KEYS = new Set(["AW", "AG"]);
 
-export const BASE_REL: Record<string, [string, number, number | null, string?, string?]> = {
-  N: ["WID", 1, -1.6],
-  K: ["N", 0.5, 0],
+export type RelTuple = [string, number, number | null, string?, string?, number?, number?];
+
+export const BASE_REL: Record<string, RelTuple> = {
   M: ["LEN", 1, null],
-  L: ["M", 1, -4.8],
-  F: ["N", 1, 0.6],
-  A: ["F", 1, -9],
-  B: ["LEN", 1, -30],
-  C: ["WID", 1, -10],
-  D: ["M", 1, 7],
-  G: ["L", 1, -9.2],
-  H: ["K", 1, -5.7],
-  I: ["L", 1, 0.7],
-  J: ["K", 1, 2],
-  AW: ["LEN", 1, 0, "WID", "*"],
-  AB: ["B", 1, 0, "C", "*"],
-  AE: ["E", 1, 0, "F", "*"],
+  N: ["WID", 1, -2.6],
+  L: ["M", 1, -7.8],
+  K: ["WID", 0.5, 1],
+  I: ["L", 1, 0],
+  J: ["K", 1, 0],
+  G: ["L", 1, -9.3],
+  H: ["K", 1, -7.8],
   AG: ["G", 1, 0, "H", "*"],
-  AI: ["I", 1, 0, "J", "*"],
+  FF: ["M", 1, -5.5],
+  D: ["M", 1, 6.5],
+  F: ["WID", 1, 0],
+  A: ["WID", 1, -9.5],
+  KL: ["LEN", 1, 9.2],
+  KW: ["WID", 1, 9.2],
+  B: ["M", 1, 10],
+  C: ["WID", 1, -11.5],
+  AW: ["LEN", 1, 0, "WID", "*", 10, 10],
 };
 
+export const BASE_DIV: Record<string, number> = { K: 2 };
+
 export const BASE_ORDER = [
-  "N",
-  "K",
   "M",
+  "N",
   "L",
-  "F",
-  "A",
-  "B",
-  "C",
-  "D",
-  "G",
-  "H",
+  "K",
   "I",
   "J",
+  "G",
+  "H",
+  "FF",
+  "D",
   "E",
-  "AW",
-  "AB",
-  "AE",
+  "F",
+  "A",
+  "KL",
+  "KW",
+  "B",
+  "C",
   "AG",
-  "AI",
+  "AW",
 ];
 
 export interface TypeDef {
   mAdd: number;
   eConst: number | null;
   fields: string[];
+  rel?: Record<string, RelTuple>;
 }
 
 export const BUILTIN_TYPE_NAMES = [
-  "شبابيك دبل مجريين ونص",
-  "واجهات سحاب بدون اباجور",
-  "واجهات سحاب سنجل + اباجور",
+  "شباك 3 مجاري نظامي",
+  "شباك 2.5 نظامي",
+  "واجهات 2.5 بدون صندوق",
+  "شباك 3 مجاري بدون صندوق",
 ];
 
-export const DEF_TYPE_DEFS: Record<string, { mAdd: number; eConst: number | null; fields: string[] }> = {
-  "شبابيك دبل مجريين ونص": {
+export const DEF_TYPE_DEFS: Record<string, TypeDef> = {
+  "شباك 3 مجاري نظامي": {
     mAdd: -29.5,
-    eConst: null,
-    fields: ["A", "B", "C", "D", "F", "G", "H", "I", "J", "K", "L", "M", "N", "AW", "AB", "AG", "AI"],
+    eConst: 29.5,
+    fields: ["M", "N", "L", "K", "I", "J", "G", "H", "AG", "FF", "D", "E", "F", "A", "KL", "KW", "B", "C", "AW"],
   },
-  "واجهات سحاب بدون اباجور": {
+  "شباك 2.5 نظامي": {
+    mAdd: -29.5,
+    eConst: 29.5,
+    fields: ["M", "N", "L", "K", "I", "J", "G", "H", "AG", "D", "E", "F", "A", "KL", "KW", "B", "C", "AW"],
+    rel: {
+      L: ["M", 1, -7.5],
+      K: ["N", 0.5, -0.1],
+      H: ["K", 1, -5.8],
+    },
+  },
+  "واجهات 2.5 بدون صندوق": {
     mAdd: 0,
     eConst: null,
-    fields: ["G", "H", "I", "J", "K", "L", "M", "N", "AW", "AG", "AI"],
+    fields: ["M", "N", "L", "K", "I", "J", "G", "H", "AG", "FF", "KL", "KW", "AW"],
   },
-  "واجهات سحاب سنجل + اباجور": {
-    mAdd: -35,
-    eConst: 35,
-    fields: ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "AW", "AB", "AE", "AG", "AI"],
+  "شباك 3 مجاري بدون صندوق": {
+    mAdd: 0,
+    eConst: null,
+    fields: ["M", "N", "L", "K", "I", "J", "G", "H", "AG", "FF", "AW"],
   },
 };
 
-export const TYPE_SUBS: Record<string, { sub: string; iconKey: "a" | "b" | "c" | "d" }> = {
-  "شبابيك دبل مجريين ونص": { sub: "شباك مجريين ونص", iconKey: "a" },
-  "واجهات سحاب بدون اباجور": { sub: "سحاب بدون صندوق اباجور", iconKey: "b" },
-  "واجهات سحاب سنجل + اباجور": { sub: "سحاب سنجل مع صندوق اباجور", iconKey: "c" },
+export const TYPE_SUBS: Record<string, { sub: string; iconKey: "a" | "b" | "c" | "d" | "e" }> = {
+  "شباك 3 مجاري نظامي": { sub: "مع صندوق وكشفة وحصيرة", iconKey: "a" },
+  "شباك 2.5 نظامي": { sub: "مع صندوق وملحقات (بدون F)", iconKey: "c" },
+  "واجهات 2.5 بدون صندوق": { sub: "جنب الحلق = الطول + كشفة", iconKey: "b" },
+  "شباك 3 مجاري بدون صندوق": { sub: "جنب الحلق = الطول (بدون ملحقات)", iconKey: "d" },
 };
 
 export const BASE_HUE: Record<string, number> = {
-  A: 270,
-  الحصيرة: 210,
-  صندوق: 130,
-  زجاج: 188,
-  منخل: 32,
-  K: 320,
+  حلق: 48,
   L: 0,
-  M: 58,
-  N: 245,
-  AW: 198,
+  K: 305,
+  منخل: 28,
+  زجاج: 188,
+  FF: 240,
+  D: 145,
+  صندوق: 95,
+  A: 275,
+  كشفة: 212,
+  حصيرة: 342,
+  AW: 170,
 };
 
 export const CHUE = [165, 15, 295, 95, 345, 200];
@@ -169,8 +188,8 @@ export const TPL: [string, Partial<RelConfig>][] = [
   ["العرض + رقم", { s: "WID", s2: "", m: "1", dv: false, neg: false, a: "10", op: "+" }],
   ["الطول ÷ 2", { s: "LEN", s2: "", m: "2", dv: true, neg: false, a: "0", op: "+" }],
   ["العرض ÷ 2", { s: "WID", s2: "", m: "2", dv: true, neg: false, a: "0", op: "+" }],
-  ["الطول × العرض", { s: "LEN", s2: "WID", m: "1", dv: false, neg: false, a: "0", op: "*" }],
-  ["الطول + العرض", { s: "LEN", s2: "WID", m: "1", dv: false, neg: false, a: "0", op: "+" }],
+  ["الطول × العرض", { s: "LEN", s2: "WID", m: "1", dv: false, neg: false, a: "0", op: "*", n1: false, a1: "0", n2: false, a2: "0" }],
+  ["الطول + العرض", { s: "LEN", s2: "WID", m: "1", dv: false, neg: false, a: "0", op: "+", n1: false, a1: "0", n2: false, a2: "0" }],
 ];
 
 export const r6 = (x: number) => Math.round(x * 1e6) / 1e6;
@@ -179,7 +198,7 @@ export const isCid = (id: string) => /^c\d+$/.test(id);
 export const isCu = (id: string) => isCid(id) || String(id).startsWith("cg:");
 export const GN = (id: string) =>
   String(id).startsWith("cg:") ? String(id).split(":").slice(2).join(":") : id;
-export const BUILTIN_GROUPS = new Set(["الحصيرة", "صندوق", "زجاج", "منخل"]);
+export const BUILTIN_GROUPS = new Set(["حلق", "منخل", "زجاج", "صندوق", "كشفة", "حصيرة"]);
 export const cUnit = (typeName: string, c: CustomField) =>
   c.group ? (BUILTIN_GROUPS.has(c.group) ? c.group : `cg:${typeName}:${c.group}`) : c.id;
 
@@ -270,7 +289,6 @@ export function validLayout(o: unknown): LayoutConfig | null {
 }
 
 export function isFieldSelected(k: string, sel: Record<string, boolean>): boolean {
-  if (AREA_KEYS.has(k)) return sel[k] === true;
   return sel[k] !== false;
 }
 
@@ -298,14 +316,14 @@ export function createDefaultState(): AppState {
 
 export interface RuntimeCatalog {
   ORDER: string[];
-  REL: Record<string, [string, number, number | null, string?, string?, number?, number?]>;
+  REL: Record<string, RelTuple>;
   TYPES: Record<string, TypeDef>;
   LABEL: Record<string, string>;
   SUB: Record<string, string>;
   HUE: Record<string, number>;
   DIV: Record<string, number>;
   TN: string[];
-  TINFO: Record<string, { sub: string; iconKey: "a" | "b" | "c" | "d" }>;
+  TINFO: Record<string, { sub: string; iconKey: "a" | "b" | "c" | "d" | "e" }>;
 }
 
 const sgv = (n?: boolean, v?: string) => {
@@ -315,10 +333,18 @@ const sgv = (n?: boolean, v?: string) => {
 
 export function createRuntimeCatalog(state: AppState): RuntimeCatalog {
   const ORDER = BASE_ORDER.slice();
-  const REL: Record<string, [string, number, number | null, string?, string?, number?, number?]> = {};
+  const REL: Record<string, RelTuple> = {};
   Object.keys(BASE_REL).forEach((k) => {
-    REL[k] = BASE_REL[k].slice() as [string, number, number | null, string?, string?, number?, number?];
+    REL[k] = BASE_REL[k].slice() as RelTuple;
   });
+
+  // Apply built-in per-type formula differences before user overrides
+  const typeRelDefs = DEF_TYPE_DEFS[state.type]?.rel;
+  if (typeRelDefs) {
+    Object.keys(typeRelDefs).forEach((k) => {
+      REL[k] = typeRelDefs[k].slice() as RelTuple;
+    });
+  }
 
   const TYPES: Record<string, TypeDef> = {};
   Object.keys(DEF_TYPE_DEFS).forEach((n) => {
@@ -326,6 +352,7 @@ export function createRuntimeCatalog(state: AppState): RuntimeCatalog {
       mAdd: DEF_TYPE_DEFS[n].mAdd,
       eConst: DEF_TYPE_DEFS[n].eConst,
       fields: DEF_TYPE_DEFS[n].fields.slice(),
+      rel: DEF_TYPE_DEFS[n].rel,
     };
   });
 
@@ -338,8 +365,8 @@ export function createRuntimeCatalog(state: AppState): RuntimeCatalog {
   });
 
   const HUE: Record<string, number> = { ...BASE_HUE };
-  const DIV: Record<string, number> = {};
-  const TINFO: Record<string, { sub: string; iconKey: "a" | "b" | "c" | "d" }> = { ...TYPE_SUBS };
+  const DIV: Record<string, number> = { ...BASE_DIV };
+  const TINFO: Record<string, { sub: string; iconKey: "a" | "b" | "c" | "d" | "e" }> = { ...TYPE_SUBS };
 
   const custList = (n?: string) => (state.custom && state.custom[n || state.type]) || [];
 
@@ -349,7 +376,7 @@ export function createRuntimeCatalog(state: AppState): RuntimeCatalog {
     }
     TINFO[u.name] = {
       sub: `نوع أضفته أنت · ${custList(u.name).length} خانة`,
-      iconKey: "d",
+      iconKey: "e",
     };
   });
 
@@ -397,6 +424,7 @@ export function createRuntimeCatalog(state: AppState): RuntimeCatalog {
       let a = num(o.a);
       if (m === null || isNaN(m)) m = 1;
       if (a === null || isNaN(a)) a = 0;
+      delete DIV[k];
       if (o.dv && m !== 0) {
         DIV[k] = m;
         m = 1 / m;
@@ -631,20 +659,23 @@ export function defRel(type: string, k: string): RelConfig {
   if (k === "E") {
     return { s: "", m: "1", neg: false, a: String(DEF_TYPE_DEFS[type]?.eConst ?? 0) };
   }
-  const d = BASE_REL[k];
+  const d = DEF_TYPE_DEFS[type]?.rel?.[k] || BASE_REL[k];
   const aRaw = k === "M" ? DEF_TYPE_DEFS[type]?.mAdd ?? 0 : d[2] ?? 0;
+  const baseDiv = BASE_DIV[k];
+  const q1Raw = d[5] ?? 0;
+  const q2Raw = d[6] ?? 0;
   return {
     s: d[0],
-    m: String(d[1]),
+    m: baseDiv ? String(baseDiv) : String(d[1]),
     neg: aRaw < 0,
     a: String(Math.abs(aRaw)),
-    dv: false,
+    dv: Boolean(baseDiv),
     s2: d[3] || "",
     op: (d[4] as "+" | "-" | "*" | "/") || "+",
-    n1: false,
-    a1: "0",
-    n2: false,
-    a2: "0",
+    n1: q1Raw < 0,
+    a1: String(Math.abs(q1Raw)),
+    n2: q2Raw < 0,
+    a2: String(Math.abs(q2Raw)),
   };
 }
 
@@ -656,15 +687,20 @@ export function effRel(state: AppState, k: string): RelConfig {
 export function relSig(o: RelConfig): string {
   const m = num(o.m);
   const a = num(o.a);
+  const a1 = num(o.a1);
+  const a2 = num(o.a2);
   return [
     o.s,
     m === null || isNaN(m) ? 1 : m,
-    (o.neg ? -1 : 1) * Math.abs(a === null || isNaN(a) ? 0 : a),
+    o.neg ? 1 : 0,
+    Math.abs(a === null || isNaN(a) ? 0 : a),
     o.dv ? 1 : 0,
     o.s2 || "",
     o.s2 ? o.op || "+" : "",
-    o.s2 ? sgv(o.n1, o.a1) : 0,
-    o.s2 ? sgv(o.n2, o.a2) : 0,
+    o.s2 ? (o.n1 ? 1 : 0) : 0,
+    o.s2 ? Math.abs(a1 === null || isNaN(a1) ? 0 : a1) : 0,
+    o.s2 ? (o.n2 ? 1 : 0) : 0,
+    o.s2 ? Math.abs(a2 === null || isNaN(a2) ? 0 : a2) : 0,
   ].join("|");
 }
 

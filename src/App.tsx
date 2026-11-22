@@ -122,13 +122,15 @@ const SNAP_KEYS = [
   "cascade",
 ] as const;
 
-function TypeIcon({ iconKey }: { iconKey: "a" | "b" | "c" | "d" }) {
+function TypeIcon({ iconKey }: { iconKey: "a" | "b" | "c" | "d" | "e" }) {
   if (iconKey === "a") {
     return (
       <svg viewBox="0 0 64 64" fill="none" stroke="currentColor" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round">
-        <rect x="8" y="9" width="48" height="46" rx="3" />
-        <path d="M24 9v46M40 9v46" />
-        <path d="M13 32h6M29 32h6M45 32h6" />
+        <rect x="6" y="7" width="52" height="11" rx="2" />
+        <path d="M14 12.5h36" />
+        <rect x="6" y="18" width="52" height="39" rx="3" />
+        <path d="M23 18v39M41 18v39" />
+        <path d="M12 37h5M29 37h6M47 37h5" />
       </svg>
     );
   }
@@ -149,6 +151,15 @@ function TypeIcon({ iconKey }: { iconKey: "a" | "b" | "c" | "d" }) {
         <rect x="6" y="20" width="52" height="36" rx="3" />
         <path d="M32 20v36" />
         <path d="M16 40h8M40 40h8" />
+      </svg>
+    );
+  }
+  if (iconKey === "d") {
+    return (
+      <svg viewBox="0 0 64 64" fill="none" stroke="currentColor" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="6" y="12" width="52" height="40" rx="3" />
+        <path d="M23 12v40M41 12v40" />
+        <path d="M12 32h5M29 32h6M47 32h5" />
       </svg>
     );
   }
@@ -305,12 +316,14 @@ function ScaledDecimalInput({
   scaleFactor,
   placeholder,
   zeroAsEmpty = false,
+  unsigned = false,
   onCommitCm,
 }: {
   storedCm: string;
   scaleFactor: number;
   placeholder?: string;
   zeroAsEmpty?: boolean;
+  unsigned?: boolean;
   onCommitCm: (nextCm: string) => void;
 }) {
   const formatDisplay = useCallback(
@@ -360,7 +373,7 @@ function ScaledDecimalInput({
         const cleaned = ev.target.value
           .replace(/[٠-٩]/g, (d) => String(AR_DIGITS.indexOf(d)))
           .replace(/[٫،,]/g, ".")
-          .replace(/[^0-9.\-+]/g, "");
+          .replace(unsigned ? /[^0-9.]/g : /[^0-9.\-+]/g, "");
         setDraft(cleaned);
         if (cleaned === "" || cleaned === "." || cleaned === "-" || cleaned === "+") {
           const fallback = zeroAsEmpty ? "0" : "";
@@ -2425,19 +2438,20 @@ export default function App() {
 
     if (k === "E") {
       return (
-        <div className="redit">
+        <div className="redit" onPointerDown={(ev) => ev.stopPropagation()}>
           <div className="rrow">
-            <label>
+            <div className="rfld">
               <span>القيمة الثابتة</span>
               <ScaledDecimalInput
                 storedCm={e.a}
                 scaleFactor={UF[state.unit]}
+                unsigned
                 onCommitCm={(cmVal) => {
                   pushUndo3();
                   setRelPatch("E", { a: cmVal });
                 }}
               />
-            </label>
+            </div>
           </div>
           <div className="rprev">= {relParen(cat, state, "E")}</div>
           <button
@@ -2463,7 +2477,7 @@ export default function App() {
     const opts = srcOptions(k, state.type);
 
     return (
-      <div className="redit">
+      <div className="redit" onPointerDown={(ev) => ev.stopPropagation()}>
         {cu && cc && (
           <div className="rrow">
             <label>
@@ -2596,13 +2610,16 @@ export default function App() {
         </div>
 
         <div className="rrow">
-          <label>
+          <div className="rfld">
             <span>{e.dv ? "÷ اقسم على" : "× اضرب في"}</span>
             <span className="sgn">
               <button
                 type="button"
                 className="op"
-                onClick={() => {
+                aria-label="تبديل الضرب والقسمة"
+                onClick={(ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
                   pushUndo3(true);
                   setRelPatch(k, { dv: !e.dv });
                 }}
@@ -2618,14 +2635,17 @@ export default function App() {
                 }}
               />
             </span>
-          </label>
-          <label>
+          </div>
+          <div className="rfld">
             <span>ثم أضف أو انقص</span>
             <span className="sgn">
               <button
                 type="button"
                 className={e.neg ? "neg" : "pos"}
-                onClick={() => {
+                aria-label="تبديل الزائد والناقص"
+                onClick={(ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
                   pushUndo3(true);
                   setRelPatch(k, { neg: !e.neg });
                 }}
@@ -2635,24 +2655,28 @@ export default function App() {
               <ScaledDecimalInput
                 storedCm={e.a}
                 scaleFactor={scaleK}
+                unsigned
                 onCommitCm={(cmVal) => {
                   pushUndo3();
                   setRelPatch(k, { a: cmVal });
                 }}
               />
             </span>
-          </label>
+          </div>
         </div>
 
         {e.s2 && (
           <div className="rrow">
-            <label>
+            <div className="rfld">
               <span>تعديل «{e.s === "LEN" ? "الطول" : e.s === "WID" ? "العرض" : cat.LABEL[e.s]}» قبل العملية</span>
               <span className="sgn">
                 <button
                   type="button"
                   className={e.n1 ? "neg" : "pos"}
-                  onClick={() => {
+                  aria-label="تبديل إشارة تعديل الخانة الأولى"
+                  onClick={(ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
                     pushUndo3(true);
                     setRelPatch(k, { n1: !e.n1 });
                   }}
@@ -2664,20 +2688,24 @@ export default function App() {
                   scaleFactor={scaleS}
                   placeholder="0"
                   zeroAsEmpty
+                  unsigned
                   onCommitCm={(cmVal) => {
                     pushUndo3();
                     setRelPatch(k, { a1: cmVal });
                   }}
                 />
               </span>
-            </label>
-            <label>
+            </div>
+            <div className="rfld">
               <span>تعديل «{e.s2 === "LEN" ? "الطول" : e.s2 === "WID" ? "العرض" : cat.LABEL[e.s2]}» قبل العملية</span>
               <span className="sgn">
                 <button
                   type="button"
                   className={e.n2 ? "neg" : "pos"}
-                  onClick={() => {
+                  aria-label="تبديل إشارة تعديل الخانة الثانية"
+                  onClick={(ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
                     pushUndo3(true);
                     setRelPatch(k, { n2: !e.n2 });
                   }}
@@ -2689,13 +2717,14 @@ export default function App() {
                   scaleFactor={scaleS2}
                   placeholder="0"
                   zeroAsEmpty
+                  unsigned
                   onCommitCm={(cmVal) => {
                     pushUndo3();
                     setRelPatch(k, { a2: cmVal });
                   }}
                 />
               </span>
-            </label>
+            </div>
           </div>
         )}
 
@@ -3884,7 +3913,7 @@ export default function App() {
             </div>
 
             <p className="lead">
-              كل خانة تُحسب بعلاقة مكتوبة تحت اسمها. خانات <b>المساحة (📐)</b> مخفية افتراضياً ولا تظهر في النتائج أو التصدير إلا إذا حددتها هنا.
+              كل خانة تُحسب بعلاقة مكتوبة تحت اسمها. يمكنك إظهار أو إخفاء أي خانة أو إعادة ترتيبها أو تعديل معادلتها.
             </p>
 
             {sampleWin && (
@@ -5604,7 +5633,7 @@ export default function App() {
             <p className="wl">احسب كل مقاسات الشباك أو الواجهة من الطول والعرض فقط، في ثلاث خطوات:</p>
             <ol>
               <li>
-                <b>اختر النوع</b> (مثل شباك مجريين ونص).
+                <b>اختر النوع</b> (مثل شباك 3 مجاري نظامي أو شباك 2.5 نظامي).
               </li>
               <li>
                 <b>اكتب الطول والعرض</b> لكل شباك، واختر الوحدة (م / سم / مم). الطول = الارتفاع، والعرض = من جنب لجنب.
