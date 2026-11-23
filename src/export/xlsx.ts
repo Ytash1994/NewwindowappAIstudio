@@ -302,7 +302,7 @@ export function buildXlsx(info: XlsxExportInfo): Blob {
   });
 
   let c = 3;
-  const colMeta: { hue: number; single: boolean }[] = [];
+  const colMeta: { hue: number; single: boolean; subLen: number }[] = [];
   S.forEach((u) => {
     const hb = hslHex(u.hue, 70, 82);
     const bc = hslHex(u.hue, 50, 38);
@@ -319,7 +319,9 @@ export function buildXlsx(info: XlsxExportInfo): Blob {
       put(4, c, "", hs);
       merges.push(`${colName(c)}3:${colName(c)}4`);
     }
-    for (let i = 0; i < n; i++) colMeta.push({ hue: u.hue, single: !u.group });
+    for (let i = 0; i < n; i++) {
+      colMeta.push({ hue: u.hue, single: !u.group, subLen: u.group ? (u.subs[i] || "").length : (u.label || "").length });
+    }
     c += n;
   });
 
@@ -452,13 +454,23 @@ export function buildXlsx(info: XlsxExportInfo): Blob {
 
   let sd = "";
   for (let r = 1; r <= FR; r++) {
-    const ht = r === 1 ? 28 : r === 2 ? 20 : r <= 4 ? 26 : r === FR ? 26 : dupN && r >= DS && r < FR ? 24 : 20;
+    const ht = r === 1 ? 28 : r === 2 ? 20 : r === 3 ? 26 : r === 4 ? 32 : r === FR ? 26 : dupN && r >= DS && r < FR ? 24 : 20;
     sd += `<row r="${r}" ht="${ht}" customHeight="1">${(R[r] || []).join("")}</row>`;
   }
 
   const cols: string[] = [];
   for (let i = 0; i < ncols; i++) {
-    const w = i === 0 ? 8 : i < 3 ? 12 : colMeta[i - 3].single ? 17 : 11;
+    const meta = i >= 3 ? colMeta[i - 3] : null;
+    const w =
+      i === 0
+        ? 8
+        : i < 3
+          ? 12
+          : meta?.single
+            ? 17
+            : meta && meta.subLen > 10
+              ? 16
+              : 11;
     cols.push(`<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`);
   }
 

@@ -1097,8 +1097,8 @@ export default function App() {
     }
     if (/^[0-9]+$/.test(normDigits)) {
       const targetNum = parseInt(normDigits, 10);
-      if (targetNum < 1 || targetNum > 200) {
-        toast("اكتب رقماً بين 1 و200");
+      if (targetNum < 1 || targetNum > 300) {
+        toast("اكتب رقماً بين 1 و300");
         return;
       }
       if (targetNum === idx + 1) {
@@ -2635,6 +2635,11 @@ export default function App() {
                 }}
               />
             </span>
+            {e.dv && num(e.m) === 0 && (
+              <small style={{ display: "block", marginTop: 4, color: "var(--bad, #dc2626)", fontWeight: 700 }}>
+                ⚠️ لا يمكن القسمة على صفر — أدخل رقماً أكبر من 0
+              </small>
+            )}
           </div>
           <div className="rfld">
             <span>ثم أضف أو انقص</span>
@@ -5523,7 +5528,7 @@ export default function App() {
           <div className="wbox" onClick={(e) => e.stopPropagation()}>
             <h2>🔢 نقل أو تسمية شباك #{badgeModalIdx + 1}</h2>
             <p className="wl">
-              اكتب رقماً (1–200) لنقل الشباك إليه (يتبدّل مع الشباك الموجود فيه)، أو اكتب اسماً لتسميته (يظهر في عمود «الاسم» ويُبحث به):
+              اكتب رقماً (1–300) لنقل الشباك إليه (يتبدّل مع الشباك الموجود فيه)، أو اكتب اسماً لتسميته (يظهر في عمود «الاسم» ويُبحث به):
             </p>
             <input
               ref={badgeInputRef}
@@ -5561,7 +5566,7 @@ export default function App() {
                 }
                 if (/^[0-9]+$/.test(normDigits)) {
                   const N = parseInt(normDigits, 10);
-                  if (N < 1 || N > 200) return "⚠️ الرقم المسموح بين 1 و200";
+                  if (N < 1 || N > 300) return "⚠️ الرقم المسموح بين 1 و300";
                   if (N === badgeModalIdx + 1) return "الرقم الحالي للشباك — اكتب رقماً آخر لنقله أو اسماً لتسميته";
                   const targetRow = state.rows[N - 1];
                   const hasOther =

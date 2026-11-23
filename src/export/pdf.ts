@@ -389,9 +389,9 @@ export async function buildPdf(
   ].forEach(([t, w]) => cols.push({ w: w as number, t: t as string, pw: 0, l: 0, r: 0, cx: 0 }));
 
   info.struct.forEach((u) =>
-    u.subs.forEach(() =>
+    u.subs.forEach((sub) =>
       cols.push({
-        w: u.label === "العدد" && !u.group ? 0.78 : u.group ? 1 : 1.32,
+        w: u.label === "العدد" && !u.group ? 0.78 : u.group ? (sub.length > 10 ? 1.32 : 1) : 1.32,
         pw: 0,
         l: 0,
         r: 0,
@@ -416,7 +416,7 @@ export async function buildPdf(
 
   const TY = 98;
   const H1 = 23;
-  const H2 = 22;
+  const H2 = 26;
   const RH = 22;
   const TABLE_TOP = TY + H1 + H2;
   const rpp = Math.max(1, Math.floor((CONTENT_BOTTOM - TABLE_TOP) / RH));

@@ -83,6 +83,22 @@ export default defineConfig(() => {
                 return;
               }
             }
+            if (urlPath === '/architecture-diagram.jpg') {
+              const imgPath = path.resolve(__dirname, 'public/architecture-diagram.jpg');
+              if (fs.existsSync(imgPath)) {
+                res.statusCode = 200;
+                res.setHeader('Content-Type', 'image/jpeg');
+                res.setHeader('Cache-Control', 'no-cache');
+                if (query.includes('download=1')) {
+                  res.setHeader(
+                    'Content-Disposition',
+                    'attachment; filename="architecture-diagram.jpg"; filename*=UTF-8\'\'%D9%85%D8%AE%D8%B7%D8%B7_%D8%AA%D8%B7%D8%A8%D9%8A%D9%82_%D8%AD%D8%A7%D8%B3%D8%A8%D8%A9_%D8%A7%D9%84%D9%82%D9%8A%D8%A7%D8%B3%D8%A7%D8%AA.jpg'
+                  );
+                }
+                fs.createReadStream(imgPath).pipe(res);
+                return;
+              }
+            }
             next();
           });
         },
