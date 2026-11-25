@@ -55,6 +55,8 @@ import { AdminPanel } from "./saas/AdminPanel";
 import {
   DEFAULT_PLANS,
   DEFAULT_PLATFORM_CONFIG,
+  DEFAULT_WHATSAPP_PHONE,
+  buildWhatsAppActivationUrl,
   evaluateTenantAccess,
   isOwnerAdminEmail,
 } from "./saas/types";
@@ -70,11 +72,13 @@ import {
   renameCloudProject,
   saveCloudProject,
   subscribeAllActivationRequests,
+  subscribeAllTenants,
   subscribeMyActivationRequests,
   subscribePlans,
   subscribePlatformConfig,
   subscribeTenant,
   subscribeTenantProjects,
+  triggerExpiryAlertOnce,
 } from "./saas/service";
 import appIconUrl from "./assets/app-icon.png";
 import Splash from "./components/Splash";
@@ -485,6 +489,7 @@ export default function App() {
   const [platformConfig, setPlatformConfig] = useState<PlatformConfig>(DEFAULT_PLATFORM_CONFIG);
   const [myRequests, setMyRequests] = useState<ActivationRequestDoc[]>([]);
   const [adminPendingCount, setAdminPendingCount] = useState(0);
+  const [adminExpiringCount, setAdminExpiringCount] = useState(0);
   const [subModalOpen, setSubModalOpen] = useState(false);
   const [adminPanelOpen, setAdminPanelOpen] = useState(false);
   const [nowTick, setNowTick] = useState(() => Date.now());
@@ -671,6 +676,7 @@ export default function App() {
         setTenantLoaded(false);
         setMyRequests([]);
         setAdminPendingCount(0);
+        setAdminExpiringCount(0);
         setAdminPanelOpen(false);
         setSubModalOpen(false);
       }
@@ -687,6 +693,7 @@ export default function App() {
     let unsubPlans: (() => void) | null = null;
     let unsubReqs: (() => void) | null = null;
     let unsubAdminReqs: (() => void) | null = null;
+    let unsubAdminTenants: (() => void) | null = null;
 
     const pendingProfile = pendingSignupProfileRef.current;
     pendingSignupProfileRef.current = undefined;
@@ -717,6 +724,13 @@ export default function App() {
           unsubAdminReqs = subscribeAllActivationRequests((allReqs) => {
             if (active) setAdminPendingCount(allReqs.filter((r) => r.status === "pending").length);
           });
+          unsubAdminTenants = subscribeAllTenants((allTenants) => {
+            if (active) {
+              setAdminExpiringCount(
+                allTenants.filter((t) => evaluateTenantAccess(t).isExpiringSoon).length
+              );
+            }
+          });
         }
       })
       .catch((err) => {
@@ -732,8 +746,16 @@ export default function App() {
       unsubPlans?.();
       unsubReqs?.();
       unsubAdminReqs?.();
+      unsubAdminTenants?.();
     };
   }, [authUser]);
+
+  // Automatically record & dispatch expiry alert once per cycle when < 2 days remain (trial or paid)
+  useEffect(() => {
+    if (!authUser || !tenant || !tenantLoaded || isAdminUser) return;
+    if (!tenantAccess.isExpiringSoon) return;
+    void triggerExpiryAlertOnce(authUser, tenant, tenantAccess, platformConfig);
+  }, [authUser, tenant, tenantLoaded, isAdminUser, tenantAccess, platformConfig]);
 
   // Real-time cloud projects sync for active tenants
   useEffect(() => {
@@ -3826,7 +3848,11 @@ export default function App() {
                   >
                     <Shield className="ico-xs" aria-hidden="true" />
                     <span>لوحة الإدارة</span>
-                    {adminPendingCount > 0 && <span className="saas-badge-dot">{adminPendingCount}</span>}
+                    {adminPendingCount + adminExpiringCount > 0 && (
+                      <span className="saas-badge-dot">
+                        {adminPendingCount + adminExpiringCount}
+                      </span>
+                    )}
                   </button>
                 )}
                 <button
@@ -5253,6 +5279,52 @@ export default function App() {
         {/* ================= الخطوة 4: النتائج ================= */}
         {state.step === 4 && (
           <section className="step">
+            {!isAdminUser && tenant && tenantAccess.isExpiringSoon && (
+              <div className="saas-expiry-banner" role="alert">
+                <div className="saas-expiry-main">
+                  <AlertTriangle className="ico saas-expiry-ico" aria-hidden="true" />
+                  <div>
+                    <b>
+                      {tenantAccess.state === "trialing"
+                        ? `تنبيه: متبقي أقل من يومين على انتهاء الفترة التجريبية (${tenantAccess.remainingLabel})`
+                        : `تنبيه: متبقي أقل من يومين على انتهاء اشتراكك (${tenantAccess.remainingLabel})`}
+                    </b>
+                    <small>
+                      {tenantAccess.state === "trialing"
+                        ? "تواصل الآن لتفعيل حسابك عبر كليك (CliQ) قبل إغلاق الحساب تلقائياً. مشاريعك محفوظة بأمان."
+                        : "جدّد اشتراكك الآن عبر كليك (CliQ) لتفادي توقف الحساب بعد انتهاء المدة."}
+                    </small>
+                  </div>
+                </div>
+                <div className="saas-expiry-acts">
+                  <button
+                    type="button"
+                    className="btn sm p"
+                    onClick={() => setSubModalOpen(true)}
+                  >
+                    <CreditCard className="ico-xs" aria-hidden="true" />
+                    <span>{tenantAccess.state === "trialing" ? "تفعيل الاشتراك الآن" : "تجديد الاشتراك الآن"}</span>
+                  </button>
+                  <a
+                    href={buildWhatsAppActivationUrl(
+                      platformConfig.whatsappPhone || DEFAULT_WHATSAPP_PHONE,
+                      `السلام عليكم، متبقي أقل من يومين (${tenantAccess.remainingLabel}) على انتهاء ${
+                        tenantAccess.state === "trialing" ? "فترتي التجريبية" : "اشتراكي"
+                      } في حاسبة القياسات وأرغب بـ${
+                        tenantAccess.state === "trialing" ? "التفعيل" : "التجديد"
+                      } عبر كليك.\n• الورشة: ${tenant.workshopName || tenant.displayName}\n• البريد: ${tenant.email}`
+                    )}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="btn sm g"
+                  >
+                    <MessageSquare className="ico-xs" aria-hidden="true" />
+                    <span>واتساب ({platformConfig.whatsappPhone || DEFAULT_WHATSAPP_PHONE})</span>
+                  </a>
+                </div>
+              </div>
+            )}
+
             <div className="chip">
               <span>النوع:</span>
               <b>{state.type}</b>

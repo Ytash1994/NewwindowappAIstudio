@@ -34,6 +34,9 @@ import {
   DEFAULT_PLANS,
   DEFAULT_PLATFORM_CONFIG,
   DEFAULT_TRIAL_DAYS,
+  DEFAULT_WHATSAPP_PHONE,
+  OWNER_ADMIN_EMAIL,
+  buildExpiryReminderEmailContent,
   isOwnerAdminEmail,
   sanitizeStr,
   tsToMs,
@@ -42,8 +45,10 @@ import type {
   ActivationRequestDoc,
   AuditLogDoc,
   BillingCycle,
+  ExpiryAlertDoc,
   PlatformConfig,
   SubscriptionPlan,
+  TenantAccessEvaluation,
   TenantAccount,
 } from "./types";
 
@@ -708,6 +713,13 @@ export async function adminSavePlatformConfig(
   cfg: PlatformConfig
 ): Promise<void> {
   const path = "config/platform";
+  const cleanWebhook = sanitizeStr(cfg.expiryWebhookUrl || "", 300);
+  const safeWebhook =
+    cleanWebhook && /^https:\/\/[^\s]+$/i.test(cleanWebhook) ? cleanWebhook : "";
+  const cleanAdminEmail =
+    sanitizeStr(cfg.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax) ||
+    OWNER_ADMIN_EMAIL;
+
   try {
     await setDoc(doc(db, "config", "platform"), {
       whatsappPhone: sanitizeStr(cfg.whatsappPhone, BLUEPRINT_LIMITS.phoneMax) || DEFAULT_PLATFORM_CONFIG.whatsappPhone,
@@ -716,6 +728,8 @@ export async function adminSavePlatformConfig(
       cliqHolderName: sanitizeStr(cfg.cliqHolderName, 120),
       trialDaysDefault: Math.max(0, Math.min(90, Math.round(Number(cfg.trialDaysDefault) || 7))),
       supportNote: sanitizeStr(cfg.supportNote, BLUEPRINT_LIMITS.adminNoteMax),
+      adminAlertEmail: cleanAdminEmail,
+      expiryWebhookUrl: safeWebhook,
       updatedBy: adminUser.uid,
       updatedAt: serverTimestamp(),
     });
@@ -726,8 +740,209 @@ export async function adminSavePlatformConfig(
     adminUser,
     "update_platform_config",
     "platform",
-    `تحديث إعدادات كليك وواتساب (${cfg.whatsappPhone})`
+    `تحديث إعدادات كليك وواتساب وتنبيهات الإيميل (${cfg.whatsappPhone})`
   );
+}
+
+async function postExpiryWebhook(
+  webhookUrl: string,
+  payload: Record<string, unknown>
+): Promise<boolean> {
+  if (!webhookUrl || !/^https:\/\/[^\s]+$/i.test(webhookUrl)) return false;
+  try {
+    await fetch(webhookUrl, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function triggerExpiryAlertOnce(
+  user: User,
+  tenant: TenantAccount,
+  access: TenantAccessEvaluation,
+  config: PlatformConfig
+): Promise<void> {
+  if (!access.isExpiringSoon || !access.expiresAtMs) return;
+  if (access.state !== "trialing" && access.state !== "active") return;
+
+  const dayBucket = Math.floor(access.expiresAtMs / 86400000);
+  const alertId = `exp_${user.uid}_${dayBucket}`.replace(/[^a-zA-Z0-9_\-]/g, "").slice(0, 128);
+  const alertRef = doc(db, "expiry_alerts", alertId);
+  const path = `expiry_alerts/${alertId}`;
+
+  try {
+    const existingSnap = await getDoc(alertRef);
+    if (existingSnap.exists()) return;
+
+    const adminEmail =
+      sanitizeStr(config.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax) ||
+      OWNER_ADMIN_EMAIL;
+    const isTrial = access.state === "trialing";
+    const clampedHours = Math.max(0, Math.min(48, Math.round(access.hoursLeft)));
+
+    await setDoc(alertRef, {
+      tenantId: user.uid,
+      ownerUid: user.uid,
+      email: sanitizeStr(user.email || tenant.email, BLUEPRINT_LIMITS.emailMax),
+      workshopName: sanitizeStr(tenant.workshopName || tenant.displayName, BLUEPRINT_LIMITS.nameMax),
+      phone: sanitizeStr(tenant.phone || "", BLUEPRINT_LIMITS.phoneMax),
+      alertType: isTrial ? "trial_expiring" : "subscription_expiring",
+      expiresAt: Timestamp.fromMillis(access.expiresAtMs),
+      hoursLeft: clampedHours,
+      adminEmail,
+      emailStatus: "pending",
+      acknowledged: false,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    const webhookUrl = (config.expiryWebhookUrl || "").trim();
+    if (webhookUrl) {
+      const content = buildExpiryReminderEmailContent({
+        workshopName: tenant.workshopName || tenant.displayName || "ورشتي",
+        userEmail: tenant.email,
+        adminEmail,
+        phone: tenant.phone,
+        isTrial,
+        remainingLabel: access.remainingLabel,
+        expiresAtIso: new Date(access.expiresAtMs).toISOString().slice(0, 10),
+        whatsappPhone: config.whatsappPhone || DEFAULT_WHATSAPP_PHONE,
+      });
+      const sent = await postExpiryWebhook(webhookUrl, {
+        adminEmail,
+        userEmail: tenant.email,
+        workshopName: tenant.workshopName || tenant.displayName || "ورشتي",
+        phone: tenant.phone || "",
+        alertType: isTrial ? "trial_expiring" : "subscription_expiring",
+        hoursLeft: clampedHours,
+        remainingLabel: access.remainingLabel,
+        expiresAtIso: new Date(access.expiresAtMs).toISOString().slice(0, 10),
+        subject: content.subject,
+        userBody: content.userBody,
+        adminBody: content.adminBody,
+      });
+      await updateDoc(alertRef, {
+        emailStatus: sent ? "sent" : "failed",
+        hoursLeft: clampedHours,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    // Non-blocking background alert — log cleanly without crashing the calculator
+    try {
+      handleFirestoreError(err, OperationType.WRITE, path);
+    } catch {
+      // already logged
+    }
+  }
+}
+
+export function subscribeAllExpiryAlerts(
+  onData: (items: ExpiryAlertDoc[]) => void
+): () => void {
+  const path = "expiry_alerts";
+  return onSnapshot(
+    query(collection(db, "expiry_alerts")),
+    (snap) => {
+      const list = snap.docs
+        .map((d) => ({ id: d.id, ...(d.data() as Omit<ExpiryAlertDoc, "id">) }))
+        .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
+      onData(list);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, path);
+      } catch {
+        onData([]);
+      }
+    }
+  );
+}
+
+export async function adminDispatchExpiryEmail(
+  adminUser: User,
+  target: TenantAccount,
+  access: TenantAccessEvaluation,
+  config: PlatformConfig,
+  existingAlertId?: string
+): Promise<{ sentViaWebhook: boolean; mailtoUrl: string }> {
+  const adminEmail =
+    sanitizeStr(config.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax) ||
+    OWNER_ADMIN_EMAIL;
+  const isTrial = access.state === "trialing";
+  const expiresAtIso = access.expiresAtMs
+    ? new Date(access.expiresAtMs).toISOString().slice(0, 10)
+    : "قريباً";
+
+  const content = buildExpiryReminderEmailContent({
+    workshopName: target.workshopName || target.displayName || "ورشتي",
+    userEmail: target.email,
+    adminEmail,
+    phone: target.phone,
+    isTrial,
+    remainingLabel: access.remainingLabel,
+    expiresAtIso,
+    whatsappPhone: config.whatsappPhone || DEFAULT_WHATSAPP_PHONE,
+  });
+
+  const webhookUrl = (config.expiryWebhookUrl || "").trim();
+  const sentViaWebhook = webhookUrl
+    ? await postExpiryWebhook(webhookUrl, {
+        adminEmail,
+        userEmail: target.email,
+        workshopName: target.workshopName || target.displayName || "ورشتي",
+        phone: target.phone || "",
+        alertType: isTrial ? "trial_expiring" : "subscription_expiring",
+        hoursLeft: Math.max(0, Math.min(48, Math.round(access.hoursLeft))),
+        remainingLabel: access.remainingLabel,
+        expiresAtIso,
+        subject: content.subject,
+        userBody: content.userBody,
+        adminBody: content.adminBody,
+      })
+    : false;
+
+  if (existingAlertId) {
+    try {
+      await updateDoc(doc(db, "expiry_alerts", existingAlertId), {
+        emailStatus: sentViaWebhook ? "sent" : "manual",
+        acknowledged: true,
+        updatedAt: serverTimestamp(),
+      });
+    } catch {
+      // ignore if alert doc doesn't exist yet
+    }
+  }
+
+  await writeAuditLog(
+    adminUser,
+    "send_expiry_reminder_email",
+    target.ownerUid,
+    `إرسال تنبيه قرب الانتهاء إلى ${target.email} ونسخة إلى ${adminEmail} (${sentViaWebhook ? "تلقائي" : "بريد يدوي"})`
+  );
+
+  return { sentViaWebhook, mailtoUrl: content.mailtoUrl };
+}
+
+export async function adminAcknowledgeExpiryAlert(
+  adminUser: User,
+  alertId: string
+): Promise<void> {
+  const path = `expiry_alerts/${alertId}`;
+  try {
+    await updateDoc(doc(db, "expiry_alerts", alertId), {
+      acknowledged: true,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
+  }
 }
 
 export async function adminSendPasswordResetLink(

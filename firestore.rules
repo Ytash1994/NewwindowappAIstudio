@@ -86,7 +86,8 @@ service cloud.firestore {
         ]) &&
         data.keys().hasOnly([
           'whatsappPhone', 'cliqAlias', 'cliqBankName', 'cliqHolderName',
-          'trialDaysDefault', 'supportNote', 'updatedBy', 'updatedAt'
+          'trialDaysDefault', 'supportNote', 'adminAlertEmail', 'expiryWebhookUrl',
+          'updatedBy', 'updatedAt'
         ]) &&
         isValidString(data.whatsappPhone, 5, 30) &&
         isValidString(data.cliqAlias, 0, 100) &&
@@ -94,6 +95,8 @@ service cloud.firestore {
         isValidString(data.cliqHolderName, 0, 120) &&
         data.trialDaysDefault is int && data.trialDaysDefault >= 0 && data.trialDaysDefault <= 90 &&
         isValidString(data.supportNote, 0, 500) &&
+        (!('adminAlertEmail' in data) || isValidString(data.adminAlertEmail, 0, 200)) &&
+        (!('expiryWebhookUrl' in data) || isValidString(data.expiryWebhookUrl, 0, 300)) &&
         isValidId(data.updatedBy) &&
         data.updatedAt is timestamp;
     }
@@ -212,6 +215,33 @@ service cloud.firestore {
         data.createdAt is timestamp;
     }
 
+    function isValidExpiryAlert(data) {
+      return data.keys().hasAll([
+          'tenantId', 'ownerUid', 'email', 'workshopName', 'phone',
+          'alertType', 'expiresAt', 'hoursLeft', 'adminEmail',
+          'emailStatus', 'acknowledged', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'tenantId', 'ownerUid', 'email', 'workshopName', 'phone',
+          'alertType', 'expiresAt', 'hoursLeft', 'adminEmail',
+          'emailStatus', 'acknowledged', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.tenantId) &&
+        isValidId(data.ownerUid) &&
+        data.tenantId == data.ownerUid &&
+        isValidString(data.email, 3, 200) &&
+        isValidString(data.workshopName, 0, 120) &&
+        isValidString(data.phone, 0, 30) &&
+        data.alertType in ['trial_expiring', 'subscription_expiring'] &&
+        data.expiresAt is timestamp &&
+        data.hoursLeft is int && data.hoursLeft >= 0 && data.hoursLeft <= 48 &&
+        isValidString(data.adminEmail, 3, 200) &&
+        data.emailStatus in ['pending', 'sent', 'manual', 'failed'] &&
+        data.acknowledged is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     // ==================== CONNECTION PROBE ====================
     match /test/connection {
       allow get: if isSignedIn();
@@ -244,7 +274,8 @@ service cloud.firestore {
         incoming().updatedAt == request.time &&
         incoming().diff(existing()).affectedKeys().hasOnly([
           'whatsappPhone', 'cliqAlias', 'cliqBankName', 'cliqHolderName',
-          'trialDaysDefault', 'supportNote', 'updatedBy', 'updatedAt'
+          'trialDaysDefault', 'supportNote', 'adminAlertEmail', 'expiryWebhookUrl',
+          'updatedBy', 'updatedAt'
         ]) &&
         isAdmin();
       allow delete: if false;
@@ -437,6 +468,47 @@ service cloud.firestore {
         );
 
       allow delete: if isVerified() && isValidId(requestId) && isAdmin();
+    }
+
+    // ==================== EXPIRY ALERTS (< 2 DAYS) ====================
+    match /expiry_alerts/{alertId} {
+      allow get: if isAuthenticatedUser() && isValidId(alertId) &&
+        (resource.data.ownerUid == request.auth.uid || isAdmin());
+
+      allow list: if isAuthenticatedUser() && (
+        resource.data.ownerUid == request.auth.uid || isOwnerAdmin()
+      );
+
+      allow create: if isAuthenticatedUser() && isValidId(alertId) &&
+        isValidExpiryAlert(incoming()) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().tenantId == request.auth.uid &&
+        incoming().email == request.auth.token.email &&
+        incoming().acknowledged == false &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/tenants/$(request.auth.uid));
+
+      allow update: if isAuthenticatedUser() && isValidId(alertId) &&
+        isValidExpiryAlert(incoming()) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().tenantId == existing().tenantId &&
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['acknowledged', 'emailStatus', 'updatedAt'])
+          ) ||
+          (
+            existing().ownerUid == request.auth.uid &&
+            incoming().acknowledged == existing().acknowledged &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['emailStatus', 'hoursLeft', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isVerified() && isValidId(alertId) && isAdmin();
     }
 
     // ==================== IMMUTABLE AUDIT LOGS ====================

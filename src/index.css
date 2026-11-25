@@ -4345,4 +4345,68 @@ html[data-pal="flame"][data-theme] {
   filter: grayscale(0.28);
 }
 
+/* Results Page <2 Days Expiry Warning Banner */
+.saas-expiry-banner {
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--warn) 22%, var(--card)),
+    color-mix(in srgb, var(--bad) 14%, var(--card))
+  );
+  border: 2px solid color-mix(in srgb, var(--warn) 65%, transparent);
+  border-radius: 22px;
+  padding: 13px 15px;
+  margin-bottom: 14px;
+  box-shadow: var(--cl-shs);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.saas-expiry-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.saas-expiry-ico {
+  color: var(--warn);
+  flex: none;
+  margin-top: 2px;
+}
+.saas-expiry-main b {
+  display: block;
+  font-size: calc(15px * var(--fscale));
+  line-height: 1.45;
+  color: var(--tx);
+}
+.saas-expiry-main small {
+  display: block;
+  margin-top: 3px;
+  font-size: calc(13px * var(--fscale));
+  color: var(--mut);
+  line-height: 1.5;
+}
+.saas-expiry-acts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.saas-script-box {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.saas-script-box pre {
+  margin: 0;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--bg);
+  border: 1px solid var(--bd);
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+
+
 

@@ -17,6 +17,8 @@ export interface PlatformConfig {
   cliqHolderName: string;
   trialDaysDefault: number;
   supportNote: string;
+  adminAlertEmail?: string;
+  expiryWebhookUrl?: string;
   updatedBy: string;
   updatedAt?: Timestamp | null;
 }
@@ -89,6 +91,26 @@ export interface AuditLogDoc {
   createdAt: Timestamp | null;
 }
 
+export type ExpiryAlertType = "trial_expiring" | "subscription_expiring";
+export type ExpiryEmailStatus = "pending" | "sent" | "manual" | "failed";
+
+export interface ExpiryAlertDoc {
+  id: string;
+  tenantId: string;
+  ownerUid: string;
+  email: string;
+  workshopName: string;
+  phone: string;
+  alertType: ExpiryAlertType;
+  expiresAt: Timestamp | null;
+  hoursLeft: number;
+  adminEmail: string;
+  emailStatus: ExpiryEmailStatus;
+  acknowledged: boolean;
+  createdAt: Timestamp | null;
+  updatedAt: Timestamp | null;
+}
+
 export interface TenantAccessEvaluation {
   allowed: boolean;
   state: "owner_free" | "active" | "trialing" | "expired" | "suspended";
@@ -96,7 +118,12 @@ export interface TenantAccessEvaluation {
   hoursLeft: number;
   trialEndsAtMs: number | null;
   activeUntilMs: number | null;
+  expiresAtMs: number | null;
+  isExpiringSoon: boolean;
+  remainingLabel: string;
 }
+
+export const EXPIRY_WARNING_MS = 2 * 86400000; // Strictly less than 2 days (48 hours)
 
 export const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
   whatsappPhone: DEFAULT_WHATSAPP_PHONE,
@@ -105,6 +132,8 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
   cliqHolderName: "إدارة حاسبة القياسات",
   trialDaysDefault: DEFAULT_TRIAL_DAYS,
   supportNote: "بعد التحويل عبر كليك أرسل صورة الحوالة وبريد حسابك على الواتساب ليتم التفعيل فوراً.",
+  adminAlertEmail: OWNER_ADMIN_EMAIL,
+  expiryWebhookUrl: "",
   updatedBy: "system",
 };
 
@@ -192,6 +221,25 @@ export function tsToMs(ts?: Timestamp | null): number | null {
   return null;
 }
 
+export function formatRemainingArabic(diffMs: number): string {
+  if (diffMs <= 0) return "انتهت المدة";
+  const totalHours = Math.max(1, Math.ceil(diffMs / 3600000));
+  if (totalHours < 24) {
+    if (totalHours === 1) return "ساعة واحدة";
+    if (totalHours === 2) return "ساعتان";
+    if (totalHours <= 10) return `${totalHours} ساعات`;
+    return `${totalHours} ساعة`;
+  }
+  const days = Math.floor(totalHours / 24);
+  const remHours = totalHours % 24;
+  const dayWord = days === 1 ? "يوم" : days === 2 ? "يومان" : days <= 10 ? `${days} أيام` : `${days} يوم`;
+  if (remHours > 0) {
+    const hourWord = remHours === 1 ? "ساعة" : remHours === 2 ? "ساعتين" : remHours <= 10 ? `${remHours} ساعات` : `${remHours} ساعة`;
+    return `${dayWord} و ${hourWord}`;
+  }
+  return dayWord;
+}
+
 export function evaluateTenantAccess(
   tenant: TenantAccount | null,
   nowMs = Date.now()
@@ -204,6 +252,9 @@ export function evaluateTenantAccess(
       hoursLeft: 0,
       trialEndsAtMs: null,
       activeUntilMs: null,
+      expiresAtMs: null,
+      isExpiringSoon: false,
+      remainingLabel: "انتهت المدة",
     };
   }
 
@@ -215,17 +266,24 @@ export function evaluateTenantAccess(
       hoursLeft: 9999,
       trialEndsAtMs: null,
       activeUntilMs: null,
+      expiresAtMs: null,
+      isExpiringSoon: false,
+      remainingLabel: "دائم",
     };
   }
 
   if (tenant.subscriptionStatus === "suspended") {
+    const activeUntilMs = tsToMs(tenant.activeUntil);
     return {
       allowed: false,
       state: "suspended",
       daysLeft: 0,
       hoursLeft: 0,
       trialEndsAtMs: null,
-      activeUntilMs: tsToMs(tenant.activeUntil),
+      activeUntilMs,
+      expiresAtMs: activeUntilMs,
+      isExpiringSoon: false,
+      remainingLabel: "موقوف",
     };
   }
 
@@ -239,17 +297,25 @@ export function evaluateTenantAccess(
         hoursLeft: 9999,
         trialEndsAtMs: null,
         activeUntilMs: null,
+        expiresAtMs: null,
+        isExpiringSoon: false,
+        remainingLabel: "دائم",
       };
     }
     const diff = activeUntilMs - nowMs;
     if (diff > 0) {
+      const daysLeft = Math.max(1, Math.ceil(diff / 86400000));
+      const hoursLeft = Math.max(1, Math.ceil(diff / 3600000));
       return {
         allowed: true,
         state: "active",
-        daysLeft: Math.ceil(diff / 86400000),
-        hoursLeft: Math.ceil(diff / 3600000),
+        daysLeft,
+        hoursLeft,
         trialEndsAtMs: null,
         activeUntilMs,
+        expiresAtMs: activeUntilMs,
+        isExpiringSoon: diff < EXPIRY_WARNING_MS,
+        remainingLabel: formatRemainingArabic(diff),
       };
     }
     return {
@@ -259,6 +325,9 @@ export function evaluateTenantAccess(
       hoursLeft: 0,
       trialEndsAtMs: null,
       activeUntilMs,
+      expiresAtMs: activeUntilMs,
+      isExpiringSoon: false,
+      remainingLabel: "انتهت المدة",
     };
   }
 
@@ -266,14 +335,18 @@ export function evaluateTenantAccess(
     const trialDays = Math.max(0, Number(tenant.trialDays ?? DEFAULT_TRIAL_DAYS));
     const createdMs = tsToMs(tenant.createdAt);
     if (createdMs === null) {
-      // Newly created doc whose serverTimestamp is still resolving locally
+      const approxEnds = nowMs + trialDays * 86400000;
+      const approxDiff = trialDays * 86400000;
       return {
         allowed: trialDays > 0,
         state: trialDays > 0 ? "trialing" : "expired",
         daysLeft: trialDays,
         hoursLeft: trialDays * 24,
-        trialEndsAtMs: nowMs + trialDays * 86400000,
+        trialEndsAtMs: approxEnds,
         activeUntilMs: null,
+        expiresAtMs: approxEnds,
+        isExpiringSoon: trialDays > 0 && approxDiff < EXPIRY_WARNING_MS,
+        remainingLabel: formatRemainingArabic(approxDiff),
       };
     }
     const trialEndsAtMs = createdMs + trialDays * 86400000;
@@ -281,6 +354,7 @@ export function evaluateTenantAccess(
     if (diff > 0 && trialDays > 0) {
       const daysLeft = Math.min(trialDays, Math.max(1, Math.ceil(diff / 86400000)));
       const hoursLeft = Math.min(trialDays * 24, Math.max(1, Math.ceil(diff / 3600000)));
+      const clampedDiff = Math.min(diff, trialDays * 86400000);
       return {
         allowed: true,
         state: "trialing",
@@ -288,6 +362,9 @@ export function evaluateTenantAccess(
         hoursLeft,
         trialEndsAtMs,
         activeUntilMs: null,
+        expiresAtMs: trialEndsAtMs,
+        isExpiringSoon: clampedDiff < EXPIRY_WARNING_MS,
+        remainingLabel: formatRemainingArabic(clampedDiff),
       };
     }
     return {
@@ -297,16 +374,23 @@ export function evaluateTenantAccess(
       hoursLeft: 0,
       trialEndsAtMs,
       activeUntilMs: null,
+      expiresAtMs: trialEndsAtMs,
+      isExpiringSoon: false,
+      remainingLabel: "انتهت المدة",
     };
   }
 
+  const fallbackUntil = tsToMs(tenant.activeUntil);
   return {
     allowed: false,
     state: "expired",
     daysLeft: 0,
     hoursLeft: 0,
     trialEndsAtMs: null,
-    activeUntilMs: tsToMs(tenant.activeUntil),
+    activeUntilMs: fallbackUntil,
+    expiresAtMs: fallbackUntil,
+    isExpiringSoon: false,
+    remainingLabel: "انتهت المدة",
   };
 }
 
@@ -347,3 +431,61 @@ export function buildWhatsAppActivationUrl(
   const waNum = normalizeJordanWhatsApp(whatsappPhone);
   return `https://wa.me/${waNum}?text=${encodeURIComponent(message)}`;
 }
+
+export function buildExpiryReminderEmailContent(params: {
+  workshopName: string;
+  userEmail: string;
+  adminEmail: string;
+  phone?: string;
+  isTrial: boolean;
+  remainingLabel: string;
+  expiresAtIso: string;
+  whatsappPhone: string;
+}): {
+  subject: string;
+  userBody: string;
+  adminBody: string;
+  mailtoUrl: string;
+} {
+  const kind = params.isTrial ? "الفترة التجريبية" : "الاشتراك المدفوع";
+  const actionVerb = params.isTrial ? "التفعيل" : "التجديد";
+  const subject = `تنبيه: متبقي ${params.remainingLabel} على انتهاء ${kind} في حاسبة القياسات`;
+  const userBody = [
+    `مرحباً ${params.workshopName || "عميلنا العزيز"}،`,
+    "",
+    `نود تذكيرك بأنه متبقي أقل من يومين (${params.remainingLabel}) على انتهاء ${kind} لحسابك (${params.userEmail}) في حاسبة قياسات الشبابيك.`,
+    `تاريخ الانتهاء: ${params.expiresAtIso}`,
+    "",
+    `لتفادي توقف الحساب، يرجى التواصل الآن عبر واتساب (${params.whatsappPhone}) لإتمام ${actionVerb} عبر كليك (CliQ).`,
+    "ملاحظة: جميع مشاريعك وبياناتك محفوظة بأمان.",
+  ].join("\n");
+
+  const adminBody = [
+    `تنبيه للإدارة — حساب قارب على الانتهاء (أقل من يومين):`,
+    `• الورشة: ${params.workshopName || "—"}`,
+    `• بريد المستخدم: ${params.userEmail}`,
+    `• الهاتف: ${params.phone || "غير مضاف"}`,
+    `• النوع: ${kind}`,
+    `• المتبقي: ${params.remainingLabel} (ينتهي في ${params.expiresAtIso})`,
+    `• الإجراء المقترح: التواصل مع الورشة لتذكيرها بـ${actionVerb}.`,
+  ].join("\n");
+
+  const mailtoUrl = `mailto:${encodeURIComponent(params.userEmail)}?cc=${encodeURIComponent(
+    params.adminEmail || OWNER_ADMIN_EMAIL
+  )}&subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(userBody)}`;
+
+  return { subject, userBody, adminBody, mailtoUrl };
+}
+
+export const APPS_SCRIPT_EMAIL_TEMPLATE = `function doPost(e) {
+  var d = JSON.parse(e.postData.contents);
+  if (d.userEmail) {
+    MailApp.sendEmail(d.userEmail, d.subject, d.userBody);
+  }
+  if (d.adminEmail) {
+    MailApp.sendEmail(d.adminEmail, "[تنبيه أدمن] " + d.subject, d.adminBody);
+  }
+  return ContentService.createTextOutput(JSON.stringify({ ok: true }))
+    .setMimeType(ContentService.MimeType.JSON);
+}`;
+

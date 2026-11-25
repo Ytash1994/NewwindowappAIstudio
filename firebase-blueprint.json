@@ -22,6 +22,8 @@
         "cliqHolderName": { "type": "string", "maxLength": 120 },
         "trialDaysDefault": { "type": "number" },
         "supportNote": { "type": "string", "maxLength": 500 },
+        "adminAlertEmail": { "type": "string", "format": "email", "maxLength": 200 },
+        "expiryWebhookUrl": { "type": "string", "maxLength": 300 },
         "updatedBy": { "type": "string", "maxLength": 128 },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -116,6 +118,27 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["actorUid", "actorEmail", "action", "targetTenantId", "details", "createdAt"]
+    },
+    "ExpiryAlert": {
+      "title": "ExpiryAlert",
+      "description": "Under-2-days trial or paid subscription expiry alert for admin and user email tracking",
+      "type": "object",
+      "properties": {
+        "tenantId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 200 },
+        "workshopName": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "alertType": { "type": "string", "enum": ["trial_expiring", "subscription_expiring"] },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "hoursLeft": { "type": "number" },
+        "adminEmail": { "type": "string", "format": "email", "maxLength": 200 },
+        "emailStatus": { "type": "string", "enum": ["pending", "sent", "manual", "failed"] },
+        "acknowledged": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["tenantId", "ownerUid", "email", "workshopName", "phone", "alertType", "expiresAt", "hoursLeft", "adminEmail", "emailStatus", "acknowledged", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -125,7 +148,7 @@
     },
     "/config/{configId}": {
       "schema": { "$ref": "#/entities/PlatformConfig" },
-      "description": "Platform CliQ/WhatsApp settings document (config/platform)"
+      "description": "Platform CliQ/WhatsApp/email alert settings document (config/platform)"
     },
     "/plans/{planId}": {
       "schema": { "$ref": "#/entities/SubscriptionPlan" },
@@ -142,6 +165,10 @@
     "/activation_requests/{requestId}": {
       "schema": { "$ref": "#/entities/ActivationRequest" },
       "description": "CliQ & WhatsApp activation requests awaiting admin approval"
+    },
+    "/expiry_alerts/{alertId}": {
+      "schema": { "$ref": "#/entities/ExpiryAlert" },
+      "description": "Automated under-48h trial/subscription expiry notifications for admin and user"
     },
     "/audit_logs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },

@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
 import type { User } from "firebase/auth";
 import {
+  BellRing,
   CheckCircle2,
   ClipboardList,
+  Clock,
   Copy,
   ExternalLink,
   KeyRound,
@@ -19,7 +21,11 @@ import {
 } from "lucide-react";
 import firebaseConfig from "../../firebase-applet-config.json";
 import {
+  APPS_SCRIPT_EMAIL_TEMPLATE,
   BILLING_CYCLE_LABELS,
+  DEFAULT_WHATSAPP_PHONE,
+  OWNER_ADMIN_EMAIL,
+  buildExpiryReminderEmailContent,
   evaluateTenantAccess,
   normalizeJordanWhatsApp,
   tsToMs,
@@ -27,13 +33,16 @@ import {
 import type {
   ActivationRequestDoc,
   AuditLogDoc,
+  ExpiryAlertDoc,
   PlatformConfig,
   SubscriptionPlan,
   TenantAccount,
 } from "./types";
 import {
+  adminAcknowledgeExpiryAlert,
   adminActivateTenant,
   adminCreateWorkshopAccount,
+  adminDispatchExpiryEmail,
   adminExtendTrial,
   adminReviewActivationRequest,
   adminSavePlan,
@@ -41,6 +50,7 @@ import {
   adminSendPasswordResetLink,
   adminSuspendTenant,
   subscribeAllActivationRequests,
+  subscribeAllExpiryAlerts,
   subscribeAllTenants,
   subscribeAuditLogs,
 } from "./service";
@@ -53,7 +63,7 @@ interface AdminPanelProps {
   onToast: (msg: string, ms?: number) => void;
 }
 
-type AdminTab = "tenants" | "requests" | "settings" | "audit";
+type AdminTab = "tenants" | "requests" | "alerts" | "settings" | "audit";
 
 export function AdminPanel({
   adminUser,
@@ -65,6 +75,7 @@ export function AdminPanel({
   const [tab, setTab] = useState<AdminTab>("tenants");
   const [tenants, setTenants] = useState<TenantAccount[]>([]);
   const [requests, setRequests] = useState<ActivationRequestDoc[]>([]);
+  const [expiryAlerts, setExpiryAlerts] = useState<ExpiryAlertDoc[]>([]);
   const [logs, setLogs] = useState<AuditLogDoc[]>([]);
   const [searchQ, setSearchQ] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "trialing" | "active" | "locked">("all");
@@ -90,7 +101,11 @@ export function AdminPanel({
   const [plansDraft, setPlansDraft] = useState<SubscriptionPlan[]>(plans);
 
   useEffect(() => {
-    setCfgDraft(config);
+    setCfgDraft({
+      ...config,
+      adminAlertEmail: config.adminAlertEmail || OWNER_ADMIN_EMAIL,
+      expiryWebhookUrl: config.expiryWebhookUrl || "",
+    });
   }, [config]);
 
   useEffect(() => {
@@ -101,12 +116,25 @@ export function AdminPanel({
     const unsub1 = subscribeAllTenants(setTenants);
     const unsub2 = subscribeAllActivationRequests(setRequests);
     const unsub3 = subscribeAuditLogs(setLogs);
+    const unsub4 = subscribeAllExpiryAlerts(setExpiryAlerts);
     return () => {
       unsub1();
       unsub2();
       unsub3();
+      unsub4();
     };
   }, []);
+
+  const expiringTenants = useMemo(() => {
+    return tenants
+      .map((t) => ({
+        tenant: t,
+        access: evaluateTenantAccess(t),
+        alert: expiryAlerts.find((a) => a.ownerUid === t.ownerUid),
+      }))
+      .filter((item) => item.access.isExpiringSoon)
+      .sort((a, b) => a.access.hoursLeft - b.access.hoursLeft);
+  }, [tenants, expiryAlerts]);
 
   const stats = useMemo(() => {
     let active = 0;
@@ -119,8 +147,15 @@ export function AdminPanel({
       else locked++;
     });
     const pendingReqs = requests.filter((r) => r.status === "pending").length;
-    return { total: tenants.length, active, trialing, locked, pendingReqs };
-  }, [tenants, requests]);
+    return {
+      total: tenants.length,
+      active,
+      trialing,
+      locked,
+      pendingReqs,
+      expiringSoon: expiringTenants.length,
+    };
+  }, [tenants, requests, expiringTenants.length]);
 
   const filteredTenants = useMemo(() => {
     const q = searchQ.trim().toLowerCase();
@@ -275,6 +310,39 @@ export function AdminPanel({
     }
   };
 
+  const handleDispatchExpiryEmail = async (
+    target: TenantAccount,
+    access: ReturnType<typeof evaluateTenantAccess>,
+    existingAlertId?: string
+  ) => {
+    setBusyId(`exp_${target.ownerUid}`);
+    try {
+      const res = await adminDispatchExpiryEmail(adminUser, target, access, config, existingAlertId);
+      if (res.sentViaWebhook) {
+        onToast(`تم إرسال بريد التنبيه تلقائياً إلى ${target.email} وبريد الأدمن ✓`, 4000);
+      } else {
+        onToast("تم تجهيز رسالة التنبيه في تطبيق البريد (للعميل + نسخة للأدمن) ✓", 3500);
+        window.location.href = res.mailtoUrl;
+      }
+    } catch {
+      onToast("تعذر إرسال تنبيه البريد");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleAckAlert = async (alertId: string) => {
+    setBusyId(`ack_${alertId}`);
+    try {
+      await adminAcknowledgeExpiryAlert(adminUser, alertId);
+      onToast("تم تأكيد مراجعة التنبيه ✓");
+    } catch {
+      onToast("تعذر تحديث حالة التنبيه");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const firebaseAuthConsoleUrl = `https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/users`;
 
   const fmtDate = (ms: number | null) => {
@@ -320,6 +388,10 @@ export function AdminPanel({
             <small>طلبات كليك معلقة</small>
             <b>{stats.pendingReqs}</b>
           </div>
+          <div className="saas-kpi warn">
+            <small>قارب الانتهاء (&lt; يومين)</small>
+            <b>{stats.expiringSoon}</b>
+          </div>
         </div>
 
         {/* التبويبات */}
@@ -332,9 +404,13 @@ export function AdminPanel({
             <MessageCircle className="ico-xs" aria-hidden="true" />
             <span>طلبات كليك {stats.pendingReqs > 0 ? `(${stats.pendingReqs})` : ""}</span>
           </button>
+          <button type="button" className={tab === "alerts" ? "on" : ""} onClick={() => setTab("alerts")}>
+            <BellRing className="ico-xs" aria-hidden="true" />
+            <span>تنبيهات الانتهاء {stats.expiringSoon > 0 ? `(${stats.expiringSoon})` : ""}</span>
+          </button>
           <button type="button" className={tab === "settings" ? "on" : ""} onClick={() => setTab("settings")}>
             <Settings className="ico-xs" aria-hidden="true" />
-            <span>الباقات وكليك</span>
+            <span>الباقات وكليك والإيميل</span>
           </button>
           <button type="button" className={tab === "audit" ? "on" : ""} onClick={() => setTab("audit")}>
             <ClipboardList className="ico-xs" aria-hidden="true" />
@@ -698,11 +774,138 @@ export function AdminPanel({
             </div>
           )}
 
+          {/* 2.5 تنبيهات قرب الانتهاء (< يومين) */}
+          {tab === "alerts" && (
+            <div className="saas-admin-list">
+              <div className="saas-note-banner">
+                <b>تنبيهات الحسابات المتبقي لها أقل من يومين (تجريبية أو مدفوعة):</b>{" "}
+                بريد الأدمن المستلم:{" "}
+                <b dir="ltr">{config.adminAlertEmail || OWNER_ADMIN_EMAIL}</b> —{" "}
+                {config.expiryWebhookUrl
+                  ? "الإرسال التلقائي للإيميل مفعّل ✓"
+                  : "يمكنك الإرسال بنقرة واحدة بالبريد أو تفعيل الإرسال التلقائي المجاني من تبويب «الباقات وكليك والإيميل»."}
+              </div>
+
+              {expiringTenants.map(({ tenant: t, access: ev, alert }) => {
+                const isBusy = busyId === `exp_${t.ownerUid}` || busyId === t.ownerUid;
+                const isTrial = ev.state === "trialing";
+                const expiresAtIso = fmtDate(ev.expiresAtMs);
+                const emailPkg = buildExpiryReminderEmailContent({
+                  workshopName: t.workshopName || t.displayName || "ورشتي",
+                  userEmail: t.email,
+                  adminEmail: config.adminAlertEmail || OWNER_ADMIN_EMAIL,
+                  phone: t.phone,
+                  isTrial,
+                  remainingLabel: ev.remainingLabel,
+                  expiresAtIso,
+                  whatsappPhone: config.whatsappPhone || DEFAULT_WHATSAPP_PHONE,
+                });
+                const waReminder = t.phone
+                  ? `https://wa.me/${normalizeJordanWhatsApp(t.phone)}?text=${encodeURIComponent(
+                      `مرحباً ${t.workshopName || ""}، نذكّرك بأنه متبقي أقل من يومين (${ev.remainingLabel}) على انتهاء ${
+                        isTrial ? "فترتك التجريبية" : "اشتراكك"
+                      } في حاسبة القياسات. للتفعيل أو التجديد عبر كليك تواصل معنا الآن.`
+                    )}`
+                  : null;
+
+                return (
+                  <div key={t.ownerUid} className="saas-tenant-card">
+                    <div className="saas-tenant-top">
+                      <div>
+                        <b>{t.workshopName || t.displayName || "بدون اسم"}</b>
+                        <div className="saas-tenant-sub">
+                          <span>{t.email}</span>
+                          {t.phone && <span> · {t.phone}</span>}
+                        </div>
+                      </div>
+                      <span className="saas-status-tag st-trialing">
+                        <Clock className="ico-xs" aria-hidden="true" />{" "}
+                        {isTrial ? "تجربة" : "مدفوع"} · متبقي {ev.remainingLabel}
+                      </span>
+                    </div>
+
+                    <div className="saas-tenant-meta">
+                      <span>تاريخ الانتهاء: <b>{expiresAtIso}</b></span>
+                      <span>
+                        حالة بريد التنبيه:{" "}
+                        <b>
+                          {alert?.emailStatus === "sent"
+                            ? "تم الإرسال تلقائياً ✓"
+                            : alert?.emailStatus === "manual"
+                              ? "تم الإرسال يدوياً ✓"
+                              : "بانتظار الإرسال"}
+                        </b>
+                      </span>
+                    </div>
+
+                    <div className="saas-tenant-acts">
+                      <button
+                        type="button"
+                        className="btn sm p"
+                        disabled={isBusy}
+                        onClick={() => void handleDispatchExpiryEmail(t, ev, alert?.id)}
+                      >
+                        <Mail className="ico-xs" aria-hidden="true" />
+                        <span>
+                          {config.expiryWebhookUrl
+                            ? "إرسال إيميل تنبيه تلقائي (للمستخدم + الأدمن)"
+                            : "إرسال إيميل تنبيه (للمستخدم + نسخة للأدمن)"}
+                        </span>
+                      </button>
+                      {config.expiryWebhookUrl && (
+                        <a href={emailPkg.mailtoUrl} className="btn sm">
+                          <Mail className="ico-xs" aria-hidden="true" />
+                          <span>فتح في تطبيق البريد</span>
+                        </a>
+                      )}
+                      {waReminder && (
+                        <a
+                          href={waReminder}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="btn sm g"
+                        >
+                          <MessageCircle className="ico-xs" aria-hidden="true" />
+                          <span>تذكير واتساب</span>
+                        </a>
+                      )}
+                      <button
+                        type="button"
+                        className="btn sm g"
+                        disabled={isBusy}
+                        onClick={() => void handleActivate(t, 30)}
+                      >
+                        تجديد شهر
+                      </button>
+                      {alert && !alert.acknowledged && (
+                        <button
+                          type="button"
+                          className="btn sm"
+                          disabled={busyId === `ack_${alert.id}`}
+                          onClick={() => void handleAckAlert(alert.id)}
+                        >
+                          <CheckCircle2 className="ico-xs" aria-hidden="true" />
+                          <span>تمت المراجعة</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+
+              {!expiringTenants.length && (
+                <p className="saas-empty">
+                  لا توجد حالياً حسابات تجريبية أو مدفوعة متبقي لها أقل من يومين.
+                </p>
+              )}
+            </div>
+          )}
+
           {/* 3. الباقات وإعدادات الدفع كليك */}
           {tab === "settings" && (
             <div className="saas-admin-list">
               <div className="saas-section">
-                <h3>إعدادات الدفع عبر كليك (CliQ) وواتساب التفعيل</h3>
+                <h3>إعدادات الدفع عبر كليك (CliQ) وواتساب وتنبيهات الإيميل</h3>
                 <div className="saas-form-row">
                   <label>
                     <span>رقم واتساب التفعيل</span>
@@ -748,6 +951,61 @@ export function AdminPanel({
                     onChange={(e) => setCfgDraft({ ...cfgDraft, supportNote: e.target.value })}
                   />
                 </label>
+
+                <div className="saas-form-row">
+                  <label>
+                    <span>إيميل الأدمن لاستلام تنبيهات الانتهاء</span>
+                    <input
+                      type="email"
+                      dir="ltr"
+                      value={cfgDraft.adminAlertEmail || OWNER_ADMIN_EMAIL}
+                      maxLength={200}
+                      onChange={(e) =>
+                        setCfgDraft({ ...cfgDraft, adminAlertEmail: e.target.value })
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>رابط Webhook مجاني للإرسال التلقائي (Google Apps Script)</span>
+                    <input
+                      type="url"
+                      dir="ltr"
+                      value={cfgDraft.expiryWebhookUrl || ""}
+                      maxLength={300}
+                      placeholder="https://script.google.com/macros/s/.../exec"
+                      onChange={(e) =>
+                        setCfgDraft({ ...cfgDraft, expiryWebhookUrl: e.target.value })
+                      }
+                    />
+                  </label>
+                </div>
+
+                <details className="saas-pass-details" style={{ marginBottom: 10 }}>
+                  <summary>
+                    <Mail className="ico-xs" aria-hidden="true" />
+                    <span>تفعيل إرسال الإيميل التلقائي مجاناً (0 تكلفة عبر Gmail Apps Script)</span>
+                  </summary>
+                  <div className="saas-script-box">
+                    <p className="saas-cliq-note">
+                      افتح <b>script.google.com</b> بحسابك → مشروع جديد → الصق الكود التالي → اضغط
+                      <b> Deploy → New deployment → Web app</b> (Execute as: Me، Who has access:
+                      Anyone) ثم الصق الرابط الناتج في الحقل أعلاه:
+                    </p>
+                    <pre dir="ltr">{APPS_SCRIPT_EMAIL_TEMPLATE}</pre>
+                    <button
+                      type="button"
+                      className="btn sm"
+                      onClick={() => {
+                        navigator.clipboard?.writeText(APPS_SCRIPT_EMAIL_TEMPLATE);
+                        onToast("تم نسخ كود Google Apps Script ✓");
+                      }}
+                    >
+                      <Copy className="ico-xs" aria-hidden="true" />
+                      <span>نسخ الكود</span>
+                    </button>
+                  </div>
+                </details>
+
                 <button
                   type="button"
                   className="btn p sm"
@@ -755,7 +1013,7 @@ export function AdminPanel({
                   onClick={() => void handleSaveConfig()}
                 >
                   <Save className="ico-xs" aria-hidden="true" />
-                  <span>{busyId === "cfg" ? "جاري الحفظ..." : "حفظ إعدادات كليك وواتساب"}</span>
+                  <span>{busyId === "cfg" ? "جاري الحفظ..." : "حفظ إعدادات كليك وواتساب والإيميل"}</span>
                 </button>
               </div>
 
