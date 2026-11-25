@@ -206,7 +206,7 @@ export function SubscriptionModal({
         setPasswordLinkedNow(true);
         onToast("الحساب مرتبط بكلمة مرور مسبقاً، استخدم تغيير كلمة المرور", 3500);
       } else if (msg.includes("operation-not-allowed")) {
-        onToast("يرجى تفعيل مزوّد Email/Password أولاً في Firebase Console", 4500);
+        onToast("خدمة الدخول بالبريد وكلمة المرور غير مفعّلة حالياً من إعدادات المنصة.", 4500);
       } else {
         onToast("تعذر ربط كلمة المرور حالياً، حاول مرة أخرى", 3500);
       }

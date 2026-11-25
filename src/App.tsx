@@ -817,7 +817,7 @@ export default function App() {
       return "محاولات كثيرة جداً، يرجى الانتظار قليلاً ثم المحاولة مرة أخرى.";
     }
     if (msg.includes("operation-not-allowed")) {
-      return "تسجيل الدخول بالبريد وكلمة المرور غير مفعّل بعد في Firebase Console (Authentication → Sign-in method → Email/Password).";
+      return "خدمة التسجيل بالبريد الإلكتروني وكلمة المرور غير مفعّلة حالياً من إعدادات المنصة. يُرجى المحاولة بحساب جوجل أو التواصل مع إدارة المنصة.";
     }
     return "تعذر إتمام العملية، يرجى المحاولة مرة أخرى.";
   }, []);
