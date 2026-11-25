@@ -272,9 +272,13 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
         updatedAt: serverTimestamp(),
       });
     } else {
-      // تنظيف أي حقول حساسة قديمة (expiryWebhookUrl / adminAlertEmail) من الوثيقة العامة تلقائياً
+      // تنظيف أي حقول حساسة قديمة (expiryWebhookUrl / adminAlertEmail) أو تثبيت مدة التجربة على 7 أيام
       const existingData = cfgSnap.data() as Record<string, unknown>;
-      if ("expiryWebhookUrl" in existingData || "adminAlertEmail" in existingData) {
+      if (
+        "expiryWebhookUrl" in existingData ||
+        "adminAlertEmail" in existingData ||
+        existingData.trialDaysDefault !== DEFAULT_TRIAL_DAYS
+      ) {
         await setDoc(cfgRef, {
           whatsappPhone:
             sanitizeStr(String(existingData.whatsappPhone || ""), BLUEPRINT_LIMITS.phoneMax) ||
@@ -282,10 +286,7 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
           cliqAlias: sanitizeStr(String(existingData.cliqAlias || ""), 100),
           cliqBankName: sanitizeStr(String(existingData.cliqBankName || ""), 100),
           cliqHolderName: sanitizeStr(String(existingData.cliqHolderName || ""), 120),
-          trialDaysDefault: Math.max(
-            0,
-            Math.min(90, Math.round(Number(existingData.trialDaysDefault) || DEFAULT_TRIAL_DAYS))
-          ),
+          trialDaysDefault: DEFAULT_TRIAL_DAYS,
           supportNote: sanitizeStr(String(existingData.supportNote || ""), BLUEPRINT_LIMITS.adminNoteMax),
           updatedBy: adminUid,
           updatedAt: serverTimestamp(),
@@ -366,8 +367,7 @@ export async function fetchPlatformConfig(force = false): Promise<PlatformConfig
             cliqAlias: d.cliqAlias || "",
             cliqBankName: d.cliqBankName || "",
             cliqHolderName: d.cliqHolderName || "",
-            trialDaysDefault:
-              typeof d.trialDaysDefault === "number" ? d.trialDaysDefault : DEFAULT_TRIAL_DAYS,
+            trialDaysDefault: DEFAULT_TRIAL_DAYS,
             supportNote: d.supportNote || "",
             updatedBy: d.updatedBy || "system",
             updatedAt: d.updatedAt ?? null,
@@ -441,15 +441,46 @@ export async function fetchMyActivationRequests(uid: string): Promise<Activation
   }
 }
 
-/** التحقق من حدود الأنواع المخصصة والعلاقات الجديدة على لقطة المشروع قبل الحفظ السحابي */
+/** التحقق الصارم من بنية وحدود الأنواع المخصصة والعلاقات الجديدة على لقطة المشروع قبل الحفظ السحابي */
 export function assertSnapshotWithinPlanLimits(
   tenant: TenantAccount,
   plan: SubscriptionPlan | null,
   snapshot: Omit<AppState, "raw">
 ): void {
+  const rawUtypes = (snapshot as unknown as { utypes?: unknown }).utypes;
+  if (rawUtypes !== undefined) {
+    if (!Array.isArray(rawUtypes)) {
+      throw new Error("بنية الأنواع المخصصة (utypes) غير صالحة ويجب أن تكون قائمة.");
+    }
+    for (const item of rawUtypes) {
+      if (
+        !item ||
+        typeof item !== "object" ||
+        Array.isArray(item) ||
+        typeof (item as { name?: unknown }).name !== "string" ||
+        (item as { name: string }).name.trim().length === 0 ||
+        (item as { name: string }).name.length > 100
+      ) {
+        throw new Error("أحد عناصر الأنواع المخصصة غير صالح.");
+      }
+    }
+  }
+
+  const rawCustom = (snapshot as unknown as { custom?: unknown }).custom;
+  if (rawCustom !== undefined) {
+    if (rawCustom === null || typeof rawCustom !== "object" || Array.isArray(rawCustom)) {
+      throw new Error("بنية العلاقات المخصصة (custom) غير صالحة ويجب أن تكون خريطة (map).");
+    }
+    for (const [, fieldsList] of Object.entries(rawCustom as Record<string, unknown>)) {
+      if (!Array.isArray(fieldsList)) {
+        throw new Error("بنية قائمة العلاقات المخصصة داخل أحد الأنواع غير صالحة.");
+      }
+    }
+  }
+
   if (isOwnerAdminEmail(tenant.email)) return;
   const limits = resolvePlanLimits(tenant, plan, false);
-  const customTypesCount = Array.isArray(snapshot.utypes) ? snapshot.utypes.length : 0;
+  const customTypesCount = Array.isArray(rawUtypes) ? rawUtypes.length : 0;
 
   if (limits.maxCustomTypes === 0 && customTypesCount > 0) {
     throw new Error(
@@ -464,10 +495,9 @@ export function assertSnapshotWithinPlanLimits(
     );
   }
 
-  if (limits.maxCustomFieldsPerType >= 0 && snapshot.custom && typeof snapshot.custom === "object") {
-    for (const [typeName, fieldsList] of Object.entries(snapshot.custom)) {
-      const cnt = Array.isArray(fieldsList) ? fieldsList.length : 0;
-      if (cnt > limits.maxCustomFieldsPerType) {
+  if (limits.maxCustomFieldsPerType >= 0 && rawCustom && typeof rawCustom === "object") {
+    for (const [typeName, fieldsList] of Object.entries(rawCustom as Record<string, unknown[]>)) {
+      if (fieldsList.length > limits.maxCustomFieldsPerType) {
         throw new Error(
           `تجاوزت الحد الأقصى لإضافة العلاقات الجديدة لنوع «${typeName}» في باقتك (${limits.maxCustomFieldsPerType} علاقات لكل نوع). قم بترقية الباقة.`
         );
@@ -1283,6 +1313,7 @@ export async function adminReviewActivationRequest(
   }
 }
 
+/** حفظ باقة الاشتراك وسجل التدقيق داخل معاملة Firestore ذرية واحدة */
 export async function adminSavePlan(
   adminUser: User,
   plan: SubscriptionPlan
@@ -1305,66 +1336,155 @@ export async function adminSavePlan(
     ? Math.max(0, Math.min(10000, Number(defaults.extraTypesPackPriceJod ?? DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD) || 0))
     : 0;
 
+  const nextPlanData = {
+    id: safeId,
+    name: sanitizeStr(plan.name, 80) || safeId,
+    priceLabel: sanitizeStr(plan.priceLabel, 60) || `${plan.priceMonthlyJod} دينار / شهرياً`,
+    priceMonthlyJod: Math.max(0, Math.min(10000, Number(plan.priceMonthlyJod) || 0)),
+    maxProjects: Math.max(-1, Math.min(100000, Math.round(Number(plan.maxProjects) || 0))),
+    allowExport: Boolean(plan.allowExport),
+    allowCustomTypes: maxCustomTypes !== 0,
+    maxCustomTypes,
+    maxCustomFieldsPerType,
+    allowExtraTypesAddon,
+    extraTypesPackSize,
+    extraTypesPackPriceJod,
+    active: Boolean(plan.active),
+    sortOrder: Math.max(0, Math.min(100, Math.round(Number(plan.sortOrder) || 0))),
+    features: cleanFeatures,
+  };
+
+  const logId = makeSafeDocId("log");
   try {
-    await setDoc(doc(db, "plans", safeId), {
-      id: safeId,
-      name: sanitizeStr(plan.name, 80) || safeId,
-      priceLabel: sanitizeStr(plan.priceLabel, 60) || `${plan.priceMonthlyJod} دينار / شهرياً`,
-      priceMonthlyJod: Math.max(0, Math.min(10000, Number(plan.priceMonthlyJod) || 0)),
-      maxProjects: Math.max(-1, Math.min(100000, Math.round(Number(plan.maxProjects) || 0))),
-      allowExport: Boolean(plan.allowExport),
-      allowCustomTypes: maxCustomTypes !== 0,
-      maxCustomTypes,
-      maxCustomFieldsPerType,
-      allowExtraTypesAddon,
-      extraTypesPackSize,
-      extraTypesPackPriceJod,
-      active: Boolean(plan.active),
-      sortOrder: Math.max(0, Math.min(100, Math.round(Number(plan.sortOrder) || 0))),
-      features: cleanFeatures,
-      updatedAt: serverTimestamp(),
+    await runTransaction(db, async (tx) => {
+      const planRef = doc(db, "plans", safeId);
+      const prevSnap = await tx.get(planRef);
+      const prev = prevSnap.exists() ? (prevSnap.data() as Partial<SubscriptionPlan>) : null;
+
+      const beforeState = prev
+        ? sanitizeStr(
+            JSON.stringify({
+              name: prev.name || "",
+              price: prev.priceMonthlyJod ?? 0,
+              maxProjects: prev.maxProjects ?? 0,
+              maxCustomTypes: prev.maxCustomTypes ?? 0,
+              maxCustomFieldsPerType: prev.maxCustomFieldsPerType ?? 0,
+              active: Boolean(prev.active),
+            }),
+            BLUEPRINT_LIMITS.stateSnapMax
+          )
+        : "";
+
+      const afterState = sanitizeStr(
+        JSON.stringify({
+          name: nextPlanData.name,
+          price: nextPlanData.priceMonthlyJod,
+          maxProjects: nextPlanData.maxProjects,
+          maxCustomTypes: nextPlanData.maxCustomTypes,
+          maxCustomFieldsPerType: nextPlanData.maxCustomFieldsPerType,
+          active: nextPlanData.active,
+        }),
+        BLUEPRINT_LIMITS.stateSnapMax
+      );
+
+      tx.set(planRef, {
+        ...nextPlanData,
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(doc(db, "audit_logs", logId), {
+        actorUid: adminUser.uid,
+        actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+        action: "save_plan",
+        targetTenantId: sanitizeStr(safeId, BLUEPRINT_LIMITS.idMax),
+        details: sanitizeStr(
+          `تحديث باقة ${nextPlanData.name} (أنواع مخصصة: ${maxCustomTypes}، علاقات/نوع: ${maxCustomFieldsPerType})`,
+          BLUEPRINT_LIMITS.adminNoteMax
+        ),
+        beforeState,
+        afterState,
+        createdAt: serverTimestamp(),
+      });
     });
     cachedPlans = null;
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
   }
-  await writeAuditLog(
-    adminUser,
-    "save_plan",
-    safeId,
-    `تحديث باقة ${plan.name} (أنواع مخصصة: ${maxCustomTypes}، علاقات/نوع: ${maxCustomFieldsPerType})`
-  );
 }
 
-/** حفظ الإعدادات العامة (كليك وواتساب فقط — لا تخزن أي أسرار أو روابط Webhook) */
+/**
+ * حفظ الإعدادات العامة (كليك وواتساب فقط) وسجل التدقيق داخل معاملة Firestore ذرية واحدة.
+ * مدة التجربة المجانية مثبتة على 7 أيام (DEFAULT_TRIAL_DAYS) ولا تُقبل أي قيمة أخرى من العميل.
+ */
 export async function adminSavePlatformConfig(
   adminUser: User,
   cfg: PlatformConfig
 ): Promise<void> {
   const path = "config/platform";
+  const nextCfg = {
+    whatsappPhone:
+      sanitizeStr(cfg.whatsappPhone, BLUEPRINT_LIMITS.phoneMax) ||
+      DEFAULT_PLATFORM_CONFIG.whatsappPhone,
+    cliqAlias: sanitizeStr(cfg.cliqAlias, 100),
+    cliqBankName: sanitizeStr(cfg.cliqBankName, 100),
+    cliqHolderName: sanitizeStr(cfg.cliqHolderName, 120),
+    trialDaysDefault: DEFAULT_TRIAL_DAYS,
+    supportNote: sanitizeStr(cfg.supportNote, BLUEPRINT_LIMITS.adminNoteMax),
+  };
+
+  const logId = makeSafeDocId("log");
   try {
-    await setDoc(doc(db, "config", "platform"), {
-      whatsappPhone:
-        sanitizeStr(cfg.whatsappPhone, BLUEPRINT_LIMITS.phoneMax) ||
-        DEFAULT_PLATFORM_CONFIG.whatsappPhone,
-      cliqAlias: sanitizeStr(cfg.cliqAlias, 100),
-      cliqBankName: sanitizeStr(cfg.cliqBankName, 100),
-      cliqHolderName: sanitizeStr(cfg.cliqHolderName, 120),
-      trialDaysDefault: Math.max(0, Math.min(90, Math.round(Number(cfg.trialDaysDefault) || 7))),
-      supportNote: sanitizeStr(cfg.supportNote, BLUEPRINT_LIMITS.adminNoteMax),
-      updatedBy: adminUser.uid,
-      updatedAt: serverTimestamp(),
+    await runTransaction(db, async (tx) => {
+      const cfgRef = doc(db, "config", "platform");
+      const prevSnap = await tx.get(cfgRef);
+      const prev = prevSnap.exists() ? (prevSnap.data() as Partial<PlatformConfig>) : null;
+
+      const beforeState = prev
+        ? sanitizeStr(
+            JSON.stringify({
+              whatsappPhone: prev.whatsappPhone || "",
+              cliqAlias: prev.cliqAlias || "",
+              cliqBankName: prev.cliqBankName || "",
+              trialDaysDefault: prev.trialDaysDefault ?? DEFAULT_TRIAL_DAYS,
+            }),
+            BLUEPRINT_LIMITS.stateSnapMax
+          )
+        : "";
+
+      const afterState = sanitizeStr(
+        JSON.stringify({
+          whatsappPhone: nextCfg.whatsappPhone,
+          cliqAlias: nextCfg.cliqAlias,
+          cliqBankName: nextCfg.cliqBankName,
+          trialDaysDefault: DEFAULT_TRIAL_DAYS,
+        }),
+        BLUEPRINT_LIMITS.stateSnapMax
+      );
+
+      tx.set(cfgRef, {
+        ...nextCfg,
+        updatedBy: adminUser.uid,
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(doc(db, "audit_logs", logId), {
+        actorUid: adminUser.uid,
+        actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+        action: "update_platform_config",
+        targetTenantId: "platform",
+        details: sanitizeStr(
+          `تحديث إعدادات كليك وواتساب (${nextCfg.whatsappPhone})`,
+          BLUEPRINT_LIMITS.adminNoteMax
+        ),
+        beforeState,
+        afterState,
+        createdAt: serverTimestamp(),
+      });
     });
     cachedPlatformConfig = null;
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
   }
-  await writeAuditLog(
-    adminUser,
-    "update_platform_config",
-    "platform",
-    `تحديث إعدادات كليك وواتساب (${cfg.whatsappPhone})`
-  );
 }
 
 export const PASSWORD_RESET_TTL_MS = 10 * 60 * 1000; // 10 دقائق

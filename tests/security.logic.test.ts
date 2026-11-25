@@ -362,7 +362,77 @@ runTest("فرض حدود الأنواع والعلاقات فعلياً عند �
   );
 });
 
-runTest("التحقق من الالتزام التام بخطة Firebase Spark المجانية (بدون خادم Express أو Blaze أو onSnapshot)", () => {
+runTest("رفض البنى غير الصالحة في snapshot (utypes ليست قائمة أو custom ليست خريطة) حتى على أعلى باقة", () => {
+  const starterPlan = DEFAULT_PLANS.find((p) => p.id === "starter")!;
+  const businessPlan = DEFAULT_PLANS.find((p) => p.id === "business")!;
+  const starterTenant = makeTenant({ planId: "starter", subscriptionStatus: "active" });
+  const bizTenant = makeTenant({ planId: "business", subscriptionStatus: "active" });
+
+  // utypes غائبة (undefined) تُعامل كقائمة فارغة ومسموحة
+  const withoutUtypes = makeSnapshot();
+  delete (withoutUtypes as unknown as Record<string, unknown>).utypes;
+  assert.doesNotThrow(() => assertSnapshotWithinPlanLimits(starterTenant, starterPlan, withoutUtypes));
+
+  // utypes كـ string
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      starterTenant,
+      starterPlan,
+      makeSnapshot({ utypes: "bypass" as unknown as AppState["utypes"] })
+    )
+  );
+
+  // utypes كـ map (كائن)
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      starterTenant,
+      starterPlan,
+      makeSnapshot({ utypes: { "0": { name: "نوع" } } as unknown as AppState["utypes"] })
+    )
+  );
+
+  // utypes كـ null
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      starterTenant,
+      starterPlan,
+      makeSnapshot({ utypes: null as unknown as AppState["utypes"] })
+    )
+  );
+
+  // عنصر غير صالح داخل قائمة utypes
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      bizTenant,
+      businessPlan,
+      makeSnapshot({ utypes: [{ name: "" }] as unknown as AppState["utypes"] })
+    )
+  );
+
+  // custom ليست map (string / array / null) حتى على باقة الورش والمصانع (maxFields == -1)
+  for (const badCustom of ["not-a-map", ["bad"], null, 123]) {
+    assert.throws(() =>
+      assertSnapshotWithinPlanLimits(
+        bizTenant,
+        businessPlan,
+        makeSnapshot({ custom: badCustom as unknown as AppState["custom"] })
+      )
+    );
+  }
+
+  // قيمة مفتاح داخل custom ليست قائمة
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      bizTenant,
+      businessPlan,
+      makeSnapshot({
+        custom: { "شباك 3 مجاري نظامي": "bad-list" } as unknown as AppState["custom"],
+      })
+    )
+  );
+});
+
+runTest("التحقق من الالتزام التام بخطة Firebase Spark المجانية وتثبيت التجربة وذرية سجل الإدارة", () => {
   // 1. غياب ملفات الخادم Express نهائياً
   assert.equal(fs.existsSync(path.resolve("server.ts")), false, "يجب حذف server.ts");
   assert.equal(
@@ -371,17 +441,18 @@ runTest("التحقق من الالتزام التام بخطة Firebase Spark �
     "يجب حذف src/server/security.ts"
   );
 
-  // 2. وجود إعدادات Firebase Hosting العادي (SPA rewrites -> /index.html)
+  // 2. وجود إعدادات Firebase Hosting العادي + محاكي Firestore
   const fbJson = JSON.parse(fs.readFileSync(path.resolve("firebase.json"), "utf8"));
   assert.equal(fbJson.hosting.public, "dist");
   assert.equal(fbJson.firestore.rules, "firestore.rules");
+  assert.equal(fbJson.emulators.firestore.port, 8080);
   assert.ok(
     Array.isArray(fbJson.hosting.rewrites) &&
       fbJson.hosting.rewrites.some((r: { source: string; destination: string }) => r.source === "**" && r.destination === "/index.html"),
     "يجب توجيه جميع المسارات إلى /index.html"
   );
 
-  // 3. نظافة package.json من خدمات الخادم أو Blaze
+  // 3. نظافة package.json من خدمات الخادم أو Blaze ووجود سكربت اختبارات المحاكي
   const pkg = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
   const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
   for (const forbidden of [
@@ -394,20 +465,45 @@ runTest("التحقق من الالتزام التام بخطة Firebase Spark �
   ]) {
     assert.equal(forbidden in allDeps, false, `الاعتماد ${forbidden} يجب ألا يوجد في خطة Spark`);
   }
+  assert.ok("@firebase/rules-unit-testing" in allDeps, "يجب توفر @firebase/rules-unit-testing");
   assert.ok(String(pkg.scripts.dev).startsWith("vite"), "يجب تشغيل dev عبر Vite SPA فقط");
+  assert.ok(String(pkg.scripts["test:rules:emulator"]).includes("emulators:exec"));
 
-  // 4. فحص src/saas/service.ts: صفر onSnapshot، صفر /api/، صفر no-cors، ووجود runTransaction
+  // 4. فحص src/saas/service.ts: صفر onSnapshot، صفر /api/، ذرية adminSavePlan و adminSavePlatformConfig
   const serviceText = fs.readFileSync(path.resolve("src/saas/service.ts"), "utf8");
   assert.equal(serviceText.includes("onSnapshot"), false, "يجب الاستغناء عن onSnapshot لتوفير حصة Spark");
   assert.equal(serviceText.includes("/api/"), false, "لا يجوز الاعتماد على مسارات /api/ خادمية");
   assert.equal(serviceText.includes("no-cors"), false, "يجب إزالة mode: no-cors نهائياً");
   assert.ok(serviceText.includes("runTransaction"), "يجب استخدام المعاملات الذرية");
 
-  // 5. فحص firestore.rules: حصر الإدارة بالمالك الأساسي وفرض حدود الباقات والعلاقات على الخادم
+  const savePlanBlock = serviceText.slice(
+    serviceText.indexOf("export async function adminSavePlan"),
+    serviceText.indexOf("export async function adminSavePlatformConfig")
+  );
+  assert.ok(savePlanBlock.includes("runTransaction(db"), "adminSavePlan يجب أن يستخدم معاملة ذرية");
+  assert.ok(savePlanBlock.includes('doc(db, "audit_logs", logId)'), "adminSavePlan يجب أن يكتب سجل التدقيق داخل المعاملة");
+
+  const saveCfgBlock = serviceText.slice(
+    serviceText.indexOf("export async function adminSavePlatformConfig"),
+    serviceText.indexOf("export const PASSWORD_RESET_TTL_MS")
+  );
+  assert.ok(saveCfgBlock.includes("runTransaction(db"), "adminSavePlatformConfig يجب أن يستخدم معاملة ذرية");
+  assert.ok(saveCfgBlock.includes('doc(db, "audit_logs", logId)'), "adminSavePlatformConfig يجب أن يكتب سجل التدقيق داخل المعاملة");
+  assert.ok(saveCfgBlock.includes("trialDaysDefault: DEFAULT_TRIAL_DAYS"), "يجب تثبيت مدة التجربة على DEFAULT_TRIAL_DAYS");
+
+  // 5. فحص firestore.rules: رفض utypes غير القائمة و custom غير الخريطة وتثبيت trialDaysDefault == 7
   const rulesText = fs.readFileSync(path.resolve("firestore.rules"), "utf8");
   assert.ok(rulesText.includes("request.auth.token.email_verified == true"));
   assert.ok(rulesText.includes("request.auth.token.email.lower() == 'xtashtoush@gmail.com'"));
   assert.ok(rulesText.includes("function isAdmin() {\n      return isOwnerAdmin();\n    }"));
+  assert.ok(rulesText.includes("hasValidUtypesShape"));
+  assert.ok(rulesText.includes("hasValidCustomMapShape"));
+  assert.equal(
+    rulesText.includes("!(projectData.snapshot.utypes is list)"),
+    false,
+    "ممنوع السماح بتمرير utypes غير القائمة"
+  );
+  assert.ok(rulesText.includes("data.trialDaysDefault is int && data.trialDaysDefault == 7"));
   assert.ok(rulesText.includes("planAllowsNewProject"));
   assert.ok(rulesText.includes("planAllowsCustomTypes"));
   assert.ok(rulesText.includes("planAllowsCustomFields"));
@@ -417,6 +513,13 @@ runTest("التحقق من الالتزام التام بخطة Firebase Spark �
   assert.ok(rulesText.includes("match /expiry_alerts/{alertId} {\n      allow read, write: if false;\n    }"));
   assert.ok(rulesText.includes("match /config_private/{configId} {\n      allow read, write: if false;\n    }"));
   assert.ok(rulesText.includes("allow update: if false;\n      allow delete: if false;"));
+
+  // 6. فحص src/firebase.ts: App Check اختياري بالتطوير وجاهز للإنتاج بدون أسرار
+  const firebaseTs = fs.readFileSync(path.resolve("src/firebase.ts"), "utf8");
+  assert.ok(firebaseTs.includes("ReCaptchaV3Provider"));
+  assert.ok(firebaseTs.includes("VITE_RECAPTCHA_V3_SITE_KEY"));
+  assert.ok(firebaseTs.includes("import.meta.env?.DEV"));
+  assert.equal(firebaseTs.includes("SECRET"), false, "لا يجوز تخزين أي سر في src/firebase.ts");
 });
 
 console.log(`\nاكتملت جميع اختبارات الأمان والاشتراكات وخطة Spark بنجاح (${passed}/${passed}).`);

@@ -26,6 +26,7 @@ import {
   BILLING_CYCLE_LABELS,
   DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
   DEFAULT_EXTRA_TYPES_PACK_SIZE,
+  DEFAULT_TRIAL_DAYS,
   DEFAULT_WHATSAPP_PHONE,
   OWNER_ADMIN_EMAIL,
   buildExpiryReminderEmailContent,
@@ -1084,6 +1085,14 @@ export function AdminPanel({
                     value={cfgDraft.supportNote}
                     maxLength={500}
                     onChange={(e) => setCfgDraft({ ...cfgDraft, supportNote: e.target.value })}
+                  />
+                </label>
+                <label className="saas-note-input">
+                  <span>مدة التجربة المجانية (للعرض فقط — ثابتة في الإطلاق التجريبي)</span>
+                  <input
+                    value={`${DEFAULT_TRIAL_DAYS} أيام (ثابتة ولا يمكن تعديلها من الواجهة أو العميل)`}
+                    readOnly
+                    disabled
                   />
                 </label>
 

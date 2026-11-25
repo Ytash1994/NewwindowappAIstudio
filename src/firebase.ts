@@ -10,20 +10,31 @@ export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 
-// تهيئة Firebase App Check بشكل آمن ومشروط (يُفعّل تلقائياً عند ضبط مفتاح reCAPTCHA v3 — مجاني ضمن خطة Spark)
-let appCheckInitialized = false;
-if (typeof window !== "undefined") {
-  const siteKey = (
-    (import.meta.env?.VITE_RECAPTCHA_V3_SITE_KEY as string | undefined) ||
-    firebaseConfig.recaptchaSiteKey ||
-    ""
-  ).trim();
+// تهيئة Firebase App Check بشكل آمن ومجاني ضمن خطة Spark:
+// - اختياري تماماً في التطوير المحلي (يدعم VITE_APPCHECK_DEBUG_TOKEN أثناء DEV فقط)
+// - جاهز للإنتاج عبر مفتاح reCAPTCHA v3 العام (VITE_RECAPTCHA_V3_SITE_KEY) دون تخزين أي أسرار في الواجهة
+// - ملاحظة: لا يصبح App Check فعّالاً فعلياً على الخادم إلا بعد تسجيل المفتاح وتفعيل Enforcement من Firebase Console
+export type AppCheckMode = "active" | "debug" | "disabled";
 
-  if (import.meta.env?.DEV && import.meta.env?.VITE_APPCHECK_DEBUG_TOKEN) {
+let appCheckInitialized = false;
+let resolvedAppCheckMode: AppCheckMode = "disabled";
+
+if (typeof window !== "undefined") {
+  const isDev = Boolean(import.meta.env?.DEV);
+  const envSiteKey = (import.meta.env?.VITE_RECAPTCHA_V3_SITE_KEY as string | undefined) || "";
+  const cfgSiteKey =
+    typeof (firebaseConfig as { recaptchaSiteKey?: unknown }).recaptchaSiteKey === "string"
+      ? ((firebaseConfig as { recaptchaSiteKey?: string }).recaptchaSiteKey as string)
+      : "";
+  const siteKey = (envSiteKey || cfgSiteKey).trim();
+
+  const rawDebugToken = isDev
+    ? ((import.meta.env?.VITE_APPCHECK_DEBUG_TOKEN as string | undefined) || "").trim()
+    : "";
+
+  if (isDev && rawDebugToken) {
     (self as unknown as Record<string, unknown>).FIREBASE_APPCHECK_DEBUG_TOKEN =
-      import.meta.env.VITE_APPCHECK_DEBUG_TOKEN === "true"
-        ? true
-        : String(import.meta.env.VITE_APPCHECK_DEBUG_TOKEN);
+      rawDebugToken === "true" ? true : rawDebugToken;
   }
 
   if (siteKey) {
@@ -33,13 +44,19 @@ if (typeof window !== "undefined") {
         isTokenAutoRefreshEnabled: true,
       });
       appCheckInitialized = true;
+      resolvedAppCheckMode = isDev && rawDebugToken ? "debug" : "active";
     } catch (err) {
       console.warn("تعذر تهيئة App Check:", err);
     }
+  } else if (!isDev) {
+    console.warn(
+      "App Check غير مفعّل بعد: أضف VITE_RECAPTCHA_V3_SITE_KEY (المفتاح العام فقط) قبل البناء وفعّل App Check من Firebase Console."
+    );
   }
 }
 
 export const isAppCheckConfigured = appCheckInitialized;
+export const appCheckMode: AppCheckMode = resolvedAppCheckMode;
 
 export enum OperationType {
   CREATE = "create",
