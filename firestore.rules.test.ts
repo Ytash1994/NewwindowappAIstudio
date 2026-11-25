@@ -1,7 +1,8 @@
 /**
  * اختبارات عقود الأمان لقواعد Firestore (firestore.rules)
  * تغطي جميع محاولات التحايل: البريد غير الموثق، الترقية الذاتية، تخطي حد المشاريع،
- * الموافقة المزدوجة على طلبات CliQ، قراءة الإعدادات الخاصة، وحذف سجل التدقيق.
+ * تخطي حد الأنواع والعلاقات المخصصة، الموافقة المزدوجة على طلبات CliQ،
+ * قفل المجموعات المعطلة في خطة Spark، وحذف سجل التدقيق.
  */
 
 export interface AdversarialTestCase {
@@ -196,10 +197,18 @@ export const ADVERSARIAL_SECURITY_CASES: AdversarialTestCase[] = [
   },
   {
     id: 11,
-    name: "Regular User Reading Private Admin Notification Config",
-    actor: { uid: "userA", email: "a@workshop.jo", email_verified: true },
-    operation: "get",
-    path: "/config_private/notifications",
+    name: "Starter Plan Bypassing Custom Fields Per Type Limit (>2)",
+    actor: { uid: "starterUser", email: "s@workshop.jo", email_verified: true },
+    operation: "update",
+    path: "/tenants/starterUser/projects/proj_1",
+    payload: {
+      snapshot: {
+        custom: {
+          "شباك 3 مجاري نظامي": [{ id: "c1" }, { id: "c2" }, { id: "c3" }],
+        },
+      },
+      updatedAt: "REQUEST_TIME",
+    },
     expected: "PERMISSION_DENIED",
   },
   {
@@ -251,6 +260,15 @@ export const ADVERSARIAL_SECURITY_CASES: AdversarialTestCase[] = [
     actor: { uid: "adminUid", email: "xtashtoush@gmail.com", email_verified: true },
     operation: "delete",
     path: "/audit_logs/log_1",
+    expected: "PERMISSION_DENIED",
+  },
+  {
+    id: 16,
+    name: "Disabled Spark Collections (admins / expiry_alerts / config_private) Denied",
+    actor: { uid: "adminUid", email: "xtashtoush@gmail.com", email_verified: true },
+    operation: "create",
+    path: "/admins/secondAdmin",
+    payload: { uid: "secondAdmin", email: "other@workshop.jo", createdAt: "REQUEST_TIME" },
     expected: "PERMISSION_DENIED",
   },
 ];

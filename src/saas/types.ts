@@ -21,12 +21,6 @@ export type ActivationStatus = "pending" | "approved" | "rejected";
 export type ActivationRequestType = "subscription" | "extra_types_addon";
 export type TenantRole = "owner" | "admin";
 
-export interface AdminRecord {
-  uid: string;
-  email: string;
-  createdAt?: Timestamp | null;
-}
-
 /** الإعدادات العامة المتاحة للمستخدمين الموثّقين (كليك وواتساب فقط — بدون أي أسرار أو روابط Webhook) */
 export interface PlatformConfig {
   whatsappPhone: string;
@@ -35,14 +29,6 @@ export interface PlatformConfig {
   cliqHolderName: string;
   trialDaysDefault: number;
   supportNote: string;
-  updatedBy: string;
-  updatedAt?: Timestamp | null;
-}
-
-/** إعدادات التنبيهات الخاصة بالمدير فقط (محمية في config_private/notifications) */
-export interface PrivateNotificationConfig {
-  adminAlertEmail: string;
-  notificationsEnabled: boolean;
   updatedBy: string;
   updatedAt?: Timestamp | null;
 }
@@ -129,26 +115,6 @@ export interface AuditLogDoc {
   createdAt: Timestamp | null;
 }
 
-export type ExpiryAlertType = "trial_expiring" | "subscription_expiring";
-export type ExpiryEmailStatus = "pending" | "sent" | "manual" | "failed";
-
-export interface ExpiryAlertDoc {
-  id: string;
-  tenantId: string;
-  ownerUid: string;
-  email: string;
-  workshopName: string;
-  phone: string;
-  alertType: ExpiryAlertType;
-  expiresAt: Timestamp | null;
-  hoursLeft: number;
-  adminEmail: string;
-  emailStatus: ExpiryEmailStatus;
-  acknowledged: boolean;
-  createdAt: Timestamp | null;
-  updatedAt: Timestamp | null;
-}
-
 export interface TenantAccessEvaluation {
   allowed: boolean;
   state: "owner_free" | "active" | "trialing" | "pending_payment" | "expired" | "suspended";
@@ -182,12 +148,6 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
   cliqHolderName: "إدارة حاسبة القياسات",
   trialDaysDefault: DEFAULT_TRIAL_DAYS,
   supportNote: "بعد التحويل عبر كليك أرسل صورة الحوالة وبريد حسابك على الواتساب ليتم التفعيل فوراً.",
-  updatedBy: "system",
-};
-
-export const DEFAULT_PRIVATE_NOTIFICATION_CONFIG: PrivateNotificationConfig = {
-  adminAlertEmail: OWNER_ADMIN_EMAIL,
-  notificationsEnabled: true,
   updatedBy: "system",
 };
 
@@ -327,7 +287,7 @@ export function resolvePlanLimits(
   plan: SubscriptionPlan | null,
   isAdmin: boolean
 ): ResolvedPlanLimits {
-  if (isAdmin || tenant?.role === "admin") {
+  if (isAdmin || (tenant && isOwnerAdminEmail(tenant.email))) {
     return {
       baseMaxCustomTypes: -1,
       extraTypesQuota: 0,
@@ -445,9 +405,9 @@ export function evaluateTenantAccess(
     };
   }
 
-  // المدير يتطلب بريدًا موثّقًا (عند تمرير emailVerified) ولا نعتمد على البريد غير الموثّق
+  // صلاحية المدير محصورة في المالك الأساسي الموثّق فقط (Xtashtoush@gmail.com)
   const verifiedOrNotPassed = opts?.emailVerified !== false;
-  if (verifiedOrNotPassed && (tenant.role === "admin" || isOwnerAdminEmail(tenant.email))) {
+  if (verifiedOrNotPassed && isOwnerAdminEmail(tenant.email)) {
     return {
       allowed: true,
       state: "owner_free",
@@ -534,7 +494,6 @@ export function evaluateTenantAccess(
     const isPendingPayment = tenant.subscriptionStatus === "pending_payment";
     const activeUntilMs = tsToMs(tenant.activeUntil);
 
-    // إن كان لديه اشتراك مدفوع سابق لم ينتهِ بعد
     if (activeUntilMs !== null) {
       const diff = activeUntilMs - nowMs;
       if (diff > 0) {
@@ -717,20 +676,3 @@ export function buildExpiryReminderEmailContent(params: {
 
   return { subject, userBody, adminBody, mailtoUrl };
 }
-
-export const APPS_SCRIPT_EMAIL_TEMPLATE = `function doPost(e) {
-  var secret = PropertiesService.getScriptProperties().getProperty("EXPIRY_WEBHOOK_SECRET");
-  var d = JSON.parse(e.postData.contents || "{}");
-  if (secret && d.webhookSecret !== secret) {
-    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "unauthorized" }))
-      .setMimeType(ContentService.MimeType.JSON);
-  }
-  if (d.userEmail) {
-    MailApp.sendEmail(d.userEmail, d.subject, d.userBody);
-  }
-  if (d.adminEmail) {
-    MailApp.sendEmail(d.adminEmail, "[تنبيه الإدارة] " + d.subject, d.adminBody);
-  }
-  return ContentService.createTextOutput(JSON.stringify({ ok: true }))
-    .setMimeType(ContentService.MimeType.JSON);
-}`;

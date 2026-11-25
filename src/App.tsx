@@ -71,20 +71,17 @@ import {
   confirmInAppPasswordReset,
   deleteCloudProject,
   ensureTenantAndDefaults,
+  fetchMyActivationRequests,
+  fetchPlans,
+  fetchPlatformConfig,
   fetchServerTimeOffsetMs,
+  fetchTenant,
+  fetchTenantProjects,
   refreshUserVerificationStatus,
   renameCloudProject,
   saveCloudProject,
   sendEmailVerificationSafe,
   sendPasswordResetSafe,
-  subscribeAllActivationRequests,
-  subscribeAllTenants,
-  subscribeMyActivationRequests,
-  subscribePlans,
-  subscribePlatformConfig,
-  subscribeTenant,
-  subscribeTenantProjects,
-  triggerExpiryAlertOnce,
   verifyInAppResetCode,
 } from "./saas/service";
 import {
@@ -628,12 +625,8 @@ export default function App() {
   const serverNowMs = nowTick + serverOffsetMs;
 
   const isAdminUser = useMemo(
-    () =>
-      Boolean(
-        emailVerifiedFlag &&
-          (tenant?.role === "admin" || isOwnerAdminEmail(authUser?.email))
-      ),
-    [emailVerifiedFlag, tenant?.role, authUser?.email]
+    () => Boolean(emailVerifiedFlag && isOwnerAdminEmail(authUser?.email)),
+    [emailVerifiedFlag, authUser?.email]
   );
 
   const tenantAccess = useMemo(
@@ -702,55 +695,30 @@ export default function App() {
     setNewProjName("");
   }, [authUser, emailVerifiedFlag]);
 
-  // تهيئة حساب الورشة واشتراكات Firestore الحية فقط بعد توثيق البريد الإلكتروني بنجاح
+  // تهيئة حساب الورشة وجلب الإعدادات والباقات مرة واحدة فقط بعد توثيق البريد (توفير حصة Spark بدون onSnapshot)
   useEffect(() => {
     if (!authUser || !emailVerifiedFlag) return;
     let active = true;
-    let unsubTenant: (() => void) | null = null;
-    let unsubConfig: (() => void) | null = null;
-    let unsubPlans: (() => void) | null = null;
-    let unsubReqs: (() => void) | null = null;
-    let unsubAdminReqs: (() => void) | null = null;
-    let unsubAdminTenants: (() => void) | null = null;
 
     const pendingProfile =
       pendingSignupProfileRef.current || consumePendingSignupProfile(authUser.uid);
     pendingSignupProfileRef.current = undefined;
 
     setTenantLoaded(false);
+    const ownerAdmin = isOwnerAdminEmail(authUser.email) && Boolean(authUser.emailVerified);
+
     ensureTenantAndDefaults(authUser, pendingProfile)
-      .then((initialTenant) => {
+      .then(async (initialTenant) => {
         if (!active) return;
         setTenant(initialTenant);
         setTenantLoaded(true);
-        const ownerAdmin =
-          initialTenant.role === "admin" ||
-          (isOwnerAdminEmail(authUser.email) && Boolean(authUser.emailVerified));
-
-        unsubTenant = subscribeTenant(authUser.uid, (t) => {
-          if (active && t) setTenant(t);
-        });
-        unsubConfig = subscribePlatformConfig((cfg) => {
-          if (active) setPlatformConfig(cfg);
-        });
-        unsubPlans = subscribePlans(ownerAdmin, (pls) => {
-          if (active) setPlans(pls);
-        });
-        unsubReqs = subscribeMyActivationRequests(authUser.uid, (reqs) => {
-          if (active) setMyRequests(reqs);
-        });
-        if (ownerAdmin) {
-          unsubAdminReqs = subscribeAllActivationRequests((allReqs) => {
-            if (active) setAdminPendingCount(allReqs.filter((r) => r.status === "pending").length);
-          });
-          unsubAdminTenants = subscribeAllTenants((allTenants) => {
-            if (active) {
-              setAdminExpiringCount(
-                allTenants.filter((t) => evaluateTenantAccess(t, Date.now() + serverOffsetMs).isExpiringSoon).length
-              );
-            }
-          });
-        }
+        const [cfg, pls] = await Promise.all([
+          fetchPlatformConfig(),
+          fetchPlans(ownerAdmin),
+        ]);
+        if (!active) return;
+        setPlatformConfig(cfg);
+        setPlans(pls);
       })
       .catch((err) => {
         if (!active) return;
@@ -760,36 +728,81 @@ export default function App() {
 
     return () => {
       active = false;
-      unsubTenant?.();
-      unsubConfig?.();
-      unsubPlans?.();
-      unsubReqs?.();
-      unsubAdminReqs?.();
-      unsubAdminTenants?.();
     };
-  }, [authUser, emailVerifiedFlag, serverOffsetMs]);
+  }, [authUser, emailVerifiedFlag]);
 
-  // إرسال تنبيه قرب الانتهاء مرة واحدة عند تبقي أقل من يومين (عبر الخادم الآمن)
-  useEffect(() => {
-    if (!authUser || !emailVerifiedFlag || !tenant || !tenantLoaded || isAdminUser) return;
-    if (!tenantAccess.isExpiringSoon) return;
-    void triggerExpiryAlertOnce(authUser, tenant, tenantAccess, platformConfig);
-  }, [authUser, emailVerifiedFlag, tenant, tenantLoaded, isAdminUser, tenantAccess, platformConfig]);
-
-  // Real-time cloud projects sync for active tenants
+  // تحميل المشاريع السحابية مرة واحدة عند فتح الجلسة الفعالة (بدلاً من مستمع onSnapshot مستمر)
   useEffect(() => {
     if (!authUser || !tenantLoaded || !tenantAccess.allowed) return;
-    const unsub = subscribeTenantProjects(
-      authUser.uid,
-      (cloudProjects) => {
-        setProjects(cloudProjects);
-      },
-      () => {
-        toast("تعذر مزامنة المشاريع السحابية، تحقق من حالة الاشتراك", 3200);
-      }
-    );
-    return () => unsub();
+    let active = true;
+    fetchTenantProjects(authUser.uid)
+      .then((cloudProjects) => {
+        if (active) setProjects(cloudProjects);
+      })
+      .catch(() => {
+        if (active) toast("تعذر تحميل المشاريع السحابية، تحقق من حالة الاشتراك", 3200);
+      });
+    return () => {
+      active = false;
+    };
   }, [authUser, tenantLoaded, tenantAccess.allowed, toast]);
+
+  // جلب طلبات التفعيل عند الحاجة فقط (عند فتح نافذة الاشتراك أو قفل الحساب أو وجود طلب قيد المراجعة)
+  useEffect(() => {
+    if (!authUser || !emailVerifiedFlag || !tenantLoaded) return;
+    const needsReqs =
+      subModalOpen || !tenantAccess.allowed || tenant?.subscriptionStatus === "pending_payment";
+    if (!needsReqs) return;
+    let active = true;
+    fetchMyActivationRequests(authUser.uid)
+      .then((reqs) => {
+        if (active) setMyRequests(reqs);
+      })
+      .catch(() => {
+        // تجاهل صامت
+      });
+    return () => {
+      active = false;
+    };
+  }, [authUser, emailVerifiedFlag, tenantLoaded, subModalOpen, tenantAccess.allowed, tenant?.subscriptionStatus]);
+
+  // تحديث فوري لحالة الحساب وطلبات التفعيل عند الضغط على «تحديث حالة الحساب» أو بعد تقديم طلب كليك
+  const refreshAccountState = useCallback(async () => {
+    if (!authUser || !emailVerifiedFlag) return;
+    const [freshTenant, freshReqs] = await Promise.all([
+      fetchTenant(authUser.uid),
+      fetchMyActivationRequests(authUser.uid),
+    ]);
+    if (freshTenant) {
+      setTenant(freshTenant);
+      const nextAccess = evaluateTenantAccess(freshTenant, Date.now() + serverOffsetMs, {
+        emailVerified: emailVerifiedFlag,
+      });
+      if (nextAccess.allowed) {
+        try {
+          const cloudProjects = await fetchTenantProjects(authUser.uid);
+          setProjects(cloudProjects);
+        } catch {
+          // تجاهل
+        }
+      }
+    }
+    setMyRequests(freshReqs);
+  }, [authUser, emailVerifiedFlag, serverOffsetMs]);
+
+  const refreshPlatformData = useCallback(async () => {
+    const [cfg, pls] = await Promise.all([
+      fetchPlatformConfig(true),
+      fetchPlans(isAdminUser, true),
+    ]);
+    setPlatformConfig(cfg);
+    setPlans(pls);
+  }, [isAdminUser]);
+
+  const handleAdminCountsUpdated = useCallback((pendingReqs: number, expiringSoon: number) => {
+    setAdminPendingCount(pendingReqs);
+    setAdminExpiringCount(expiringSoon);
+  }, []);
 
   const mapAuthError = useCallback((err: unknown): string => {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1763,7 +1776,13 @@ export default function App() {
 
     if (authUser && tenantAccess.allowed) {
       try {
-        await saveCloudProject(authUser.uid, existing?.id || null, name, rest);
+        const saved = await saveCloudProject(authUser.uid, existing?.id || null, name, rest);
+        setProjects((prev) => [saved, ...prev.filter((p) => p.id !== saved.id)]);
+        if (!existing && !isAdminUser) {
+          setTenant((prev) =>
+            prev ? { ...prev, projectCount: (prev.projectCount ?? 0) + 1 } : prev
+          );
+        }
         setPjName(name);
         setNewProjName(name);
         toast(`تم حفظ مشروع «${name}» سحابياً ✓`);
@@ -4012,6 +4031,7 @@ export default function App() {
           plans={plans}
           config={platformConfig}
           myRequests={myRequests}
+          onRefreshAccount={refreshAccountState}
           onSignOut={handleSignOut}
           onToast={toast}
         />
@@ -4282,6 +4302,13 @@ export default function App() {
                                 if (authUser && tenantAccess.allowed) {
                                   void renameCloudProject(authUser.uid, pj.id, nm)
                                     .then(() => {
+                                      setProjects((prev) =>
+                                        prev.map((x) =>
+                                          x.id === pj.id
+                                            ? { ...x, name: nm, updatedAt: new Date().toISOString() }
+                                            : x
+                                        )
+                                      );
                                       if (pjName === pj.name) setPjName(nm);
                                       toast("تمت إعادة تسمية المشروع ✓");
                                     })
@@ -4345,7 +4372,23 @@ export default function App() {
                                     onConfirm: () => {
                                       if (authUser && tenantAccess.allowed) {
                                         void deleteCloudProject(authUser.uid, pj.id)
-                                          .then(() => toast("تم حذف المشروع"))
+                                          .then(() => {
+                                            setProjects((prev) => prev.filter((x) => x.id !== pj.id));
+                                            if (!isAdminUser) {
+                                              setTenant((prev) =>
+                                                prev
+                                                  ? {
+                                                      ...prev,
+                                                      projectCount: Math.max(
+                                                        0,
+                                                        (prev.projectCount ?? 1) - 1
+                                                      ),
+                                                    }
+                                                  : prev
+                                              );
+                                            }
+                                            toast("تم حذف المشروع");
+                                          })
                                           .catch(() => toast("تعذر حذف المشروع"));
                                       } else {
                                         setProjects((prev) => prev.filter((x) => x.id !== pj.id));
@@ -7218,6 +7261,7 @@ export default function App() {
           config={platformConfig}
           myRequests={myRequests}
           onClose={() => setSubModalOpen(false)}
+          onRefreshAccount={refreshAccountState}
           onSignOut={handleSignOut}
           onToast={toast}
         />
@@ -7230,6 +7274,8 @@ export default function App() {
           config={platformConfig}
           serverNowMs={serverNowMs}
           onClose={() => setAdminPanelOpen(false)}
+          onPlatformDataChanged={refreshPlatformData}
+          onCountsUpdated={handleAdminCountsUpdated}
           onToast={toast}
         />
       )}

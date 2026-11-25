@@ -1,6 +1,6 @@
 import { initializeApp } from "firebase/app";
 import { ReCaptchaV3Provider, initializeAppCheck } from "firebase/app-check";
-import { getAuth, GoogleAuthProvider } from "firebase/auth";
+import { getAuth, GoogleAuthProvider, onAuthStateChanged } from "firebase/auth";
 import { doc, getDocFromServer, getFirestore } from "firebase/firestore";
 import firebaseConfig from "../firebase-applet-config.json";
 
@@ -10,7 +10,7 @@ export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 
-// تهيئة Firebase App Check بشكل آمن ومشروط (يُفعّل تلقائياً عند ضبط مفتاح reCAPTCHA v3)
+// تهيئة Firebase App Check بشكل آمن ومشروط (يُفعّل تلقائياً عند ضبط مفتاح reCAPTCHA v3 — مجاني ضمن خطة Spark)
 let appCheckInitialized = false;
 if (typeof window !== "undefined") {
   const siteKey = (
@@ -93,14 +93,17 @@ export function handleFirestoreError(
   throw new Error(JSON.stringify(errInfo));
 }
 
-async function testConnection() {
-  try {
-    await getDocFromServer(doc(db, "test", "connection"));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes("the client is offline")) {
-      console.error("يرجى التحقق من اتصال Firebase.");
-    }
-  }
+// فحص الاتصال لمرة واحدة فقط بعد تسجيل الدخول لتجنب القراءات المرفوضة للزوار غير المسجلين (توفير حصة Spark)
+let connectionTested = false;
+if (typeof window !== "undefined") {
+  const unsubProbe = onAuthStateChanged(auth, (u) => {
+    if (!u || connectionTested) return;
+    connectionTested = true;
+    unsubProbe();
+    void getDocFromServer(doc(db, "test", "connection")).catch((error) => {
+      if (error instanceof Error && error.message.includes("the client is offline")) {
+        console.error("يرجى التحقق من اتصال Firebase.");
+      }
+    });
+  });
 }
-
-void testConnection();

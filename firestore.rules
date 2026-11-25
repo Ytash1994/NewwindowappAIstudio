@@ -32,17 +32,14 @@ service cloud.firestore {
         request.auth.token.email.size() >= 3;
     }
 
-    // Zero-lookup primary owner admin check (case-insensitive, strictly requires verified email, safe for allow list)
+    // Zero-lookup primary owner admin check (case-insensitive, strictly requires verified email)
     function isOwnerAdmin() {
       return isVerified() && request.auth.token.email.lower() == 'xtashtoush@gmail.com';
     }
 
-    // Full admin check for single-document operations (strictly requires verified email)
+    // Spark-safe launch: all administrative actions are strictly locked to the verified primary owner
     function isAdmin() {
-      return isOwnerAdmin() || (
-        isVerified() &&
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-      );
+      return isOwnerAdmin();
     }
 
     // Tenant owner MUST have verified email
@@ -61,9 +58,9 @@ service cloud.firestore {
     }
 
     // Active access evaluation using authoritative server request.time.
-    // Note: pending_payment STILL strictly enforces trial/paid expiry so an expired trial stays locked!
+    // pending_payment STILL strictly enforces trial/paid expiry so an expired trial stays locked!
     function hasActiveTenantAccess(tenantData) {
-      return tenantData.role == 'admin' ||
+      return (tenantData.role == 'admin' && isOwnerAdmin()) ||
         (
           tenantData.subscriptionStatus == 'active' &&
           (tenantData.activeUntil == null || request.time <= tenantData.activeUntil)
@@ -85,7 +82,7 @@ service cloud.firestore {
 
     // Server-side plan limit enforcement for maxProjects
     function planAllowsNewProject(tenantData) {
-      return tenantData.role == 'admin' ||
+      return (tenantData.role == 'admin' && isOwnerAdmin()) ||
         (
           tenantData.planId == 'trial' &&
           tenantProjectCount(tenantData) < 25
@@ -113,6 +110,12 @@ service cloud.firestore {
         : (planData.id == 'starter' ? 0 : (planData.id == 'pro' ? 2 : (planData.id == 'business' ? 5 : (planData.allowCustomTypes == true ? 2 : 0))));
     }
 
+    function planMaxCustomFieldsPerType(planData) {
+      return ('maxCustomFieldsPerType' in planData && planData.maxCustomFieldsPerType is int)
+        ? planData.maxCustomFieldsPerType
+        : (planData.id == 'starter' ? 2 : (planData.id == 'pro' ? 5 : (planData.id == 'business' ? -1 : 2)));
+    }
+
     function planAllowsExtraTypesAddon(planData) {
       return ('allowExtraTypesAddon' in planData && planData.allowExtraTypesAddon is bool)
         ? planData.allowExtraTypesAddon
@@ -121,7 +124,7 @@ service cloud.firestore {
 
     // Server-side plan limit enforcement for maxCustomTypes (+ paid extraCustomTypesQuota on last plan only)
     function planAllowsCustomTypes(tenantData, projectData) {
-      return tenantData.role == 'admin' ||
+      return (tenantData.role == 'admin' && isOwnerAdmin()) ||
         !('utypes' in projectData.snapshot) ||
         !(projectData.snapshot.utypes is list) ||
         projectData.snapshot.utypes.size() == 0 ||
@@ -143,16 +146,71 @@ service cloud.firestore {
         );
     }
 
-    // ==================== VALIDATION BLUEPRINTS ====================
-    function isValidAdminRecord(data) {
-      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
-        data.keys().hasOnly(['uid', 'email', 'createdAt']) &&
-        isValidId(data.uid) &&
-        isValidString(data.email, 3, 200) &&
-        data.createdAt is timestamp;
+    function customFieldCountForKey(customMap, keyName) {
+      return (keyName in customMap)
+        ? ((customMap[keyName] is list) ? customMap[keyName].size() : 999)
+        : 0;
     }
 
-    // Public non-sensitive config ONLY (no expiryWebhookUrl or private notification fields)
+    function utypeNameAt(projectData, idx) {
+      return ('utypes' in projectData.snapshot &&
+        projectData.snapshot.utypes is list &&
+        projectData.snapshot.utypes.size() > idx &&
+        projectData.snapshot.utypes[idx] is map &&
+        'name' in projectData.snapshot.utypes[idx] &&
+        projectData.snapshot.utypes[idx].name is string)
+        ? projectData.snapshot.utypes[idx].name
+        : 'شباك 3 مجاري نظامي';
+    }
+
+    // Zero-loop server-side enforcement of maxCustomFieldsPerType across all 4 built-in + custom types
+    function customFieldsWithinLimit(projectData, maxFields) {
+      return maxFields == -1 ||
+        !('custom' in projectData.snapshot) ||
+        (
+          projectData.snapshot.custom is map &&
+          projectData.snapshot.custom.keys().hasOnly([
+            'شباك 3 مجاري نظامي',
+            'شباك 2.5 نظامي',
+            'واجهات 2.5 بدون صندوق',
+            'شباك 3 مجاري بدون صندوق',
+            utypeNameAt(projectData, 0),
+            utypeNameAt(projectData, 1),
+            utypeNameAt(projectData, 2),
+            utypeNameAt(projectData, 3),
+            utypeNameAt(projectData, 4)
+          ]) &&
+          customFieldCountForKey(projectData.snapshot.custom, 'شباك 3 مجاري نظامي') <= maxFields &&
+          customFieldCountForKey(projectData.snapshot.custom, 'شباك 2.5 نظامي') <= maxFields &&
+          customFieldCountForKey(projectData.snapshot.custom, 'واجهات 2.5 بدون صندوق') <= maxFields &&
+          customFieldCountForKey(projectData.snapshot.custom, 'شباك 3 مجاري بدون صندوق') <= maxFields &&
+          customFieldCountForKey(projectData.snapshot.custom, utypeNameAt(projectData, 0)) <= maxFields &&
+          customFieldCountForKey(projectData.snapshot.custom, utypeNameAt(projectData, 1)) <= maxFields &&
+          customFieldCountForKey(projectData.snapshot.custom, utypeNameAt(projectData, 2)) <= maxFields &&
+          customFieldCountForKey(projectData.snapshot.custom, utypeNameAt(projectData, 3)) <= maxFields &&
+          customFieldCountForKey(projectData.snapshot.custom, utypeNameAt(projectData, 4)) <= maxFields
+        );
+    }
+
+    function planAllowsCustomFields(tenantData, projectData) {
+      return (tenantData.role == 'admin' && isOwnerAdmin()) ||
+        (
+          (tenantData.planId == 'trial' || tenantData.subscriptionStatus != 'active') &&
+          customFieldsWithinLimit(projectData, 2)
+        ) ||
+        (
+          tenantData.subscriptionStatus == 'active' &&
+          tenantData.planId != 'trial' &&
+          exists(/databases/$(database)/documents/plans/$(tenantData.planId)) &&
+          customFieldsWithinLimit(
+            projectData,
+            planMaxCustomFieldsPerType(get(/databases/$(database)/documents/plans/$(tenantData.planId)).data)
+          )
+        );
+    }
+
+    // ==================== VALIDATION BLUEPRINTS ====================
+    // Public non-sensitive config ONLY (CliQ & WhatsApp — never contains secrets or webhook URLs)
     function isValidPlatformConfig(data) {
       return data.keys().hasAll([
           'whatsappPhone', 'cliqAlias', 'cliqBankName', 'cliqHolderName',
@@ -168,20 +226,6 @@ service cloud.firestore {
         isValidString(data.cliqHolderName, 0, 120) &&
         data.trialDaysDefault is int && data.trialDaysDefault >= 0 && data.trialDaysDefault <= 90 &&
         isValidString(data.supportNote, 0, 500) &&
-        isValidId(data.updatedBy) &&
-        data.updatedAt is timestamp;
-    }
-
-    // Private admin-only notification configuration
-    function isValidPrivateNotificationConfig(data) {
-      return data.keys().hasAll([
-          'adminAlertEmail', 'notificationsEnabled', 'updatedBy', 'updatedAt'
-        ]) &&
-        data.keys().hasOnly([
-          'adminAlertEmail', 'notificationsEnabled', 'updatedBy', 'updatedAt'
-        ]) &&
-        isValidString(data.adminAlertEmail, 3, 200) &&
-        data.notificationsEnabled is bool &&
         isValidId(data.updatedBy) &&
         data.updatedAt is timestamp;
     }
@@ -318,59 +362,34 @@ service cloud.firestore {
         data.createdAt is timestamp;
     }
 
-    function isValidExpiryAlert(data) {
-      return data.keys().hasAll([
-          'tenantId', 'ownerUid', 'email', 'workshopName', 'phone',
-          'alertType', 'expiresAt', 'hoursLeft', 'adminEmail',
-          'emailStatus', 'acknowledged', 'createdAt', 'updatedAt'
-        ]) &&
-        data.keys().hasOnly([
-          'tenantId', 'ownerUid', 'email', 'workshopName', 'phone',
-          'alertType', 'expiresAt', 'hoursLeft', 'adminEmail',
-          'emailStatus', 'acknowledged', 'createdAt', 'updatedAt'
-        ]) &&
-        isValidId(data.tenantId) &&
-        isValidId(data.ownerUid) &&
-        data.tenantId == data.ownerUid &&
-        isValidString(data.email, 3, 200) &&
-        isValidString(data.workshopName, 0, 120) &&
-        isValidString(data.phone, 0, 30) &&
-        data.alertType in ['trial_expiring', 'subscription_expiring'] &&
-        data.expiresAt is timestamp &&
-        data.hoursLeft is int && data.hoursLeft >= 0 && data.hoursLeft <= 48 &&
-        isValidString(data.adminEmail, 3, 200) &&
-        data.emailStatus in ['pending', 'sent', 'manual', 'failed'] &&
-        data.acknowledged is bool &&
-        data.createdAt is timestamp &&
-        data.updatedAt is timestamp;
-    }
-
     // ==================== CONNECTION PROBE ====================
     match /test/connection {
       allow get: if isSignedIn();
     }
 
-    // ==================== ADMINS (OWNER-MANAGED ONLY) ====================
+    // ==================== DEFERRED / DISABLED COLLECTIONS (ZERO-COST SPARK STAGE) ====================
+    // Additional admins, server webhooks, and auto-written expiry alerts are disabled on Spark.
     match /admins/{adminUid} {
-      allow get: if isVerified() && isValidId(adminUid) && (request.auth.uid == adminUid || isAdmin());
-      allow list: if isOwnerAdmin();
-      allow create: if isOwnerAdmin() && isValidId(adminUid) && isValidAdminRecord(incoming()) &&
-        incoming().uid == adminUid &&
-        incoming().createdAt == request.time;
-      allow update: if false;
-      allow delete: if isOwnerAdmin() && isValidId(adminUid) && adminUid != request.auth.uid;
+      allow read, write: if false;
+    }
+
+    match /config_private/{configId} {
+      allow read, write: if false;
+    }
+
+    match /expiry_alerts/{alertId} {
+      allow read, write: if false;
     }
 
     // ==================== PUBLIC PLATFORM CONFIG (CliQ & WhatsApp ONLY) ====================
     match /config/{configId} {
       allow get: if isVerified() && isValidId(configId);
       allow list: if false;
-      allow create: if isVerified() && isValidId(configId) &&
+      allow create: if isAdmin() && isValidId(configId) &&
         isValidPlatformConfig(incoming()) &&
         incoming().updatedBy == request.auth.uid &&
-        incoming().updatedAt == request.time &&
-        isAdmin();
-      allow update: if isVerified() && isValidId(configId) &&
+        incoming().updatedAt == request.time;
+      allow update: if isAdmin() && isValidId(configId) &&
         isValidPlatformConfig(incoming()) &&
         incoming().updatedBy == request.auth.uid &&
         incoming().updatedAt == request.time &&
@@ -378,28 +397,7 @@ service cloud.firestore {
           'whatsappPhone', 'cliqAlias', 'cliqBankName', 'cliqHolderName',
           'trialDaysDefault', 'supportNote', 'adminAlertEmail', 'expiryWebhookUrl',
           'updatedBy', 'updatedAt'
-        ]) &&
-        isAdmin();
-      allow delete: if false;
-    }
-
-    // ==================== PRIVATE ADMIN CONFIG (NEVER READABLE BY REGULAR USERS) ====================
-    match /config_private/{configId} {
-      allow get: if isVerified() && isValidId(configId) && isAdmin();
-      allow list: if false;
-      allow create: if isVerified() && isValidId(configId) &&
-        isValidPrivateNotificationConfig(incoming()) &&
-        incoming().updatedBy == request.auth.uid &&
-        incoming().updatedAt == request.time &&
-        isAdmin();
-      allow update: if isVerified() && isValidId(configId) &&
-        isValidPrivateNotificationConfig(incoming()) &&
-        incoming().updatedBy == request.auth.uid &&
-        incoming().updatedAt == request.time &&
-        incoming().diff(existing()).affectedKeys().hasOnly([
-          'adminAlertEmail', 'notificationsEnabled', 'updatedBy', 'updatedAt'
-        ]) &&
-        isAdmin();
+        ]);
       allow delete: if false;
     }
 
@@ -407,12 +405,11 @@ service cloud.firestore {
     match /plans/{planId} {
       allow get: if isVerified() && isValidId(planId);
       allow list: if isVerified() && (resource.data.active == true || isOwnerAdmin());
-      allow create: if isVerified() && isValidId(planId) &&
+      allow create: if isAdmin() && isValidId(planId) &&
         isValidPlan(incoming()) &&
         incoming().id == planId &&
-        incoming().updatedAt == request.time &&
-        isAdmin();
-      allow update: if isVerified() && isValidId(planId) &&
+        incoming().updatedAt == request.time;
+      allow update: if isAdmin() && isValidId(planId) &&
         isValidPlan(incoming()) &&
         incoming().id == existing().id &&
         incoming().updatedAt == request.time &&
@@ -421,8 +418,7 @@ service cloud.firestore {
           'allowExport', 'allowCustomTypes', 'maxCustomTypes', 'maxCustomFieldsPerType',
           'allowExtraTypesAddon', 'extraTypesPackSize', 'extraTypesPackPriceJod',
           'active', 'sortOrder', 'features', 'updatedAt'
-        ]) &&
-        isAdmin();
+        ]);
       allow delete: if isOwnerAdmin() && isValidId(planId);
     }
 
@@ -441,7 +437,7 @@ service cloud.firestore {
         tenantExtraTypesQuota(incoming()) == 0 &&
         (
           (
-            isAdmin() &&
+            isOwnerAdmin() &&
             incoming().ownerUid == request.auth.uid &&
             incoming().role == 'admin' &&
             incoming().subscriptionStatus == 'active' &&
@@ -459,7 +455,7 @@ service cloud.firestore {
           )
         );
 
-      // Action-Based Update: Admin vs Tenant Profile vs Pending Payment Transition vs Atomic Project Counter
+      // Action-Based Update: Owner Admin vs Tenant Profile vs Pending Payment vs Atomic Project Counter
       allow update: if isVerified() && isValidId(tenantId) &&
         isValidTenant(incoming(), existing().ownerUid) &&
         incoming().ownerUid == existing().ownerUid &&
@@ -468,10 +464,11 @@ service cloud.firestore {
         incoming().updatedAt == request.time &&
         (
           (
-            isAdmin() &&
+            isOwnerAdmin() &&
+            incoming().role == existing().role &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'workshopName', 'phone', 'displayName', 'subscriptionStatus',
-              'planId', 'trialDays', 'activeUntil', 'adminNote', 'role',
+              'planId', 'trialDays', 'activeUntil', 'adminNote',
               'projectCount', 'lastProjectActionId', 'extraCustomTypesQuota', 'updatedAt'
             ])
           ) ||
@@ -485,6 +482,7 @@ service cloud.firestore {
             incoming().activeUntil == existing().activeUntil &&
             incoming().adminNote == existing().adminNote &&
             tenantProjectCount(incoming()) == tenantProjectCount(existing()) &&
+            tenantExtraTypesQuota(incoming()) == tenantExtraTypesQuota(existing()) &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'workshopName', 'phone', 'displayName', 'updatedAt'
             ])
@@ -500,6 +498,7 @@ service cloud.firestore {
             incoming().activeUntil == existing().activeUntil &&
             incoming().adminNote == existing().adminNote &&
             tenantProjectCount(incoming()) == tenantProjectCount(existing()) &&
+            tenantExtraTypesQuota(incoming()) == tenantExtraTypesQuota(existing()) &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'subscriptionStatus', 'updatedAt'
             ])
@@ -515,6 +514,7 @@ service cloud.firestore {
             incoming().trialDays == existing().trialDays &&
             incoming().activeUntil == existing().activeUntil &&
             incoming().adminNote == existing().adminNote &&
+            tenantExtraTypesQuota(incoming()) == tenantExtraTypesQuota(existing()) &&
             incoming().projectCount == tenantProjectCount(existing()) + 1 &&
             isValidId(incoming().lastProjectActionId) &&
             !exists(/databases/$(database)/documents/tenants/$(tenantId)/projects/$(incoming().lastProjectActionId)) &&
@@ -534,6 +534,7 @@ service cloud.firestore {
             incoming().trialDays == existing().trialDays &&
             incoming().activeUntil == existing().activeUntil &&
             incoming().adminNote == existing().adminNote &&
+            tenantExtraTypesQuota(incoming()) == tenantExtraTypesQuota(existing()) &&
             incoming().projectCount == tenantProjectCount(existing()) - 1 &&
             isValidId(incoming().lastProjectActionId) &&
             exists(/databases/$(database)/documents/tenants/$(tenantId)/projects/$(incoming().lastProjectActionId)) &&
@@ -546,7 +547,7 @@ service cloud.firestore {
 
       allow delete: if isOwnerAdmin() && isValidId(tenantId);
 
-      // ==================== TENANT PROJECTS (MASTER GATE + SERVER PLAN LIMITS) ====================
+      // ==================== TENANT PROJECTS (MASTER GATE + FULL SERVER PLAN LIMITS) ====================
       match /projects/{projectId} {
         allow get: if isVerified() && isValidId(tenantId) && isValidId(projectId) &&
           (
@@ -568,7 +569,7 @@ service cloud.firestore {
           isOwnerAdmin()
         );
 
-        // Master Gate: verified email + active subscription/trial + maxProjects + allowCustomTypes + atomic projectCount increment
+        // Master Gate: verified email + active subscription/trial + maxProjects + maxCustomTypes + maxCustomFieldsPerType + atomic counter
         allow create: if isVerified() && isValidId(tenantId) && isValidId(projectId) &&
           isValidProject(incoming(), tenantId) &&
           incoming().createdAt == request.time &&
@@ -581,6 +582,7 @@ service cloud.firestore {
               hasActiveTenantAccess(get(/databases/$(database)/documents/tenants/$(tenantId)).data) &&
               planAllowsNewProject(get(/databases/$(database)/documents/tenants/$(tenantId)).data) &&
               planAllowsCustomTypes(get(/databases/$(database)/documents/tenants/$(tenantId)).data, incoming()) &&
+              planAllowsCustomFields(get(/databases/$(database)/documents/tenants/$(tenantId)).data, incoming()) &&
               getAfter(/databases/$(database)/documents/tenants/$(tenantId)).data.projectCount ==
                 tenantProjectCount(get(/databases/$(database)/documents/tenants/$(tenantId)).data) + 1
             )
@@ -600,7 +602,8 @@ service cloud.firestore {
               isTenantOwner(tenantId) &&
               exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
               hasActiveTenantAccess(get(/databases/$(database)/documents/tenants/$(tenantId)).data) &&
-              planAllowsCustomTypes(get(/databases/$(database)/documents/tenants/$(tenantId)).data, incoming())
+              planAllowsCustomTypes(get(/databases/$(database)/documents/tenants/$(tenantId)).data, incoming()) &&
+              planAllowsCustomFields(get(/databases/$(database)/documents/tenants/$(tenantId)).data, incoming())
             )
           );
 
@@ -653,7 +656,7 @@ service cloud.firestore {
           )
         );
 
-      // Terminal State Locking: Admin can ONLY approve/reject a 'pending' request (prevents double-approval!)
+      // Terminal State Locking: Owner Admin can ONLY approve/reject a 'pending' request (prevents double-approval!)
       allow update: if isVerified() && isValidId(requestId) &&
         isValidActivationRequest(incoming()) &&
         incoming().ownerUid == existing().ownerUid &&
@@ -681,55 +684,13 @@ service cloud.firestore {
       allow delete: if isOwnerAdmin() && isValidId(requestId);
     }
 
-    // ==================== EXPIRY ALERTS (< 2 DAYS) ====================
-    match /expiry_alerts/{alertId} {
-      allow get: if isVerified() && isValidId(alertId) &&
-        (resource.data.ownerUid == request.auth.uid || isAdmin());
-
-      allow list: if isVerified() && (
-        resource.data.ownerUid == request.auth.uid || isOwnerAdmin()
-      );
-
-      allow create: if isVerified() && isValidId(alertId) &&
-        isValidExpiryAlert(incoming()) &&
-        incoming().ownerUid == request.auth.uid &&
-        incoming().tenantId == request.auth.uid &&
-        incoming().email.lower() == request.auth.token.email.lower() &&
-        incoming().acknowledged == false &&
-        incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time &&
-        exists(/databases/$(database)/documents/tenants/$(request.auth.uid));
-
-      allow update: if isVerified() && isValidId(alertId) &&
-        isValidExpiryAlert(incoming()) &&
-        incoming().ownerUid == existing().ownerUid &&
-        incoming().tenantId == existing().tenantId &&
-        incoming().email == existing().email &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time &&
-        (
-          (
-            isAdmin() &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['acknowledged', 'emailStatus', 'updatedAt'])
-          ) ||
-          (
-            existing().ownerUid == request.auth.uid &&
-            incoming().acknowledged == existing().acknowledged &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['emailStatus', 'hoursLeft', 'updatedAt'])
-          )
-        );
-
-      allow delete: if isOwnerAdmin() && isValidId(alertId);
-    }
-
     // ==================== IMMUTABLE AUDIT LOGS ====================
     match /audit_logs/{logId} {
-      allow get: if isVerified() && isValidId(logId) && isAdmin();
+      allow get: if isOwnerAdmin() && isValidId(logId);
       allow list: if isOwnerAdmin();
-      allow create: if isVerified() && isValidId(logId) &&
+      allow create: if isOwnerAdmin() && isValidId(logId) &&
         isValidAuditLog(incoming()) &&
-        incoming().createdAt == request.time &&
-        isAdmin();
+        incoming().createdAt == request.time;
       allow update: if false;
       allow delete: if false;
     }

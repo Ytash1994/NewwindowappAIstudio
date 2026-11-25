@@ -21,7 +21,7 @@ import {
   doc,
   getDoc,
   getDocs,
-  onSnapshot,
+  limit,
   orderBy,
   query,
   runTransaction,
@@ -39,12 +39,8 @@ import {
   DEFAULT_EXTRA_TYPES_PACK_SIZE,
   DEFAULT_PLANS,
   DEFAULT_PLATFORM_CONFIG,
-  DEFAULT_PRIVATE_NOTIFICATION_CONFIG,
   DEFAULT_TRIAL_DAYS,
-  DEFAULT_WHATSAPP_PHONE,
-  OWNER_ADMIN_EMAIL,
   TRIAL_MAX_PROJECTS,
-  buildExpiryReminderEmailContent,
   getPlanDefaultsById,
   isOwnerAdminEmail,
   resolvePlanLimits,
@@ -54,16 +50,22 @@ import {
 import type {
   ActivationRequestDoc,
   ActivationRequestType,
-  AdminRecord,
   AuditLogDoc,
   BillingCycle,
-  ExpiryAlertDoc,
   PlatformConfig,
-  PrivateNotificationConfig,
   SubscriptionPlan,
-  TenantAccessEvaluation,
   TenantAccount,
 } from "./types";
+
+// ذاكرة مؤقتة خفيفة داخل الجلسة لتقليل قراءات Firestore على خطة Spark المجانية
+let cachedPlatformConfig: { data: PlatformConfig; fetchedAt: number } | null = null;
+let cachedPlans: { data: SubscriptionPlan[]; isAdmin: boolean; fetchedAt: number } | null = null;
+const CONFIG_CACHE_TTL_MS = 5 * 60 * 1000;
+
+export function invalidateStaticSaaSCache(): void {
+  cachedPlatformConfig = null;
+  cachedPlans = null;
+}
 
 function stripUndefined<T>(value: T): T {
   if (Array.isArray(value)) {
@@ -98,17 +100,25 @@ function summarizeTenantState(t: Partial<TenantAccount>): string {
   return sanitizeStr(JSON.stringify(summary), BLUEPRINT_LIMITS.stateSnapMax);
 }
 
-/** جلب فرق التوقيت مع الخادم الموثوق حتى لا يتأثر الحساب بتعديل ساعة جهاز المستخدم */
+/**
+ * مزامنة تقدير التوقيت من ترويسة HTTP Date لاستضافة Firebase Hosting (بدون أي خادم Express أو تكلفة).
+ * ملاحظة أمان: التحقق الإلزامي من انتهاء التجربة والاشتراك يتم دائماً عبر request.time داخل قواعد Firestore.
+ */
 export async function fetchServerTimeOffsetMs(): Promise<number> {
+  if (typeof window === "undefined") return 0;
   try {
     const t0 = Date.now();
-    const res = await fetch("/api/server-time", { cache: "no-store" });
-    if (!res.ok) return 0;
-    const data = (await res.json()) as { nowMs?: number };
+    const res = await fetch(`${window.location.origin}/`, {
+      method: "HEAD",
+      cache: "no-store",
+    });
+    const dateHeader = res.headers.get("date");
     const t1 = Date.now();
-    if (typeof data.nowMs !== "number" || !Number.isFinite(data.nowMs)) return 0;
+    if (!dateHeader) return 0;
+    const serverMs = Date.parse(dateHeader);
+    if (!Number.isFinite(serverMs)) return 0;
     const midpoint = Math.round((t0 + t1) / 2);
-    return data.nowMs - midpoint;
+    return serverMs - midpoint;
   } catch {
     return 0;
   }
@@ -162,16 +172,6 @@ export async function ensureTenantAndDefaults(
   const tenantRef = doc(db, "tenants", user.uid);
   const isPrimaryOwner = isOwnerAdminEmail(user.email) && Boolean(user.emailVerified);
 
-  let isRegisteredAdmin = isPrimaryOwner;
-  if (!isRegisteredAdmin) {
-    try {
-      const adminSnap = await getDoc(doc(db, "admins", user.uid));
-      isRegisteredAdmin = adminSnap.exists();
-    } catch {
-      isRegisteredAdmin = false;
-    }
-  }
-
   let snap;
   try {
     snap = await getDoc(tenantRef);
@@ -179,6 +179,7 @@ export async function ensureTenantAndDefaults(
     handleFirestoreError(err, OperationType.GET, tenantPath);
   }
 
+  let createdNow = false;
   if (!snap.exists()) {
     const email = sanitizeStr((user.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax);
     const displayName = sanitizeStr(
@@ -189,7 +190,7 @@ export async function ensureTenantAndDefaults(
       initialProfile?.workshopName ||
         user.displayName ||
         email.split("@")[0] ||
-        (isRegisteredAdmin ? "إدارة المنصة" : "ورشتي"),
+        (isPrimaryOwner ? "إدارة المنصة" : "ورشتي"),
       BLUEPRINT_LIMITS.nameMax
     );
     const phone = sanitizeStr(
@@ -197,7 +198,7 @@ export async function ensureTenantAndDefaults(
       BLUEPRINT_LIMITS.phoneMax
     );
 
-    const payload = isRegisteredAdmin
+    const payload = isPrimaryOwner
       ? {
           ownerUid: user.uid,
           email,
@@ -209,8 +210,9 @@ export async function ensureTenantAndDefaults(
           planId: "owner_free",
           trialDays: 0,
           activeUntil: null,
-          adminNote: isPrimaryOwner ? "حساب مالك المنصة - مجاني دائم" : "حساب مدير منصة",
+          adminNote: "حساب مالك المنصة - مجاني دائم",
           projectCount: 0,
+          extraCustomTypesQuota: 0,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         }
@@ -227,12 +229,14 @@ export async function ensureTenantAndDefaults(
           activeUntil: null,
           adminNote: "",
           projectCount: 0,
+          extraCustomTypesQuota: 0,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         };
 
     try {
       await setDoc(tenantRef, payload);
+      createdNow = true;
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, tenantPath);
     }
@@ -240,6 +244,10 @@ export async function ensureTenantAndDefaults(
 
   if (isPrimaryOwner) {
     await seedDefaultsIfMissing(user.uid);
+  }
+
+  if (!createdNow && snap.exists()) {
+    return snap.data() as TenantAccount;
   }
 
   let freshSnap;
@@ -267,23 +275,6 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
       // تنظيف أي حقول حساسة قديمة (expiryWebhookUrl / adminAlertEmail) من الوثيقة العامة تلقائياً
       const existingData = cfgSnap.data() as Record<string, unknown>;
       if ("expiryWebhookUrl" in existingData || "adminAlertEmail" in existingData) {
-        const legacyAdminEmail =
-          typeof existingData.adminAlertEmail === "string" && existingData.adminAlertEmail.includes("@")
-            ? existingData.adminAlertEmail
-            : OWNER_ADMIN_EMAIL;
-
-        // ترحيل بريد التنبيه للإعدادات الخاصة قبل تنظيف الوثيقة العامة
-        const privRef = doc(db, "config_private", "notifications");
-        const privSnap = await getDoc(privRef);
-        if (!privSnap.exists()) {
-          await setDoc(privRef, {
-            adminAlertEmail: sanitizeStr(legacyAdminEmail, BLUEPRINT_LIMITS.emailMax),
-            notificationsEnabled: true,
-            updatedBy: adminUid,
-            updatedAt: serverTimestamp(),
-          });
-        }
-
         await setDoc(cfgRef, {
           whatsappPhone:
             sanitizeStr(String(existingData.whatsappPhone || ""), BLUEPRINT_LIMITS.phoneMax) ||
@@ -305,21 +296,6 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
     handleFirestoreError(err, OperationType.WRITE, cfgPath);
   }
 
-  // ضمان وجود وثيقة الإعدادات الخاصة بالمدير فقط
-  try {
-    const privRef = doc(db, "config_private", "notifications");
-    const privSnap = await getDoc(privRef);
-    if (!privSnap.exists()) {
-      await setDoc(privRef, {
-        ...DEFAULT_PRIVATE_NOTIFICATION_CONFIG,
-        updatedBy: adminUid,
-        updatedAt: serverTimestamp(),
-      });
-    }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, "config_private/notifications");
-  }
-
   const plansPath = "plans";
   try {
     const existingPlans = await getDocs(collection(db, "plans"));
@@ -331,7 +307,6 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
         });
       }
     } else {
-      // ترقية هادئة لحقول حدود الأنواع والعلاقات الجديدة على الباقات الموجودة دون مسح تعديلات المدير
       for (const d of existingPlans.docs) {
         const cur = d.data() as Partial<SubscriptionPlan>;
         if (typeof cur.maxCustomTypes !== "number" || typeof cur.maxCustomFieldsPerType !== "number") {
@@ -349,7 +324,7 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
                 updatedAt: serverTimestamp(),
               });
             } catch {
-              // يتم تطبيق القيم الافتراضية تلقائياً عبر getPlanDefaultsById لحين نشر القواعد المحدثة
+              // يتم تطبيق القيم الافتراضية تلقائياً عبر getPlanDefaultsById
             }
           }
         }
@@ -360,158 +335,119 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
   }
 }
 
-export function subscribeTenant(
-  uid: string,
-  onData: (tenant: TenantAccount | null) => void,
-  onError?: (err: unknown) => void
-): () => void {
+// ==================== قراءات عند الطلب (بدون مستمعات حية مستمرة لتقليل استهلاك خطة Spark) ====================
+
+export async function fetchTenant(uid: string): Promise<TenantAccount | null> {
   const path = `tenants/${uid}`;
-  return onSnapshot(
-    doc(db, "tenants", uid),
-    (snap) => {
-      onData(snap.exists() ? (snap.data() as TenantAccount) : null);
-    },
-    (error) => {
-      if (onError) onError(error);
-      try {
-        handleFirestoreError(error, OperationType.GET, path);
-      } catch {
-        // تم التمرير عبر onError
-      }
-    }
-  );
+  try {
+    const snap = await getDoc(doc(db, "tenants", uid));
+    return snap.exists() ? (snap.data() as TenantAccount) : null;
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, path);
+  }
 }
 
-export function subscribePlatformConfig(
-  onData: (cfg: PlatformConfig) => void
-): () => void {
+export async function fetchPlatformConfig(force = false): Promise<PlatformConfig> {
+  if (
+    !force &&
+    cachedPlatformConfig &&
+    Date.now() - cachedPlatformConfig.fetchedAt < CONFIG_CACHE_TTL_MS
+  ) {
+    return cachedPlatformConfig.data;
+  }
   const path = "config/platform";
-  return onSnapshot(
-    doc(db, "config", "platform"),
-    (snap) => {
-      if (snap.exists()) {
-        const d = snap.data() as Partial<PlatformConfig>;
-        onData({
-          whatsappPhone: d.whatsappPhone || DEFAULT_PLATFORM_CONFIG.whatsappPhone,
-          cliqAlias: d.cliqAlias || "",
-          cliqBankName: d.cliqBankName || "",
-          cliqHolderName: d.cliqHolderName || "",
-          trialDaysDefault:
-            typeof d.trialDaysDefault === "number" ? d.trialDaysDefault : DEFAULT_TRIAL_DAYS,
-          supportNote: d.supportNote || "",
-          updatedBy: d.updatedBy || "system",
-          updatedAt: d.updatedAt ?? null,
-        });
-      } else {
-        onData(DEFAULT_PLATFORM_CONFIG);
-      }
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.GET, path);
-      } catch {
-        onData(DEFAULT_PLATFORM_CONFIG);
-      }
-    }
-  );
-}
-
-export function subscribePrivateNotificationConfig(
-  onData: (cfg: PrivateNotificationConfig) => void
-): () => void {
-  const path = "config_private/notifications";
-  return onSnapshot(
-    doc(db, "config_private", "notifications"),
-    (snap) => {
-      if (snap.exists()) {
-        onData(snap.data() as PrivateNotificationConfig);
-      } else {
-        onData(DEFAULT_PRIVATE_NOTIFICATION_CONFIG);
-      }
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.GET, path);
-      } catch {
-        onData(DEFAULT_PRIVATE_NOTIFICATION_CONFIG);
-      }
-    }
-  );
-}
-
-export function subscribePlans(
-  isAdmin: boolean,
-  onData: (plans: SubscriptionPlan[]) => void
-): () => void {
-  const path = "plans";
-  const q = isAdmin
-    ? query(collection(db, "plans"))
-    : query(collection(db, "plans"), where("active", "==", true));
-
-  return onSnapshot(
-    q,
-    (snap) => {
-      if (snap.empty) {
-        onData(DEFAULT_PLANS);
-        return;
-      }
-      const list = snap.docs
-        .map((d) => d.data() as SubscriptionPlan)
-        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
-      onData(list);
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        onData(DEFAULT_PLANS);
-      }
-    }
-  );
-}
-
-export function subscribeTenantProjects(
-  uid: string,
-  onData: (projects: SavedProject[]) => void,
-  onError?: (err: unknown) => void
-): () => void {
-  const path = `tenants/${uid}/projects`;
-  const q = query(collection(db, "tenants", uid, "projects"), where("ownerUid", "==", uid));
-  return onSnapshot(
-    q,
-    (snap) => {
-      const items: SavedProject[] = snap.docs
-        .map((d) => {
-          const data = d.data() as Record<string, unknown>;
-          const updatedMs = tsToMs(data.updatedAt as Timestamp | null) || Date.now();
+  try {
+    const snap = await getDoc(doc(db, "config", "platform"));
+    const cfg: PlatformConfig = snap.exists()
+      ? (() => {
+          const d = snap.data() as Partial<PlatformConfig>;
           return {
-            id: d.id,
-            name: String(data.name || "مشروع"),
-            updatedAt: new Date(updatedMs).toISOString(),
-            data: data.snapshot as Omit<AppState, "raw">,
+            whatsappPhone: d.whatsappPhone || DEFAULT_PLATFORM_CONFIG.whatsappPhone,
+            cliqAlias: d.cliqAlias || "",
+            cliqBankName: d.cliqBankName || "",
+            cliqHolderName: d.cliqHolderName || "",
+            trialDaysDefault:
+              typeof d.trialDaysDefault === "number" ? d.trialDaysDefault : DEFAULT_TRIAL_DAYS,
+            supportNote: d.supportNote || "",
+            updatedBy: d.updatedBy || "system",
+            updatedAt: d.updatedAt ?? null,
           };
-        })
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      onData(items);
-    },
-    (error) => {
-      if (onError) onError(error);
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        // تم التعامل معه عبر onError
-      }
-    }
-  );
+        })()
+      : DEFAULT_PLATFORM_CONFIG;
+    cachedPlatformConfig = { data: cfg, fetchedAt: Date.now() };
+    return cfg;
+  } catch {
+    return DEFAULT_PLATFORM_CONFIG;
+  }
+}
+
+export async function fetchPlans(isAdmin: boolean, force = false): Promise<SubscriptionPlan[]> {
+  if (
+    !force &&
+    cachedPlans &&
+    cachedPlans.isAdmin === isAdmin &&
+    Date.now() - cachedPlans.fetchedAt < CONFIG_CACHE_TTL_MS
+  ) {
+    return cachedPlans.data;
+  }
+  try {
+    const q = isAdmin
+      ? query(collection(db, "plans"))
+      : query(collection(db, "plans"), where("active", "==", true));
+    const snap = await getDocs(q);
+    const list = snap.empty
+      ? DEFAULT_PLANS
+      : snap.docs
+          .map((d) => d.data() as SubscriptionPlan)
+          .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+    cachedPlans = { data: list, isAdmin, fetchedAt: Date.now() };
+    return list;
+  } catch {
+    return DEFAULT_PLANS;
+  }
+}
+
+export async function fetchTenantProjects(uid: string): Promise<SavedProject[]> {
+  const path = `tenants/${uid}/projects`;
+  try {
+    const q = query(collection(db, "tenants", uid, "projects"), where("ownerUid", "==", uid));
+    const snap = await getDocs(q);
+    return snap.docs
+      .map((d) => {
+        const data = d.data() as Record<string, unknown>;
+        const updatedMs = tsToMs(data.updatedAt as Timestamp | null) || Date.now();
+        return {
+          id: d.id,
+          name: String(data.name || "مشروع"),
+          updatedAt: new Date(updatedMs).toISOString(),
+          data: data.snapshot as Omit<AppState, "raw">,
+        };
+      })
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
+}
+
+export async function fetchMyActivationRequests(uid: string): Promise<ActivationRequestDoc[]> {
+  try {
+    const q = query(collection(db, "activation_requests"), where("ownerUid", "==", uid));
+    const snap = await getDocs(q);
+    return snap.docs
+      .map((d) => ({ id: d.id, ...(d.data() as Omit<ActivationRequestDoc, "id">) }))
+      .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
+  } catch {
+    return [];
+  }
 }
 
 /** التحقق من حدود الأنواع المخصصة والعلاقات الجديدة على لقطة المشروع قبل الحفظ السحابي */
-function assertSnapshotWithinPlanLimits(
+export function assertSnapshotWithinPlanLimits(
   tenant: TenantAccount,
   plan: SubscriptionPlan | null,
   snapshot: Omit<AppState, "raw">
 ): void {
-  if (tenant.role === "admin") return;
+  if (isOwnerAdminEmail(tenant.email)) return;
   const limits = resolvePlanLimits(tenant, plan, false);
   const customTypesCount = Array.isArray(snapshot.utypes) ? snapshot.utypes.length : 0;
 
@@ -543,14 +479,14 @@ function assertSnapshotWithinPlanLimits(
 /**
  * حفظ مشروع سحابي داخل معاملة ذرية تفرض حد المشاريع (maxProjects)
  * وحد الأنواع المخصصة (maxCustomTypes + extraCustomTypesQuota) وحد العلاقات الجديدة لكل نوع
- * بالتزامن مع قواعد Firestore.
+ * بالتزامن مع قواعد Firestore، وتُرجع المشروع المحفوظ لتحديث الواجهة محلياً دون قراءة إضافية.
  */
 export async function saveCloudProject(
   uid: string,
   projectId: string | null,
   name: string,
   snapshot: Omit<AppState, "raw">
-): Promise<string> {
+): Promise<SavedProject> {
   const safeName = sanitizeStr(name, BLUEPRINT_LIMITS.nameMax) || "مشروع جديد";
   const safeType = sanitizeStr(snapshot.type || "شباك 3 مجاري نظامي", BLUEPRINT_LIMITS.windowTypeMax);
   const windowCount = Math.min(
@@ -570,7 +506,7 @@ export async function saveCloudProject(
         }
         const tenant = tenantSnap.data() as TenantAccount;
         let plan: SubscriptionPlan | null = null;
-        if (tenant.role !== "admin" && tenant.planId && tenant.planId !== "trial") {
+        if (!isOwnerAdminEmail(tenant.email) && tenant.planId && tenant.planId !== "trial") {
           const planSnap = await tx.get(doc(db, "plans", tenant.planId));
           if (planSnap.exists()) plan = planSnap.data() as SubscriptionPlan;
         }
@@ -585,7 +521,12 @@ export async function saveCloudProject(
           updatedAt: serverTimestamp(),
         });
       });
-      return projectId;
+      return {
+        id: projectId,
+        name: safeName,
+        updatedAt: new Date().toISOString(),
+        data: cleanSnapshot,
+      };
     } catch (err) {
       if (err instanceof Error && (err.message.includes("الحد") || err.message.includes("باقتك الحالية"))) {
         throw err;
@@ -608,9 +549,10 @@ export async function saveCloudProject(
         throw new Error("حساب الورشة غير موجود.");
       }
       const tenant = tenantSnap.data() as TenantAccount;
+      const isOwner = isOwnerAdminEmail(tenant.email);
       const currentCount = typeof tenant.projectCount === "number" ? tenant.projectCount : 0;
 
-      if (tenant.role !== "admin") {
+      if (!isOwner) {
         let maxProjects = TRIAL_MAX_PROJECTS;
         let plan: SubscriptionPlan | null = null;
         if (tenant.planId && tenant.planId !== "trial") {
@@ -640,7 +582,7 @@ export async function saveCloudProject(
         updatedAt: serverTimestamp(),
       });
 
-      if (tenant.role !== "admin") {
+      if (!isOwner) {
         tx.update(tenantRef, {
           projectCount: currentCount + 1,
           lastProjectActionId: newId,
@@ -648,7 +590,12 @@ export async function saveCloudProject(
         });
       }
     });
-    return newId;
+    return {
+      id: newId,
+      name: safeName,
+      updatedAt: new Date().toISOString(),
+      data: cleanSnapshot,
+    };
   } catch (err) {
     if (err instanceof Error && (err.message.includes("الحد") || err.message.includes("باقتك الحالية"))) {
       throw err;
@@ -696,7 +643,7 @@ export async function deleteCloudProject(uid: string, projectId: string): Promis
       if (tenantSnap.exists()) {
         const tenant = tenantSnap.data() as TenantAccount;
         const currentCount = typeof tenant.projectCount === "number" ? tenant.projectCount : 0;
-        if (tenant.role !== "admin" && currentCount > 0) {
+        if (!isOwnerAdminEmail(tenant.email) && currentCount > 0) {
           tx.update(tenantRef, {
             projectCount: currentCount - 1,
             lastProjectActionId: projectId,
@@ -835,31 +782,7 @@ export async function submitActivationRequest(
   }
 }
 
-export function subscribeMyActivationRequests(
-  uid: string,
-  onData: (items: ActivationRequestDoc[]) => void
-): () => void {
-  const path = "activation_requests";
-  const q = query(collection(db, "activation_requests"), where("ownerUid", "==", uid));
-  return onSnapshot(
-    q,
-    (snap) => {
-      const items = snap.docs
-        .map((d) => ({ id: d.id, ...(d.data() as Omit<ActivationRequestDoc, "id">) }))
-        .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
-      onData(items);
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        onData([]);
-      }
-    }
-  );
-}
-
-// ==================== ADMIN SERVICES (TRANSACTIONAL & AUDITED) ====================
+// ==================== خدمات المدير الأساسي (قراءات عند الطلب + معاملات ذرية وسجل تدقيق) ====================
 
 async function writeAuditLog(
   adminUser: User,
@@ -886,88 +809,40 @@ async function writeAuditLog(
   }
 }
 
-export function subscribeAllTenants(
-  onData: (tenants: TenantAccount[]) => void
-): () => void {
+export async function fetchAllTenants(): Promise<TenantAccount[]> {
   const path = "tenants";
-  return onSnapshot(
-    query(collection(db, "tenants")),
-    (snap) => {
-      const list = snap.docs
-        .map((d) => d.data() as TenantAccount)
-        .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
-      onData(list);
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        onData([]);
-      }
-    }
-  );
+  try {
+    const snap = await getDocs(query(collection(db, "tenants")));
+    return snap.docs
+      .map((d) => d.data() as TenantAccount)
+      .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
 }
 
-export function subscribeAdditionalAdmins(
-  onData: (admins: AdminRecord[]) => void
-): () => void {
-  const path = "admins";
-  return onSnapshot(
-    query(collection(db, "admins")),
-    (snap) => {
-      const list = snap.docs
-        .map((d) => d.data() as AdminRecord)
-        .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
-      onData(list);
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        onData([]);
-      }
-    }
-  );
-}
-
-export function subscribeAllActivationRequests(
-  onData: (items: ActivationRequestDoc[]) => void
-): () => void {
+export async function fetchAllActivationRequests(): Promise<ActivationRequestDoc[]> {
   const path = "activation_requests";
-  return onSnapshot(
-    query(collection(db, "activation_requests")),
-    (snap) => {
-      const list = snap.docs
-        .map((d) => ({ id: d.id, ...(d.data() as Omit<ActivationRequestDoc, "id">) }))
-        .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
-      onData(list);
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        onData([]);
-      }
-    }
-  );
+  try {
+    const snap = await getDocs(query(collection(db, "activation_requests")));
+    return snap.docs
+      .map((d) => ({ id: d.id, ...(d.data() as Omit<ActivationRequestDoc, "id">) }))
+      .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
 }
 
-export function subscribeAuditLogs(onData: (logs: AuditLogDoc[]) => void): () => void {
+export async function fetchAuditLogs(maxItems = 80): Promise<AuditLogDoc[]> {
   const path = "audit_logs";
-  return onSnapshot(
-    query(collection(db, "audit_logs"), orderBy("createdAt", "desc")),
-    (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<AuditLogDoc, "id">) }));
-      onData(list.slice(0, 120));
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        onData([]);
-      }
-    }
-  );
+  try {
+    const snap = await getDocs(
+      query(collection(db, "audit_logs"), orderBy("createdAt", "desc"), limit(maxItems))
+    );
+    return snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<AuditLogDoc, "id">) }));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
 }
 
 /** تفعيل اشتراك مدفوع داخل معاملة ذرية تبدأ مدتها من تاريخ التأكيد وتسجّل قبل/بعد في audit_logs */
@@ -1319,7 +1194,7 @@ export async function adminReviewActivationRequest(
               subscriptionStatus: "active",
               planId: cleanPlan,
               activeUntil,
-              extraCustomTypesQuota: 0, // حزمة الأنواع الإضافية تُدفع مرة واحدة مع كل اشتراك
+              extraCustomTypesQuota: 0,
               adminNote: sanitizeStr(
                 `تأكيد دفع كليك #${req.id.slice(-6)} (${
                   durationDays === null ? "دائم" : `${durationDays} يوم`
@@ -1353,7 +1228,6 @@ export async function adminReviewActivationRequest(
             });
           }
         } else {
-          // عند رفض الطلب: إذا كانت الحالة pending_payment نعيدها لحالتها الحقيقية (trialing أو expired)
           let nextStatus = prevTenant.subscriptionStatus;
           if (liveReq.requestType !== "extra_types_addon" && prevTenant.subscriptionStatus === "pending_payment") {
             const createdMs = tsToMs(prevTenant.createdAt) || serverNowMs;
@@ -1409,89 +1283,6 @@ export async function adminReviewActivationRequest(
   }
 }
 
-/** إضافة مدير إضافي من قِبل مالك المنصة الأساسي فقط */
-export async function adminAddAdditionalAdmin(
-  ownerUser: User,
-  target: TenantAccount
-): Promise<void> {
-  if (!isOwnerAdminEmail(ownerUser.email) || !ownerUser.emailVerified) {
-    throw new Error("إدارة المدراء الإضافيين متاحة لمالك المنصة الأساسي فقط.");
-  }
-  const logId = makeSafeDocId("log");
-  await runTransaction(db, async (tx) => {
-    const adminRef = doc(db, "admins", target.ownerUid);
-    const tenantRef = doc(db, "tenants", target.ownerUid);
-    const tenantSnap = await tx.get(tenantRef);
-    const prev = tenantSnap.exists() ? (tenantSnap.data() as TenantAccount) : target;
-
-    tx.set(adminRef, {
-      uid: target.ownerUid,
-      email: sanitizeStr(target.email.toLowerCase(), BLUEPRINT_LIMITS.emailMax),
-      createdAt: serverTimestamp(),
-    });
-
-    if (tenantSnap.exists()) {
-      tx.update(tenantRef, {
-        role: "admin",
-        subscriptionStatus: "active",
-        adminNote: "تم منحه صلاحية مدير منصة",
-        updatedAt: serverTimestamp(),
-      });
-    }
-
-    tx.set(doc(db, "audit_logs", logId), {
-      actorUid: ownerUser.uid,
-      actorEmail: sanitizeStr((ownerUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
-      action: "grant_admin",
-      targetTenantId: target.ownerUid,
-      details: sanitizeStr(`منح صلاحية مدير إضافي لـ ${target.email}`, BLUEPRINT_LIMITS.adminNoteMax),
-      beforeState: summarizeTenantState(prev),
-      afterState: summarizeTenantState({ ...prev, role: "admin", subscriptionStatus: "active" }),
-      createdAt: serverTimestamp(),
-    });
-  });
-}
-
-/** سحب صلاحية مدير إضافي من قِبل مالك المنصة الأساسي فقط */
-export async function adminRemoveAdditionalAdmin(
-  ownerUser: User,
-  adminUid: string,
-  adminEmail: string
-): Promise<void> {
-  if (!isOwnerAdminEmail(ownerUser.email) || !ownerUser.emailVerified) {
-    throw new Error("إدارة المدراء الإضافيين متاحة لمالك المنصة الأساسي فقط.");
-  }
-  if (adminUid === ownerUser.uid || isOwnerAdminEmail(adminEmail)) {
-    throw new Error("لا يمكن سحب صلاحية مالك المنصة الأساسي.");
-  }
-  const logId = makeSafeDocId("log");
-  await runTransaction(db, async (tx) => {
-    const adminRef = doc(db, "admins", adminUid);
-    const tenantRef = doc(db, "tenants", adminUid);
-    const tenantSnap = await tx.get(tenantRef);
-
-    tx.delete(adminRef);
-    if (tenantSnap.exists()) {
-      const prev = tenantSnap.data() as TenantAccount;
-      tx.update(tenantRef, {
-        role: "owner",
-        adminNote: "تم سحب صلاحية المدير",
-        updatedAt: serverTimestamp(),
-      });
-      tx.set(doc(db, "audit_logs", logId), {
-        actorUid: ownerUser.uid,
-        actorEmail: sanitizeStr((ownerUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
-        action: "revoke_admin",
-        targetTenantId: adminUid,
-        details: sanitizeStr(`سحب صلاحية المدير من ${adminEmail}`, BLUEPRINT_LIMITS.adminNoteMax),
-        beforeState: summarizeTenantState(prev),
-        afterState: summarizeTenantState({ ...prev, role: "owner" }),
-        createdAt: serverTimestamp(),
-      });
-    }
-  });
-}
-
 export async function adminSavePlan(
   adminUser: User,
   plan: SubscriptionPlan
@@ -1533,6 +1324,7 @@ export async function adminSavePlan(
       features: cleanFeatures,
       updatedAt: serverTimestamp(),
     });
+    cachedPlans = null;
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
   }
@@ -1563,6 +1355,7 @@ export async function adminSavePlatformConfig(
       updatedBy: adminUser.uid,
       updatedAt: serverTimestamp(),
     });
+    cachedPlatformConfig = null;
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
   }
@@ -1572,300 +1365,6 @@ export async function adminSavePlatformConfig(
     "platform",
     `تحديث إعدادات كليك وواتساب (${cfg.whatsappPhone})`
   );
-}
-
-/** حفظ إعدادات التنبيهات الخاصة بالمدير فقط في config_private/notifications */
-export async function adminSavePrivateNotificationConfig(
-  adminUser: User,
-  cfg: PrivateNotificationConfig
-): Promise<void> {
-  const path = "config_private/notifications";
-  const cleanAdminEmail =
-    sanitizeStr(cfg.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax).toLowerCase() ||
-    OWNER_ADMIN_EMAIL;
-  try {
-    await setDoc(doc(db, "config_private", "notifications"), {
-      adminAlertEmail: cleanAdminEmail,
-      notificationsEnabled: Boolean(cfg.notificationsEnabled),
-      updatedBy: adminUser.uid,
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, path);
-  }
-  await writeAuditLog(
-    adminUser,
-    "update_private_notifications_config",
-    "notifications",
-    `تحديث إعدادات تنبيهات الإدارة الخاصة (${cleanAdminEmail})`
-  );
-}
-
-/** فحص حالة ضبط EXPIRY_WEBHOOK_URL على الخادم (للمدير الموثّق فقط) */
-export async function fetchNotificationWebhookStatus(
-  adminUser: User
-): Promise<{ webhookConfigured: boolean; secretConfigured: boolean }> {
-  try {
-    const idToken = await adminUser.getIdToken();
-    const res = await fetch("/api/notifications/status", {
-      method: "GET",
-      headers: { Authorization: `Bearer ${idToken}` },
-      cache: "no-store",
-    });
-    if (!res.ok) return { webhookConfigured: false, secretConfigured: false };
-    const data = (await res.json()) as {
-      webhookConfigured?: boolean;
-      secretConfigured?: boolean;
-    };
-    return {
-      webhookConfigured: Boolean(data.webhookConfigured),
-      secretConfigured: Boolean(data.secretConfigured),
-    };
-  } catch {
-    return { webhookConfigured: false, secretConfigured: false };
-  }
-}
-
-/** إرسال تنبيه قرب الانتهاء عبر خادم Express المحمي مع التحقق الفعلي من الاستجابة */
-async function dispatchExpiryNotificationViaServer(
-  user: User,
-  payload: Record<string, unknown>
-): Promise<{ delivered: boolean; status: "sent" | "failed" | "unconfigured"; error?: string }> {
-  try {
-    const idToken = await user.getIdToken();
-    const resp = await fetch("/api/notifications/expiry", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${idToken}`,
-      },
-      body: JSON.stringify(payload),
-    });
-    const data = (await resp.json().catch(() => ({}))) as {
-      delivered?: boolean;
-      status?: "sent" | "failed" | "unconfigured";
-      error?: string;
-    };
-    if (resp.ok && data.delivered) {
-      return { delivered: true, status: "sent" };
-    }
-    return {
-      delivered: false,
-      status: data.status === "unconfigured" ? "unconfigured" : "failed",
-      error: data.error,
-    };
-  } catch {
-    return {
-      delivered: false,
-      status: "failed",
-      error: "تعذر الاتصال بخادم الإشعارات.",
-    };
-  }
-}
-
-export async function triggerExpiryAlertOnce(
-  user: User,
-  tenant: TenantAccount,
-  access: TenantAccessEvaluation,
-  config: PlatformConfig
-): Promise<void> {
-  if (!user.emailVerified) return;
-  if (!access.isExpiringSoon || !access.expiresAtMs) return;
-  if (access.state !== "trialing" && access.state !== "active") return;
-
-  const dayBucket = Math.floor(access.expiresAtMs / 86400000);
-  const alertId = `exp_${user.uid}_${dayBucket}`.replace(/[^a-zA-Z0-9_\-]/g, "").slice(0, 128);
-  const alertRef = doc(db, "expiry_alerts", alertId);
-  const path = `expiry_alerts/${alertId}`;
-
-  try {
-    const existingSnap = await getDoc(alertRef);
-    if (existingSnap.exists()) return;
-
-    const isTrial = access.state === "trialing";
-    const clampedHours = Math.max(0, Math.min(48, Math.round(access.hoursLeft)));
-
-    await setDoc(alertRef, {
-      tenantId: user.uid,
-      ownerUid: user.uid,
-      email: sanitizeStr((user.email || tenant.email).toLowerCase(), BLUEPRINT_LIMITS.emailMax),
-      workshopName: sanitizeStr(tenant.workshopName || tenant.displayName, BLUEPRINT_LIMITS.nameMax),
-      phone: sanitizeStr(tenant.phone || "", BLUEPRINT_LIMITS.phoneMax),
-      alertType: isTrial ? "trial_expiring" : "subscription_expiring",
-      expiresAt: Timestamp.fromMillis(access.expiresAtMs),
-      hoursLeft: clampedHours,
-      adminEmail: OWNER_ADMIN_EMAIL,
-      emailStatus: "pending",
-      acknowledged: false,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-
-    const expiresAtIso = new Date(access.expiresAtMs).toISOString().slice(0, 10);
-    const content = buildExpiryReminderEmailContent({
-      workshopName: tenant.workshopName || tenant.displayName || "ورشتي",
-      userEmail: tenant.email,
-      adminEmail: OWNER_ADMIN_EMAIL,
-      phone: tenant.phone,
-      isTrial,
-      remainingLabel: access.remainingLabel,
-      expiresAtIso,
-      whatsappPhone: config.whatsappPhone || DEFAULT_WHATSAPP_PHONE,
-    });
-
-    const result = await dispatchExpiryNotificationViaServer(user, {
-      alertId,
-      tenantId: user.uid,
-      adminEmail: OWNER_ADMIN_EMAIL,
-      userEmail: tenant.email,
-      workshopName: tenant.workshopName || tenant.displayName || "ورشتي",
-      phone: tenant.phone || "",
-      alertType: isTrial ? "trial_expiring" : "subscription_expiring",
-      hoursLeft: clampedHours,
-      remainingLabel: access.remainingLabel,
-      expiresAtIso,
-      subject: content.subject,
-      userBody: content.userBody,
-      adminBody: content.adminBody,
-    });
-
-    if (result.status !== "unconfigured") {
-      await updateDoc(alertRef, {
-        emailStatus: result.delivered ? "sent" : "failed",
-        hoursLeft: clampedHours,
-        updatedAt: serverTimestamp(),
-      });
-    }
-  } catch (err) {
-    try {
-      handleFirestoreError(err, OperationType.WRITE, path);
-    } catch {
-      // مسجّل بالفعل بدون تعطيل الواجهة
-    }
-  }
-}
-
-export function subscribeAllExpiryAlerts(
-  onData: (items: ExpiryAlertDoc[]) => void
-): () => void {
-  const path = "expiry_alerts";
-  return onSnapshot(
-    query(collection(db, "expiry_alerts")),
-    (snap) => {
-      const list = snap.docs
-        .map((d) => ({ id: d.id, ...(d.data() as Omit<ExpiryAlertDoc, "id">) }))
-        .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
-      onData(list);
-    },
-    (error) => {
-      try {
-        handleFirestoreError(error, OperationType.LIST, path);
-      } catch {
-        onData([]);
-      }
-    }
-  );
-}
-
-export async function adminDispatchExpiryEmail(
-  adminUser: User,
-  target: TenantAccount,
-  access: TenantAccessEvaluation,
-  config: PlatformConfig,
-  privateConfig: PrivateNotificationConfig,
-  existingAlertId?: string
-): Promise<{
-  sentViaServer: boolean;
-  status: "sent" | "failed" | "unconfigured";
-  error?: string;
-  mailtoUrl: string;
-}> {
-  const adminEmail =
-    sanitizeStr(privateConfig.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax) ||
-    OWNER_ADMIN_EMAIL;
-  const isTrial = access.state === "trialing";
-  const expiresAtIso = access.expiresAtMs
-    ? new Date(access.expiresAtMs).toISOString().slice(0, 10)
-    : "قريباً";
-
-  const content = buildExpiryReminderEmailContent({
-    workshopName: target.workshopName || target.displayName || "ورشتي",
-    userEmail: target.email,
-    adminEmail,
-    phone: target.phone,
-    isTrial,
-    remainingLabel: access.remainingLabel,
-    expiresAtIso,
-    whatsappPhone: config.whatsappPhone || DEFAULT_WHATSAPP_PHONE,
-  });
-
-  const alertId =
-    existingAlertId ||
-    `exp_${target.ownerUid}_${Math.floor((access.expiresAtMs || Date.now()) / 86400000)}`;
-
-  const result = await dispatchExpiryNotificationViaServer(adminUser, {
-    alertId,
-    tenantId: target.ownerUid,
-    adminEmail,
-    userEmail: target.email,
-    workshopName: target.workshopName || target.displayName || "ورشتي",
-    phone: target.phone || "",
-    alertType: isTrial ? "trial_expiring" : "subscription_expiring",
-    hoursLeft: Math.max(0, Math.min(48, Math.round(access.hoursLeft))),
-    remainingLabel: access.remainingLabel,
-    expiresAtIso,
-    subject: content.subject,
-    userBody: content.userBody,
-    adminBody: content.adminBody,
-    forceResend: true,
-  });
-
-  if (existingAlertId) {
-    try {
-      await updateDoc(doc(db, "expiry_alerts", existingAlertId), {
-        emailStatus: result.delivered
-          ? "sent"
-          : result.status === "unconfigured"
-            ? "manual"
-            : "failed",
-        acknowledged: true,
-        updatedAt: serverTimestamp(),
-      });
-    } catch {
-      // تجاهل إن لم توجد الوثيقة
-    }
-  }
-
-  await writeAuditLog(
-    adminUser,
-    "send_expiry_reminder_email",
-    target.ownerUid,
-    `إرسال تنبيه قرب الانتهاء إلى ${target.email} ونسخة إلى ${adminEmail} (${
-      result.delivered ? "إرسال مؤكد من الخادم" : result.status === "unconfigured" ? "بريد يدوي" : "فشل الإرسال"
-    })`
-  );
-
-  return {
-    sentViaServer: result.delivered,
-    status: result.status,
-    error: result.error,
-    mailtoUrl: content.mailtoUrl,
-  };
-}
-
-export async function adminAcknowledgeExpiryAlert(
-  _adminUser: User,
-  alertId: string
-): Promise<void> {
-  const path = `expiry_alerts/${alertId}`;
-  try {
-    await updateDoc(doc(db, "expiry_alerts", alertId), {
-      acknowledged: true,
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, path);
-  }
 }
 
 export const PASSWORD_RESET_TTL_MS = 10 * 60 * 1000; // 10 دقائق

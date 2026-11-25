@@ -10,6 +10,7 @@ import {
   LogOut,
   Mail,
   MessageCircle,
+  RefreshCw,
   ShieldCheck,
   X,
 } from "lucide-react";
@@ -47,6 +48,7 @@ interface SubscriptionModalProps {
   config: PlatformConfig;
   myRequests: ActivationRequestDoc[];
   onClose?: () => void;
+  onRefreshAccount?: () => Promise<void>;
   onSignOut: () => Promise<void>;
   onToast: (msg: string, ms?: number) => void;
 }
@@ -60,6 +62,7 @@ export function SubscriptionModal({
   config,
   myRequests,
   onClose,
+  onRefreshAccount,
   onSignOut,
   onToast,
 }: SubscriptionModalProps) {
@@ -79,6 +82,7 @@ export function SubscriptionModal({
   const [submitting, setSubmitting] = useState(false);
   const [submittingAddon, setSubmittingAddon] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [curPass, setCurPass] = useState("");
   const [newPass, setNewPass] = useState("");
   const [confirmNewPass, setConfirmNewPass] = useState("");
@@ -151,6 +155,19 @@ export function SubscriptionModal({
     (r) => r.status === "pending" && r.requestType === "extra_types_addon"
   );
 
+  const handleRefresh = async () => {
+    if (!onRefreshAccount) return;
+    setRefreshing(true);
+    try {
+      await onRefreshAccount();
+      onToast("تم تحديث حالة الحساب والاشتراك ✓");
+    } catch {
+      onToast("تعذر تحديث حالة الحساب حالياً");
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   const handleRequestExtraTypesAddon = async () => {
     setSubmittingAddon(true);
     try {
@@ -167,6 +184,7 @@ export function SubscriptionModal({
         addonPriceJod: currentLimits.extraTypesPackPriceJod,
       });
       setAddonNote("");
+      await onRefreshAccount?.();
       onToast("تم تسجيل طلب حزمة الأنواع الإضافية بنجاح! سيتم إضافتها لحسابك فور تأكيد حوالة كليك ✓", 4200);
     } catch (err) {
       onToast(err instanceof Error ? err.message : "تعذر تسجيل طلب الحزمة الإضافية", 3800);
@@ -182,6 +200,7 @@ export function SubscriptionModal({
         workshopName: workshopName.trim() || tenant.displayName || "ورشتي",
         phone: phone.trim(),
       });
+      await onRefreshAccount?.();
       onToast("تم حفظ بيانات الورشة ✓");
     } catch {
       onToast("تعذر حفظ بيانات الورشة");
@@ -207,6 +226,7 @@ export function SubscriptionModal({
         cliqNote: cliqNote.trim(),
       });
       setCliqNote("");
+      await onRefreshAccount?.();
       onToast("تم تسجيل طلب التفعيل في النظام! أرسله الآن عبر واتساب لتسريع التفعيل ✓", 4000);
     } catch {
       onToast("تعذر تسجيل طلب التفعيل، يرجى المحاولة مرة أخرى");
@@ -321,7 +341,7 @@ export function SubscriptionModal({
                 : access.state === "owner_free"
                   ? "حساب مالك المنصة — مجاني دائم بدون قيود."
                   : access.state === "active"
-                    ? `اشتراك فعّال (${selectedPlan?.name || tenant.planId})${access.activeUntilMs ? ` · متبقي ${access.daysLeft} يوم` : " · دائم"}${access.hasPendingPayment ? " · طلب تجديد قيد المراجعة" : ""}`
+                    ? `اشتراك فعّال (${currentPlanObj?.name || tenant.planId})${access.activeUntilMs ? ` · متبقي ${access.daysLeft} يوم` : " · دائم"}${access.hasPendingPayment ? " · طلب تجديد قيد المراجعة" : ""}`
                     : `تجربة مجانية فعالة · متبقي ${access.daysLeft} ${access.daysLeft === 1 ? "يوم" : "أيام"}${access.hasPendingPayment ? " · طلب دفع قيد المراجعة" : ""}`}
             </p>
           </div>
@@ -352,7 +372,7 @@ export function SubscriptionModal({
                 </>
               ) : null}
               تقديم الطلب لا يفعّل الاشتراك تلقائياً؛ عند تأكيد المدير لاستلام حوالة كليك تبدأ مدة
-              الباقة من تاريخ التأكيد ويُفتح حسابك فوراً.
+              الباقة من تاريخ التأكيد ويُفتح حسابك فور الضغط على «تحديث حالة الحساب».
             </small>
           </div>
         </div>
@@ -680,11 +700,24 @@ export function SubscriptionModal({
           <LogOut className="ico-xs" aria-hidden="true" />
           <span>تسجيل الخروج</span>
         </button>
-        {!locked && onClose && (
-          <button type="button" className="btn sm" onClick={onClose}>
-            إغلاق
-          </button>
-        )}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {onRefreshAccount && (
+            <button
+              type="button"
+              className="btn sm p"
+              disabled={refreshing}
+              onClick={() => void handleRefresh()}
+            >
+              <RefreshCw className="ico-xs" aria-hidden="true" />
+              <span>{refreshing ? "جارٍ التحديث..." : "تحديث حالة الحساب"}</span>
+            </button>
+          )}
+          {!locked && onClose && (
+            <button type="button" className="btn sm" onClick={onClose}>
+              إغلاق
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

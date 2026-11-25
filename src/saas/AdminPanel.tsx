@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { User } from "firebase/auth";
 import {
   BellRing,
@@ -10,13 +10,12 @@ import {
   KeyRound,
   Mail,
   MessageCircle,
+  RefreshCw,
   RotateCcw,
   Save,
   Search,
   Settings,
   Shield,
-  ShieldPlus,
-  Trash2,
   UserPlus,
   Users,
   X,
@@ -24,53 +23,38 @@ import {
 } from "lucide-react";
 import firebaseConfig from "../../firebase-applet-config.json";
 import {
-  APPS_SCRIPT_EMAIL_TEMPLATE,
   BILLING_CYCLE_LABELS,
   DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
   DEFAULT_EXTRA_TYPES_PACK_SIZE,
-  DEFAULT_PRIVATE_NOTIFICATION_CONFIG,
   DEFAULT_WHATSAPP_PHONE,
   OWNER_ADMIN_EMAIL,
   buildExpiryReminderEmailContent,
   evaluateTenantAccess,
   getPlanDefaultsById,
-  isOwnerAdminEmail,
   normalizeJordanWhatsApp,
   tsToMs,
 } from "./types";
 import type {
   ActivationRequestDoc,
-  AdminRecord,
   AuditLogDoc,
-  ExpiryAlertDoc,
   PlatformConfig,
-  PrivateNotificationConfig,
   SubscriptionPlan,
   TenantAccount,
 } from "./types";
 import {
-  adminAcknowledgeExpiryAlert,
   adminActivateTenant,
-  adminAddAdditionalAdmin,
   adminCreateWorkshopAccount,
-  adminDispatchExpiryEmail,
   adminExtendTrial,
   adminGrantExtraTypesQuota,
   adminReactivateTenant,
-  adminRemoveAdditionalAdmin,
   adminReviewActivationRequest,
   adminSavePlan,
   adminSavePlatformConfig,
-  adminSavePrivateNotificationConfig,
   adminSendPasswordResetLink,
   adminSuspendTenant,
-  fetchNotificationWebhookStatus,
-  subscribeAdditionalAdmins,
-  subscribeAllActivationRequests,
-  subscribeAllExpiryAlerts,
-  subscribeAllTenants,
-  subscribeAuditLogs,
-  subscribePrivateNotificationConfig,
+  fetchAllActivationRequests,
+  fetchAllTenants,
+  fetchAuditLogs,
 } from "./service";
 
 interface AdminPanelProps {
@@ -79,6 +63,8 @@ interface AdminPanelProps {
   config: PlatformConfig;
   serverNowMs: number;
   onClose: () => void;
+  onPlatformDataChanged?: () => Promise<void>;
+  onCountsUpdated?: (pendingReqs: number, expiringSoon: number) => void;
   onToast: (msg: string, ms?: number) => void;
 }
 
@@ -90,21 +76,16 @@ export function AdminPanel({
   config,
   serverNowMs,
   onClose,
+  onPlatformDataChanged,
+  onCountsUpdated,
   onToast,
 }: AdminPanelProps) {
   const [tab, setTab] = useState<AdminTab>("tenants");
   const [tenants, setTenants] = useState<TenantAccount[]>([]);
-  const [additionalAdmins, setAdditionalAdmins] = useState<AdminRecord[]>([]);
   const [requests, setRequests] = useState<ActivationRequestDoc[]>([]);
-  const [expiryAlerts, setExpiryAlerts] = useState<ExpiryAlertDoc[]>([]);
   const [logs, setLogs] = useState<AuditLogDoc[]>([]);
-  const [privateCfg, setPrivateCfg] = useState<PrivateNotificationConfig>(
-    DEFAULT_PRIVATE_NOTIFICATION_CONFIG
-  );
-  const [webhookStatus, setWebhookStatus] = useState<{
-    webhookConfigured: boolean;
-    secretConfigured: boolean;
-  }>({ webhookConfigured: false, secretConfigured: false });
+  const [loading, setLoading] = useState(false);
+  const auditLoadedRef = useRef(false);
 
   const [searchQ, setSearchQ] = useState("");
   const [statusFilter, setStatusFilter] = useState<
@@ -131,58 +112,84 @@ export function AdminPanel({
 
   // مسودات الإعدادات
   const [cfgDraft, setCfgDraft] = useState<PlatformConfig>(config);
-  const [privDraft, setPrivDraft] = useState<PrivateNotificationConfig>(
-    DEFAULT_PRIVATE_NOTIFICATION_CONFIG
-  );
   const [plansDraft, setPlansDraft] = useState<SubscriptionPlan[]>(plans);
-
-  const isPrimaryOwner = useMemo(
-    () => isOwnerAdminEmail(adminUser.email) && Boolean(adminUser.emailVerified),
-    [adminUser.email, adminUser.emailVerified]
-  );
 
   useEffect(() => {
     setCfgDraft(config);
   }, [config]);
 
   useEffect(() => {
-    setPrivDraft(privateCfg);
-  }, [privateCfg]);
-
-  useEffect(() => {
     setPlansDraft(plans);
   }, [plans]);
 
+  const loadCoreData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [allTenants, allReqs] = await Promise.all([
+        fetchAllTenants(),
+        fetchAllActivationRequests(),
+      ]);
+      setTenants(allTenants);
+      setRequests(allReqs);
+      const pending = allReqs.filter((r) => r.status === "pending").length;
+      const expiring = allTenants.filter(
+        (t) => evaluateTenantAccess(t, serverNowMs).isExpiringSoon
+      ).length;
+      onCountsUpdated?.(pending, expiring);
+    } catch {
+      onToast("تعذر تحميل بيانات الإدارة حالياً");
+    } finally {
+      setLoading(false);
+    }
+  }, [serverNowMs, onCountsUpdated, onToast]);
+
+  const loadAuditData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const list = await fetchAuditLogs(80);
+      setLogs(list);
+      auditLoadedRef.current = true;
+    } catch {
+      onToast("تعذر تحميل سجل التدقيق حالياً");
+    } finally {
+      setLoading(false);
+    }
+  }, [onToast]);
+
+  // تحميل مرة واحدة عند فتح لوحة الإدارة فقط (بدون مستمعات onSnapshot مستمرة لتوفير حصة Spark)
   useEffect(() => {
-    const unsub1 = subscribeAllTenants(setTenants);
-    const unsub2 = subscribeAllActivationRequests(setRequests);
-    const unsub3 = subscribeAuditLogs(setLogs);
-    const unsub4 = subscribeAllExpiryAlerts(setExpiryAlerts);
-    const unsub5 = subscribePrivateNotificationConfig(setPrivateCfg);
-    const unsub6 = isPrimaryOwner ? subscribeAdditionalAdmins(setAdditionalAdmins) : () => {};
+    void loadCoreData();
+  }, [loadCoreData]);
 
-    void fetchNotificationWebhookStatus(adminUser).then(setWebhookStatus);
+  // تحميل سجل التدقيق عند الطلب فقط عند فتح تبويب السجل
+  useEffect(() => {
+    if (tab === "audit" && !auditLoadedRef.current) {
+      void loadAuditData();
+    }
+  }, [tab, loadAuditData]);
 
-    return () => {
-      unsub1();
-      unsub2();
-      unsub3();
-      unsub4();
-      unsub5();
-      unsub6();
-    };
-  }, [adminUser, isPrimaryOwner]);
+  const handleManualRefresh = async () => {
+    await loadCoreData();
+    if (tab === "audit") {
+      await loadAuditData();
+    } else {
+      auditLoadedRef.current = false;
+    }
+    if (tab === "settings") {
+      await onPlatformDataChanged?.();
+    }
+    onToast("تم تحديث بيانات لوحة الإدارة ✓");
+  };
 
   const expiringTenants = useMemo(() => {
     return tenants
       .map((t) => ({
         tenant: t,
         access: evaluateTenantAccess(t, serverNowMs),
-        alert: expiryAlerts.find((a) => a.ownerUid === t.ownerUid),
       }))
       .filter((item) => item.access.isExpiringSoon)
       .sort((a, b) => a.access.hoursLeft - b.access.hoursLeft);
-  }, [tenants, expiryAlerts, serverNowMs]);
+  }, [tenants, serverNowMs]);
 
   const stats = useMemo(() => {
     let active = 0;
@@ -231,11 +238,6 @@ export function AdminPanel({
     });
   }, [tenants, searchQ, statusFilter, serverNowMs]);
 
-  const adminUidSet = useMemo(
-    () => new Set(additionalAdmins.map((a) => a.uid)),
-    [additionalAdmins]
-  );
-
   const handleActivate = async (t: TenantAccount, durationDays: number | null) => {
     setBusyId(t.ownerUid);
     try {
@@ -251,6 +253,8 @@ export function AdminPanel({
         },
         serverNowMs
       );
+      auditLoadedRef.current = false;
+      await loadCoreData();
       onToast(`تم تفعيل حساب ${t.workshopName || t.email} بنجاح ✓`);
     } catch {
       onToast("تعذر تفعيل الحساب");
@@ -263,6 +267,8 @@ export function AdminPanel({
     setBusyId(t.ownerUid);
     try {
       await adminExtendTrial(adminUser, t, days, serverNowMs);
+      auditLoadedRef.current = false;
+      await loadCoreData();
       onToast(`تم تمديد التجربة +${days} أيام لـ ${t.workshopName || t.email} ✓`);
     } catch {
       onToast("تعذر تمديد التجربة");
@@ -275,6 +281,8 @@ export function AdminPanel({
     setBusyId(t.ownerUid);
     try {
       await adminSuspendTenant(adminUser, t, "تم إغلاق الحساب من الإدارة");
+      auditLoadedRef.current = false;
+      await loadCoreData();
       onToast(`تم إيقاف حساب ${t.workshopName || t.email} فوراً`);
     } catch {
       onToast("تعذر إيقاف الحساب");
@@ -287,6 +295,8 @@ export function AdminPanel({
     setBusyId(t.ownerUid);
     try {
       await adminReactivateTenant(adminUser, t, serverNowMs);
+      auditLoadedRef.current = false;
+      await loadCoreData();
       onToast(`تمت إعادة تفعيل حساب ${t.workshopName || t.email} ✓`);
     } catch {
       onToast("تعذر إعادة تفعيل الحساب");
@@ -299,6 +309,8 @@ export function AdminPanel({
     setBusyId(t.ownerUid);
     try {
       await adminGrantExtraTypesQuota(adminUser, t, delta);
+      auditLoadedRef.current = false;
+      await loadCoreData();
       onToast(`تمت إضافة +${delta} أنواع مخصصة للورشة ${t.workshopName || t.email} ✓`);
     } catch {
       onToast("تعذر إضافة حصة الأنواع المخصصة");
@@ -312,6 +324,8 @@ export function AdminPanel({
     try {
       const duration = BILLING_CYCLE_LABELS[req.billingCycle]?.days || 30;
       await adminReviewActivationRequest(adminUser, req, decision, duration, serverNowMs);
+      auditLoadedRef.current = false;
+      await loadCoreData();
       const isAddon = req.requestType === "extra_types_addon";
       onToast(
         decision === "approved"
@@ -328,36 +342,13 @@ export function AdminPanel({
     }
   };
 
-  const handleGrantAdmin = async (t: TenantAccount) => {
-    setBusyId(`adm_${t.ownerUid}`);
-    try {
-      await adminAddAdditionalAdmin(adminUser, t);
-      onToast(`تم منح صلاحية مدير إضافي لـ ${t.email} ✓`);
-    } catch (err) {
-      onToast(err instanceof Error ? err.message : "تعذر منح الصلاحية");
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  const handleRevokeAdmin = async (adm: AdminRecord) => {
-    setBusyId(`adm_${adm.uid}`);
-    try {
-      await adminRemoveAdditionalAdmin(adminUser, adm.uid, adm.email);
-      onToast(`تم سحب صلاحية المدير من ${adm.email} ✓`);
-    } catch (err) {
-      onToast(err instanceof Error ? err.message : "تعذر سحب الصلاحية");
-    } finally {
-      setBusyId(null);
-    }
-  };
-
   const handleSaveConfig = async () => {
     setBusyId("cfg");
     try {
       await adminSavePlatformConfig(adminUser, cfgDraft);
-      await adminSavePrivateNotificationConfig(adminUser, privDraft);
-      onToast("تم حفظ إعدادات كليك وواتساب وإعدادات الإدارة الخاصة ✓");
+      auditLoadedRef.current = false;
+      await onPlatformDataChanged?.();
+      onToast("تم حفظ إعدادات كليك وواتساب ✓");
     } catch {
       onToast("تعذر حفظ الإعدادات");
     } finally {
@@ -369,6 +360,8 @@ export function AdminPanel({
     setBusyId(`plan_${pl.id}`);
     try {
       await adminSavePlan(adminUser, pl);
+      auditLoadedRef.current = false;
+      await onPlatformDataChanged?.();
       onToast(`تم تحديث باقة «${pl.name}» ✓`);
     } catch {
       onToast("تعذر تحديث الباقة");
@@ -381,6 +374,7 @@ export function AdminPanel({
     setBusyId(`reset_${t.ownerUid}`);
     try {
       await adminSendPasswordResetLink(adminUser, t);
+      auditLoadedRef.current = false;
       setResetLinkSent(true);
       onToast(`تم إرسال رابط إعادة تعيين كلمة المرور إلى ${t.email} ✓`, 4000);
     } catch (err) {
@@ -411,6 +405,7 @@ export function AdminPanel({
         planId: "trial",
         durationDays: null,
       });
+      auditLoadedRef.current = false;
       setCreatedCreds({
         email: newEmail.trim().toLowerCase(),
         password: newPassword,
@@ -436,48 +431,6 @@ export function AdminPanel({
     }
   };
 
-  const handleDispatchExpiryEmail = async (
-    target: TenantAccount,
-    access: ReturnType<typeof evaluateTenantAccess>,
-    existingAlertId?: string
-  ) => {
-    setBusyId(`exp_${target.ownerUid}`);
-    try {
-      const res = await adminDispatchExpiryEmail(
-        adminUser,
-        target,
-        access,
-        config,
-        privateCfg,
-        existingAlertId
-      );
-      if (res.sentViaServer) {
-        onToast(`تم تأكيد إرسال بريد التنبيه عبر الخادم إلى ${target.email} وبريد الإدارة ✓`, 4000);
-      } else if (res.status === "unconfigured") {
-        onToast("الخادم غير مربوط بـ Webhook بعد؛ تم تجهيز رسالة البريد اليدوية ✓", 3800);
-        window.location.href = res.mailtoUrl;
-      } else {
-        onToast(res.error || "فشل تسليم البريد عبر الخادم — يمكنك استخدام البريد اليدوي", 4200);
-      }
-    } catch {
-      onToast("تعذر إرسال تنبيه البريد");
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  const handleAckAlert = async (alertId: string) => {
-    setBusyId(`ack_${alertId}`);
-    try {
-      await adminAcknowledgeExpiryAlert(adminUser, alertId);
-      onToast("تم تأكيد مراجعة التنبيه ✓");
-    } catch {
-      onToast("تعذر تحديث حالة التنبيه");
-    } finally {
-      setBusyId(null);
-    }
-  };
-
   const firebaseAuthConsoleUrl = `https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/users`;
 
   const fmtDate = (ms: number | null) => {
@@ -495,12 +448,8 @@ export function AdminPanel({
       extend_trial: "تمديد فترة التجربة",
       suspend_tenant: "إيقاف حساب",
       reactivate_tenant: "إعادة تفعيل حساب",
-      grant_admin: "منح صلاحية مدير إضافي",
-      revoke_admin: "سحب صلاحية مدير إضافي",
       save_plan: "تعديل باقة اشتراك",
       update_platform_config: "تحديث إعدادات كليك وواتساب",
-      update_private_notifications_config: "تحديث إعدادات تنبيهات الإدارة",
-      send_expiry_reminder_email: "إرسال تنبيه قرب انتهاء",
       send_password_reset: "إرسال رابط تعيين كلمة مرور",
       create_workshop_manual: "إنشاء حساب ورشة يدوياً",
     };
@@ -514,13 +463,25 @@ export function AdminPanel({
           <div className="saas-sub-title">
             <Shield className="ico" aria-hidden="true" />
             <div>
-              <h2>لوحة إدارة المنصة ({isPrimaryOwner ? "المالك الأساسي" : "مدير"})</h2>
-              <p>تحكم آمن باشتراكات الورش، طلبات كليك، الباقات، وسجل التدقيق</p>
+              <h2>لوحة إدارة المنصة (المالك الأساسي)</h2>
+              <p>تحكم آمن ومؤرّخ باشتراكات الورش، طلبات كليك، الباقات، وسجل التدقيق</p>
             </div>
           </div>
-          <button type="button" className="saas-close-btn" aria-label="إغلاق" onClick={onClose}>
-            <X className="ico-sm" aria-hidden="true" />
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              type="button"
+              className="btn sm"
+              disabled={loading}
+              aria-label="تحديث البيانات"
+              onClick={() => void handleManualRefresh()}
+            >
+              <RefreshCw className="ico-xs" aria-hidden="true" />
+              <span>{loading ? "تحديث..." : "تحديث"}</span>
+            </button>
+            <button type="button" className="saas-close-btn" aria-label="إغلاق" onClick={onClose}>
+              <X className="ico-sm" aria-hidden="true" />
+            </button>
+          </div>
         </div>
 
         {/* التبويبات (ثابتة وملتفّة بشكل واضح دون قصّ نص) */}
@@ -714,7 +675,7 @@ export function AdminPanel({
               <div className="saas-admin-list">
                 {filteredTenants.map((t) => {
                   const ev = evaluateTenantAccess(t, serverNowMs);
-                  const isBusy = busyId === t.ownerUid || busyId === `adm_${t.ownerUid}`;
+                  const isBusy = busyId === t.ownerUid;
                   const chosenPlan =
                     planChoiceByTenant[t.ownerUid] ||
                     (t.planId && t.planId !== "trial" && t.planId !== "owner_free"
@@ -733,7 +694,7 @@ export function AdminPanel({
                         </div>
                         <span className={`saas-status-tag st-${ev.state}`}>
                           {ev.state === "owner_free"
-                            ? "مدير (دائم)"
+                            ? "المالك (دائم)"
                             : ev.state === "active"
                               ? `مشترك (${ev.activeUntilMs ? `${ev.daysLeft} يوم` : "دائم"})`
                               : ev.state === "trialing"
@@ -857,23 +818,16 @@ export function AdminPanel({
                               إيقاف الحساب
                             </button>
                           )}
-                          {isPrimaryOwner && !adminUidSet.has(t.ownerUid) && (
-                            <button
-                              type="button"
-                              className="btn sm"
-                              disabled={isBusy}
-                              onClick={() => void handleGrantAdmin(t)}
-                            >
-                              <ShieldPlus className="ico-xs" aria-hidden="true" />
-                              <span>ترقية كمدير</span>
-                            </button>
-                          )}
                         </div>
                       )}
                     </div>
                   );
                 })}
-                {!filteredTenants.length && <p className="saas-empty">لا توجد ورش مطابقة للبحث.</p>}
+                {!filteredTenants.length && (
+                  <p className="saas-empty">
+                    {loading ? "جارٍ تحميل الورش..." : "لا توجد ورش مطابقة للبحث."}
+                  </p>
+                )}
               </div>
             </>
           )}
@@ -985,32 +939,31 @@ export function AdminPanel({
                   </div>
                 );
               })}
-              {!requests.length && <p className="saas-empty">لا توجد طلبات دفع عبر كليك حتى الآن.</p>}
+              {!requests.length && (
+                <p className="saas-empty">
+                  {loading ? "جارٍ تحميل طلبات كليك..." : "لا توجد طلبات دفع عبر كليك حتى الآن."}
+                </p>
+              )}
             </div>
           )}
 
-          {/* 3. تنبيهات قرب الانتهاء (< يومين) */}
+          {/* 3. تنبيهات قرب الانتهاء (< يومين) — محسوبة محلياً دون استهلاك قراءات أو كتابات إضافية */}
           {tab === "alerts" && (
             <div className="saas-admin-list">
               <div className="saas-note-banner">
-                <b>تنبيهات الحسابات المتبقي لها أقل من يومين (تجريبية أو مدفوعة):</b>{" "}
-                بريد الإدارة الخاص المستلم:{" "}
-                <b dir="ltr">{privateCfg.adminAlertEmail || OWNER_ADMIN_EMAIL}</b> —{" "}
-                {webhookStatus.webhookConfigured
-                  ? `الإرسال الآمن عبر الخادم مفعّل ومؤكّد ✓ ${
-                      webhookStatus.secretConfigured ? "(محمي بمفتاح سري)" : ""
-                    }`
-                  : "خادم الإشعارات غير مربوط بـ EXPIRY_WEBHOOK_URL بعد؛ يمكنك الإرسال يدوياً بنقرة واحدة أو ضبط متغير البيئة في الخادم."}
+                <b>الحسابات المتبقي لها أقل من يومين (تجريبية أو مدفوعة):</b>{" "}
+                تظهر التنبيهات للمستخدم تلقائياً داخل التطبيق، ويمكنك هنا تذكير الورشة فوراً عبر
+                البريد الإلكتروني أو واتساب مجاناً ضمن خطة Spark بدون أي خادم مدفوع.
               </div>
 
-              {expiringTenants.map(({ tenant: t, access: ev, alert }) => {
-                const isBusy = busyId === `exp_${t.ownerUid}` || busyId === t.ownerUid;
+              {expiringTenants.map(({ tenant: t, access: ev }) => {
+                const isBusy = busyId === t.ownerUid;
                 const isTrial = ev.state === "trialing";
                 const expiresAtIso = fmtDate(ev.expiresAtMs);
                 const emailPkg = buildExpiryReminderEmailContent({
                   workshopName: t.workshopName || t.displayName || "ورشتي",
                   userEmail: t.email,
-                  adminEmail: privateCfg.adminAlertEmail || OWNER_ADMIN_EMAIL,
+                  adminEmail: OWNER_ADMIN_EMAIL,
                   phone: t.phone,
                   isTrial,
                   remainingLabel: ev.remainingLabel,
@@ -1043,40 +996,14 @@ export function AdminPanel({
 
                     <div className="saas-tenant-meta">
                       <span>تاريخ الانتهاء: <b>{expiresAtIso}</b></span>
-                      <span>
-                        حالة بريد التنبيه:{" "}
-                        <b>
-                          {alert?.emailStatus === "sent"
-                            ? "تم التسليم المؤكّد من الخادم ✓"
-                            : alert?.emailStatus === "manual"
-                              ? "تم التجهيز للبريد اليدوي ✓"
-                              : alert?.emailStatus === "failed"
-                                ? "فشل التسليم — أعد المحاولة"
-                                : "بانتظار الإرسال"}
-                        </b>
-                      </span>
+                      <span>الباقة: <b>{plans.find((p) => p.id === t.planId)?.name || t.planId}</b></span>
                     </div>
 
                     <div className="saas-tenant-acts">
-                      <button
-                        type="button"
-                        className="btn sm p"
-                        disabled={isBusy}
-                        onClick={() => void handleDispatchExpiryEmail(t, ev, alert?.id)}
-                      >
+                      <a href={emailPkg.mailtoUrl} className="btn sm p">
                         <Mail className="ico-xs" aria-hidden="true" />
-                        <span>
-                          {webhookStatus.webhookConfigured
-                            ? "إرسال تنبيه عبر الخادم (للمستخدم + الإدارة)"
-                            : "إرسال إيميل تنبيه يدوي (للمستخدم + نسخة للإدارة)"}
-                        </span>
-                      </button>
-                      {webhookStatus.webhookConfigured && (
-                        <a href={emailPkg.mailtoUrl} className="btn sm">
-                          <Mail className="ico-xs" aria-hidden="true" />
-                          <span>فتح في تطبيق البريد</span>
-                        </a>
-                      )}
+                        <span>إرسال تذكير بالبريد الإلكتروني</span>
+                      </a>
                       {waReminder && (
                         <a
                           href={waReminder}
@@ -1096,17 +1023,6 @@ export function AdminPanel({
                       >
                         تجديد شهر
                       </button>
-                      {alert && !alert.acknowledged && (
-                        <button
-                          type="button"
-                          className="btn sm"
-                          disabled={busyId === `ack_${alert.id}`}
-                          onClick={() => void handleAckAlert(alert.id)}
-                        >
-                          <CheckCircle2 className="ico-xs" aria-hidden="true" />
-                          <span>تمت المراجعة</span>
-                        </button>
-                      )}
                     </div>
                   </div>
                 );
@@ -1120,7 +1036,7 @@ export function AdminPanel({
             </div>
           )}
 
-          {/* 4. الباقات وإعدادات كليك والإعدادات الخاصة وإدارة المدراء */}
+          {/* 4. الباقات وإعدادات كليك وواتساب */}
           {tab === "settings" && (
             <div className="saas-admin-list">
               <div className="saas-section">
@@ -1171,72 +1087,6 @@ export function AdminPanel({
                   />
                 </label>
 
-                <hr style={{ borderColor: "var(--bd)", margin: "12px 0" }} />
-                <h3>إعدادات التنبيهات الخاصة بالإدارة (معزولة ولا يراها العملاء)</h3>
-                <div className="saas-form-row">
-                  <label>
-                    <span>بريد الإدارة المستلم لتنبيهات الانتهاء</span>
-                    <input
-                      type="email"
-                      dir="ltr"
-                      value={privDraft.adminAlertEmail}
-                      maxLength={200}
-                      onChange={(e) =>
-                        setPrivDraft({ ...privDraft, adminAlertEmail: e.target.value })
-                      }
-                    />
-                  </label>
-                  <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 22 }}>
-                    <input
-                      type="checkbox"
-                      checked={privDraft.notificationsEnabled}
-                      onChange={(e) =>
-                        setPrivDraft({ ...privDraft, notificationsEnabled: e.target.checked })
-                      }
-                    />
-                    <span>تفعيل تنبيهات قرب الانتهاء</span>
-                  </label>
-                </div>
-
-                <div className="saas-note-banner" style={{ marginBottom: 10 }}>
-                  <b>أمان رابط Webhook:</b> لحماية النظام، لا يُخزّن رابط الإشعارات في قاعدة البيانات
-                  العامة ولا يظهر للمتصفح. يتم ضبط <b>EXPIRY_WEBHOOK_URL</b> و{" "}
-                  <b>EXPIRY_WEBHOOK_SECRET</b> في متغيرات بيئة الخادم فقط.
-                  <br />
-                  الحالة الحالية:{" "}
-                  <b>
-                    {webhookStatus.webhookConfigured
-                      ? "مربوط ومؤمّن على الخادم ✓"
-                      : "غير مضبوط بعد في متغيرات الخادم"}
-                  </b>
-                </div>
-
-                <details className="saas-pass-details" style={{ marginBottom: 10 }}>
-                  <summary>
-                    <Mail className="ico-xs" aria-hidden="true" />
-                    <span>كود Google Apps Script الآمن للربط عبر متغيرات الخادم</span>
-                  </summary>
-                  <div className="saas-script-box">
-                    <p className="saas-cliq-note">
-                      ضع المفتاح السري في <b>Script Properties</b> باسم{" "}
-                      <b>EXPIRY_WEBHOOK_SECRET</b> ثم ضع رابط النشر في متغير بيئة الخادم{" "}
-                      <b>EXPIRY_WEBHOOK_URL</b>:
-                    </p>
-                    <pre dir="ltr">{APPS_SCRIPT_EMAIL_TEMPLATE}</pre>
-                    <button
-                      type="button"
-                      className="btn sm"
-                      onClick={() => {
-                        navigator.clipboard?.writeText(APPS_SCRIPT_EMAIL_TEMPLATE);
-                        onToast("تم نسخ كود Google Apps Script الآمن ✓");
-                      }}
-                    >
-                      <Copy className="ico-xs" aria-hidden="true" />
-                      <span>نسخ الكود</span>
-                    </button>
-                  </div>
-                </details>
-
                 <button
                   type="button"
                   className="btn p sm"
@@ -1244,44 +1094,18 @@ export function AdminPanel({
                   onClick={() => void handleSaveConfig()}
                 >
                   <Save className="ico-xs" aria-hidden="true" />
-                  <span>{busyId === "cfg" ? "جارٍ الحفظ..." : "حفظ الإعدادات العامة والخاصة"}</span>
+                  <span>{busyId === "cfg" ? "جارٍ الحفظ..." : "حفظ إعدادات الدفع"}</span>
                 </button>
               </div>
 
-              {/* إدارة المدراء الإضافيين (للمالك الأساسي فقط) */}
-              {isPrimaryOwner && (
-                <div className="saas-section">
-                  <h3>إدارة المدراء الإضافيين (خاصة بمالك المنصة الأساسي)</h3>
-                  <p className="saas-cliq-note">
-                    مالك المنصة الأساسي: <b dir="ltr">{OWNER_ADMIN_EMAIL}</b> (لا يمكن إزالته).
-                    لترقية مستخدم موثّق كمدير إضافي، استخدم زر «ترقية كمدير» من تبويب الورش.
-                  </p>
-                  {additionalAdmins.length > 0 ? (
-                    <div className="saas-admin-list" style={{ marginTop: 8 }}>
-                      {additionalAdmins.map((adm) => (
-                        <div key={adm.uid} className="saas-audit-item">
-                          <div>
-                            <b dir="ltr">{adm.email}</b> — <span>معرّف: {adm.uid.slice(0, 10)}...</span>
-                          </div>
-                          {!isOwnerAdminEmail(adm.email) && (
-                            <button
-                              type="button"
-                              className="btn sm r"
-                              disabled={busyId === `adm_${adm.uid}`}
-                              onClick={() => void handleRevokeAdmin(adm)}
-                            >
-                              <Trash2 className="ico-xs" aria-hidden="true" />
-                              <span>سحب الصلاحية</span>
-                            </button>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="saas-empty">لا يوجد مدراء إضافيون حالياً.</p>
-                  )}
-                </div>
-              )}
+              <div className="saas-section">
+                <h3>أمان الإدارة في المرحلة المجانية</h3>
+                <p className="saas-cliq-note">
+                  جميع صلاحيات الإدارة مقفولة حصراً على بريد المالك الأساسي الموثّق{" "}
+                  <b dir="ltr">{OWNER_ADMIN_EMAIL}</b> داخل قواعد أمان Firestore (دون مدراء إضافيين
+                  في هذه المرحلة لضمان أعلى أمان بأقل استهلاك قراءات على خطة Spark المجانية).
+                </p>
+              </div>
 
               <div className="saas-section">
                 <h3>تعديل الباقات والأسعار وحدود الاستخدام</h3>
@@ -1486,7 +1310,11 @@ export function AdminPanel({
                   </small>
                 </div>
               ))}
-              {!logs.length && <p className="saas-empty">لا توجد عمليات إدارية مسجلة بعد.</p>}
+              {!logs.length && (
+                <p className="saas-empty">
+                  {loading ? "جارٍ تحميل سجل التدقيق..." : "لا توجد عمليات إدارية مسجلة بعد."}
+                </p>
+              )}
             </div>
           )}
         </div>

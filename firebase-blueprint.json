@@ -1,16 +1,5 @@
 {
   "entities": {
-    "AdminRecord": {
-      "title": "AdminRecord",
-      "description": "Explicit platform administrator registry entry managed solely by the primary owner",
-      "type": "object",
-      "properties": {
-        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "email": { "type": "string", "format": "email", "maxLength": 200 },
-        "createdAt": { "type": "string", "format": "date-time" }
-      },
-      "required": ["uid", "email", "createdAt"]
-    },
     "PlatformConfig": {
       "title": "PlatformConfig",
       "description": "Public non-sensitive SaaS payment (CliQ/WhatsApp) and trial configuration",
@@ -27,21 +16,9 @@
       },
       "required": ["whatsappPhone", "cliqAlias", "cliqBankName", "cliqHolderName", "trialDaysDefault", "supportNote", "updatedBy", "updatedAt"]
     },
-    "PrivateNotificationConfig": {
-      "title": "PrivateNotificationConfig",
-      "description": "Admin-only private notification preferences isolated from regular users",
-      "type": "object",
-      "properties": {
-        "adminAlertEmail": { "type": "string", "format": "email", "maxLength": 200 },
-        "notificationsEnabled": { "type": "boolean" },
-        "updatedBy": { "type": "string", "maxLength": 128 },
-        "updatedAt": { "type": "string", "format": "date-time" }
-      },
-      "required": ["adminAlertEmail", "notificationsEnabled", "updatedBy", "updatedAt"]
-    },
     "SubscriptionPlan": {
       "title": "SubscriptionPlan",
-      "description": "Subscription tier definition editable by platform admin",
+      "description": "Subscription tier definition editable solely by the primary platform owner",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 40, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -105,7 +82,7 @@
     },
     "ActivationRequest": {
       "title": "ActivationRequest",
-      "description": "WhatsApp/CliQ subscription activation request submitted by a workshop",
+      "description": "WhatsApp/CliQ subscription activation or extra-types add-on request submitted by a workshop",
       "type": "object",
       "properties": {
         "tenantId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -128,7 +105,7 @@
     },
     "AuditLog": {
       "title": "AuditLog",
-      "description": "Immutable administrative action log with before/after state snapshots",
+      "description": "Immutable administrative action log with before/after state snapshots (owner admin only)",
       "type": "object",
       "properties": {
         "actorUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -141,41 +118,12 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["actorUid", "actorEmail", "action", "targetTenantId", "details", "createdAt"]
-    },
-    "ExpiryAlert": {
-      "title": "ExpiryAlert",
-      "description": "Under-2-days trial or paid subscription expiry alert for admin and user email tracking",
-      "type": "object",
-      "properties": {
-        "tenantId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "email": { "type": "string", "format": "email", "maxLength": 200 },
-        "workshopName": { "type": "string", "maxLength": 120 },
-        "phone": { "type": "string", "maxLength": 30 },
-        "alertType": { "type": "string", "enum": ["trial_expiring", "subscription_expiring"] },
-        "expiresAt": { "type": "string", "format": "date-time" },
-        "hoursLeft": { "type": "number" },
-        "adminEmail": { "type": "string", "format": "email", "maxLength": 200 },
-        "emailStatus": { "type": "string", "enum": ["pending", "sent", "manual", "failed"] },
-        "acknowledged": { "type": "boolean" },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" }
-      },
-      "required": ["tenantId", "ownerUid", "email", "workshopName", "phone", "alertType", "expiresAt", "hoursLeft", "adminEmail", "emailStatus", "acknowledged", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
-    "/admins/{adminUid}": {
-      "schema": { "$ref": "#/entities/AdminRecord" },
-      "description": "Platform administrator registry managed solely by primary owner"
-    },
     "/config/{configId}": {
       "schema": { "$ref": "#/entities/PlatformConfig" },
       "description": "Public CliQ/WhatsApp platform settings (config/platform)"
-    },
-    "/config_private/{configId}": {
-      "schema": { "$ref": "#/entities/PrivateNotificationConfig" },
-      "description": "Admin-only private notification preferences (config_private/notifications)"
     },
     "/plans/{planId}": {
       "schema": { "$ref": "#/entities/SubscriptionPlan" },
@@ -191,11 +139,7 @@
     },
     "/activation_requests/{requestId}": {
       "schema": { "$ref": "#/entities/ActivationRequest" },
-      "description": "CliQ & WhatsApp activation requests awaiting admin approval"
-    },
-    "/expiry_alerts/{alertId}": {
-      "schema": { "$ref": "#/entities/ExpiryAlert" },
-      "description": "Under-48h trial/subscription expiry notifications for admin and user"
+      "description": "CliQ & WhatsApp activation requests awaiting owner admin approval"
     },
     "/audit_logs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },
