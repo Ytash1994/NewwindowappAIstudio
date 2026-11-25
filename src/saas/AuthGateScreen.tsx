@@ -57,6 +57,15 @@ export function AuthGateScreen({
   const [showPass, setShowPass] = useState(false);
   const [localError, setLocalError] = useState("");
   const [resetSentMsg, setResetSentMsg] = useState("");
+  const [resendCooldown, setResendCooldown] = useState(0);
+
+  React.useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const t = window.setInterval(() => {
+      setResendCooldown((c) => (c <= 1 ? 0 : c - 1));
+    }, 1000);
+    return () => window.clearInterval(t);
+  }, [resendCooldown]);
 
   const waNum = normalizeJordanWhatsApp(config.whatsappPhone || DEFAULT_WHATSAPP_PHONE);
   const visiblePlans = (plans.length ? plans : DEFAULT_PLANS).filter((p) => p.active);
@@ -92,12 +101,17 @@ export function AuthGateScreen({
     }
 
     if (mode === "forgot") {
+      if (resendCooldown > 0) {
+        setLocalError(`يرجى الانتظار ${resendCooldown} ثانية قبل طلب رابط جديد حتى لا يُلغى الرابط السابق.`);
+        return;
+      }
       setBusy(true);
       try {
         const ok = await onForgotPassword(trimmedEmail);
         if (ok) {
+          setResendCooldown(60);
           setResetSentMsg(
-            `تم إرسال رابط إعادة تعيين كلمة المرور إلى ${trimmedEmail}. تفقد بريدك الوارد أو مجلد الرسائل غير المرغوب فيها (Spam).`
+            `تم إرسال رابط إعادة تعيين كلمة المرور إلى ${trimmedEmail}. افتح أحدث رسالة فقط خلال 10 دقائق (طلب رابط جديد يُلغي الرابط السابق فوراً).`
           );
         }
       } finally {
@@ -158,10 +172,11 @@ export function AuthGateScreen({
         <div className="saas-trial-highlight">
           <ShieldCheck className="ico" aria-hidden="true" />
           <div>
-            <b>تجربة مجانية لمدة {config.trialDaysDefault || 7} أيام فور إنشاء الحساب</b>
+            <b>تجربة مجانية لمدة {config.trialDaysDefault || 7} أيام بعد توثيق البريد الإلكتروني</b>
             <small>
-              جرّب جميع الأنظمة وحفظ المشاريع السحابي مجاناً (تصدير ملفات PDF و Excel متاح بدءاً من
-              الباقة الاحترافية). بعد انتهاء التجربة يُغلق الحساب تلقائياً لحين التفعيل عبر كليك (CliQ).
+              بعد إنشاء الحساب سنرسل رسالة توثيق لبريدك؛ وبمجرد التوثيق تبدأ تجربتك المجانية فوراً
+              (تصدير ملفات PDF و Excel متاح بدءاً من الباقة الاحترافية). بعد انتهاء التجربة يُغلق
+              الحساب تلقائياً مع حفظ كامل مشاريعك لحين التفعيل عبر كليك (CliQ).
             </small>
           </div>
         </div>
@@ -279,11 +294,21 @@ export function AuthGateScreen({
             </label>
           )}
 
-          <button type="submit" className="btn p full" disabled={busy || googleBusy}>
+          <button
+            type="submit"
+            className="btn p full"
+            disabled={busy || googleBusy || (mode === "forgot" && resendCooldown > 0)}
+          >
             {mode === "forgot" ? (
               <>
                 <Mail className="ico-sm" aria-hidden="true" />
-                <span>{busy ? "جارٍ الإرسال..." : "إرسال رابط إعادة تعيين كلمة المرور"}</span>
+                <span>
+                  {busy
+                    ? "جارٍ الإرسال..."
+                    : resendCooldown > 0
+                      ? `تم الإرسال (إعادة الإرسال بعد ${resendCooldown} ثانية)`
+                      : "إرسال رابط إعادة تعيين كلمة المرور"}
+                </span>
               </>
             ) : mode === "register" ? (
               <>

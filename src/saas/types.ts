@@ -4,12 +4,25 @@ import type { AppState, UnitCode } from "../types";
 export const OWNER_ADMIN_EMAIL = "xtashtoush@gmail.com";
 export const DEFAULT_WHATSAPP_PHONE = "0798904182";
 export const DEFAULT_TRIAL_DAYS = 7;
+export const TRIAL_MAX_PROJECTS = 25;
 
-export type SubscriptionStatus = "trialing" | "active" | "expired" | "suspended";
+export type SubscriptionStatus =
+  | "trialing"
+  | "pending_payment"
+  | "active"
+  | "expired"
+  | "suspended";
 export type BillingCycle = "monthly" | "quarterly" | "yearly";
 export type ActivationStatus = "pending" | "approved" | "rejected";
 export type TenantRole = "owner" | "admin";
 
+export interface AdminRecord {
+  uid: string;
+  email: string;
+  createdAt?: Timestamp | null;
+}
+
+/** الإعدادات العامة المتاحة للمستخدمين الموثّقين (كليك وواتساب فقط — بدون أي أسرار أو روابط Webhook) */
 export interface PlatformConfig {
   whatsappPhone: string;
   cliqAlias: string;
@@ -17,8 +30,14 @@ export interface PlatformConfig {
   cliqHolderName: string;
   trialDaysDefault: number;
   supportNote: string;
-  adminAlertEmail?: string;
-  expiryWebhookUrl?: string;
+  updatedBy: string;
+  updatedAt?: Timestamp | null;
+}
+
+/** إعدادات التنبيهات الخاصة بالمدير فقط (محمية في config_private/notifications) */
+export interface PrivateNotificationConfig {
+  adminAlertEmail: string;
+  notificationsEnabled: boolean;
   updatedBy: string;
   updatedAt?: Timestamp | null;
 }
@@ -28,7 +47,7 @@ export interface SubscriptionPlan {
   name: string;
   priceLabel: string;
   priceMonthlyJod: number;
-  maxProjects: number; // -1 means unlimited
+  maxProjects: number; // -1 يعني غير محدود
   allowExport: boolean;
   allowCustomTypes: boolean;
   active: boolean;
@@ -49,6 +68,8 @@ export interface TenantAccount {
   trialDays: number;
   activeUntil: Timestamp | null;
   adminNote: string;
+  projectCount?: number;
+  lastProjectActionId?: string;
   createdAt: Timestamp | null;
   updatedAt: Timestamp | null;
 }
@@ -88,6 +109,8 @@ export interface AuditLogDoc {
   action: string;
   targetTenantId: string;
   details: string;
+  beforeState?: string;
+  afterState?: string;
   createdAt: Timestamp | null;
 }
 
@@ -113,7 +136,8 @@ export interface ExpiryAlertDoc {
 
 export interface TenantAccessEvaluation {
   allowed: boolean;
-  state: "owner_free" | "active" | "trialing" | "expired" | "suspended";
+  state: "owner_free" | "active" | "trialing" | "pending_payment" | "expired" | "suspended";
+  hasPendingPayment: boolean;
   daysLeft: number;
   hoursLeft: number;
   trialEndsAtMs: number | null;
@@ -123,7 +147,7 @@ export interface TenantAccessEvaluation {
   remainingLabel: string;
 }
 
-export const EXPIRY_WARNING_MS = 2 * 86400000; // Strictly less than 2 days (48 hours)
+export const EXPIRY_WARNING_MS = 2 * 86400000; // أقل من يومين (48 ساعة)
 
 export const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
   whatsappPhone: DEFAULT_WHATSAPP_PHONE,
@@ -132,8 +156,12 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
   cliqHolderName: "إدارة حاسبة القياسات",
   trialDaysDefault: DEFAULT_TRIAL_DAYS,
   supportNote: "بعد التحويل عبر كليك أرسل صورة الحوالة وبريد حسابك على الواتساب ليتم التفعيل فوراً.",
+  updatedBy: "system",
+};
+
+export const DEFAULT_PRIVATE_NOTIFICATION_CONFIG: PrivateNotificationConfig = {
   adminAlertEmail: OWNER_ADMIN_EMAIL,
-  expiryWebhookUrl: "",
+  notificationsEnabled: true,
   updatedBy: "system",
 };
 
@@ -205,6 +233,7 @@ export const BLUEPRINT_LIMITS = {
   noteMax: 300,
   adminNoteMax: 500,
   windowTypeMax: 100,
+  stateSnapMax: 600,
 };
 
 export function sanitizeStr(val: string, maxLen: number): string {
@@ -242,12 +271,14 @@ export function formatRemainingArabic(diffMs: number): string {
 
 export function evaluateTenantAccess(
   tenant: TenantAccount | null,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  opts?: { emailVerified?: boolean }
 ): TenantAccessEvaluation {
   if (!tenant) {
     return {
       allowed: false,
       state: "expired",
+      hasPendingPayment: false,
       daysLeft: 0,
       hoursLeft: 0,
       trialEndsAtMs: null,
@@ -258,10 +289,13 @@ export function evaluateTenantAccess(
     };
   }
 
-  if (tenant.role === "admin" || isOwnerAdminEmail(tenant.email)) {
+  // المدير يتطلب بريدًا موثّقًا (عند تمرير emailVerified) ولا نعتمد على البريد غير الموثّق
+  const verifiedOrNotPassed = opts?.emailVerified !== false;
+  if (verifiedOrNotPassed && (tenant.role === "admin" || isOwnerAdminEmail(tenant.email))) {
     return {
       allowed: true,
       state: "owner_free",
+      hasPendingPayment: false,
       daysLeft: 9999,
       hoursLeft: 9999,
       trialEndsAtMs: null,
@@ -277,6 +311,7 @@ export function evaluateTenantAccess(
     return {
       allowed: false,
       state: "suspended",
+      hasPendingPayment: false,
       daysLeft: 0,
       hoursLeft: 0,
       trialEndsAtMs: null,
@@ -293,6 +328,7 @@ export function evaluateTenantAccess(
       return {
         allowed: true,
         state: "active",
+        hasPendingPayment: false,
         daysLeft: 9999,
         hoursLeft: 9999,
         trialEndsAtMs: null,
@@ -309,6 +345,7 @@ export function evaluateTenantAccess(
       return {
         allowed: true,
         state: "active",
+        hasPendingPayment: false,
         daysLeft,
         hoursLeft,
         trialEndsAtMs: null,
@@ -321,6 +358,7 @@ export function evaluateTenantAccess(
     return {
       allowed: false,
       state: "expired",
+      hasPendingPayment: false,
       daysLeft: 0,
       hoursLeft: 0,
       trialEndsAtMs: null,
@@ -331,7 +369,48 @@ export function evaluateTenantAccess(
     };
   }
 
-  if (tenant.subscriptionStatus === "trialing") {
+  // حالة pending_payment أو trialing: يجب دائماً مراعاة انتهاء مدة التجربة (أو الباقة السابقة)
+  // إذا انتهت التجربة أثناء وجود طلب دفع قيد المراجعة، يُقفل الحساب حتى يؤكد المدير الدفع!
+  if (
+    tenant.subscriptionStatus === "trialing" ||
+    tenant.subscriptionStatus === "pending_payment"
+  ) {
+    const isPendingPayment = tenant.subscriptionStatus === "pending_payment";
+    const activeUntilMs = tsToMs(tenant.activeUntil);
+
+    // إن كان لديه اشتراك مدفوع سابق لم ينتهِ بعد
+    if (activeUntilMs !== null) {
+      const diff = activeUntilMs - nowMs;
+      if (diff > 0) {
+        const daysLeft = Math.max(1, Math.ceil(diff / 86400000));
+        const hoursLeft = Math.max(1, Math.ceil(diff / 3600000));
+        return {
+          allowed: true,
+          state: "active",
+          hasPendingPayment: isPendingPayment,
+          daysLeft,
+          hoursLeft,
+          trialEndsAtMs: null,
+          activeUntilMs,
+          expiresAtMs: activeUntilMs,
+          isExpiringSoon: diff < EXPIRY_WARNING_MS,
+          remainingLabel: formatRemainingArabic(diff),
+        };
+      }
+      return {
+        allowed: false,
+        state: isPendingPayment ? "pending_payment" : "expired",
+        hasPendingPayment: isPendingPayment,
+        daysLeft: 0,
+        hoursLeft: 0,
+        trialEndsAtMs: null,
+        activeUntilMs,
+        expiresAtMs: activeUntilMs,
+        isExpiringSoon: false,
+        remainingLabel: "انتهت المدة",
+      };
+    }
+
     const trialDays = Math.max(0, Number(tenant.trialDays ?? DEFAULT_TRIAL_DAYS));
     const createdMs = tsToMs(tenant.createdAt);
     if (createdMs === null) {
@@ -339,7 +418,8 @@ export function evaluateTenantAccess(
       const approxDiff = trialDays * 86400000;
       return {
         allowed: trialDays > 0,
-        state: trialDays > 0 ? "trialing" : "expired",
+        state: trialDays > 0 ? "trialing" : isPendingPayment ? "pending_payment" : "expired",
+        hasPendingPayment: isPendingPayment,
         daysLeft: trialDays,
         hoursLeft: trialDays * 24,
         trialEndsAtMs: approxEnds,
@@ -349,6 +429,7 @@ export function evaluateTenantAccess(
         remainingLabel: formatRemainingArabic(approxDiff),
       };
     }
+
     const trialEndsAtMs = createdMs + trialDays * 86400000;
     const diff = trialEndsAtMs - nowMs;
     if (diff > 0 && trialDays > 0) {
@@ -358,6 +439,7 @@ export function evaluateTenantAccess(
       return {
         allowed: true,
         state: "trialing",
+        hasPendingPayment: isPendingPayment,
         daysLeft,
         hoursLeft,
         trialEndsAtMs,
@@ -367,9 +449,11 @@ export function evaluateTenantAccess(
         remainingLabel: formatRemainingArabic(clampedDiff),
       };
     }
+
     return {
       allowed: false,
-      state: "expired",
+      state: isPendingPayment ? "pending_payment" : "expired",
+      hasPendingPayment: isPendingPayment,
       daysLeft: 0,
       hoursLeft: 0,
       trialEndsAtMs,
@@ -384,6 +468,7 @@ export function evaluateTenantAccess(
   return {
     allowed: false,
     state: "expired",
+    hasPendingPayment: false,
     daysLeft: 0,
     hoursLeft: 0,
     trialEndsAtMs: null,
@@ -478,14 +563,18 @@ export function buildExpiryReminderEmailContent(params: {
 }
 
 export const APPS_SCRIPT_EMAIL_TEMPLATE = `function doPost(e) {
-  var d = JSON.parse(e.postData.contents);
+  var secret = PropertiesService.getScriptProperties().getProperty("EXPIRY_WEBHOOK_SECRET");
+  var d = JSON.parse(e.postData.contents || "{}");
+  if (secret && d.webhookSecret !== secret) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: "unauthorized" }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
   if (d.userEmail) {
     MailApp.sendEmail(d.userEmail, d.subject, d.userBody);
   }
   if (d.adminEmail) {
-    MailApp.sendEmail(d.adminEmail, "[تنبيه أدمن] " + d.subject, d.adminBody);
+    MailApp.sendEmail(d.adminEmail, "[تنبيه الإدارة] " + d.subject, d.adminBody);
   }
   return ContentService.createTextOutput(JSON.stringify({ ok: true }))
     .setMimeType(ContentService.MimeType.JSON);
 }`;
-

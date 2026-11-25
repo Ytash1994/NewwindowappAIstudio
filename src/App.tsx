@@ -40,7 +40,6 @@ import {
 import {
   createUserWithEmailAndPassword,
   onAuthStateChanged,
-  sendPasswordResetEmail,
   signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
@@ -50,6 +49,7 @@ import type { User } from "firebase/auth";
 import { auth, googleProvider } from "./firebase";
 import { AuthGateScreen } from "./saas/AuthGateScreen";
 import type { EmailSignUpPayload } from "./saas/AuthGateScreen";
+import { EmailVerificationGate } from "./saas/EmailVerificationGate";
 import { SubscriptionModal } from "./saas/SubscriptionModal";
 import { AdminPanel } from "./saas/AdminPanel";
 import {
@@ -67,10 +67,15 @@ import type {
   TenantAccount,
 } from "./saas/types";
 import {
+  confirmInAppPasswordReset,
   deleteCloudProject,
   ensureTenantAndDefaults,
+  fetchServerTimeOffsetMs,
+  refreshUserVerificationStatus,
   renameCloudProject,
   saveCloudProject,
+  sendEmailVerificationSafe,
+  sendPasswordResetSafe,
   subscribeAllActivationRequests,
   subscribeAllTenants,
   subscribeMyActivationRequests,
@@ -79,7 +84,17 @@ import {
   subscribeTenant,
   subscribeTenantProjects,
   triggerExpiryAlertOnce,
+  verifyInAppResetCode,
 } from "./saas/service";
+import {
+  cleanupLegacyGlobalKeys,
+  consumePendingSignupProfile,
+  loadScopedProjects,
+  readScopedRawState,
+  savePendingSignupProfile,
+  saveScopedAppState,
+  saveScopedProjects,
+} from "./saas/storage";
 import appIconUrl from "./assets/app-icon.png";
 import Splash from "./components/Splash";
 import {
@@ -87,16 +102,12 @@ import {
   BASE_REL,
   BUILTIN_GROUPS,
   BUILTIN_TYPE_NAMES,
-  CKEY,
   DEF_TYPE_DEFS,
   FONT_KEY,
   GN,
-  KEY,
   MAXCM,
   MAXQ,
   PAL_KEY,
-  PKEY,
-  RKEY,
   THEME_KEY,
   TPL,
   UAREA,
@@ -312,31 +323,8 @@ function hydrateState(rawObj: unknown): AppState {
   return s;
 }
 
-function loadInitialState(): AppState {
-  let raw: Record<string, unknown> = {};
-  try {
-    const o = JSON.parse(localStorage.getItem(KEY) || "null");
-    if (o && typeof o === "object") raw = o;
-  } catch {
-    // ignore
-  }
-  try {
-    const r = JSON.parse(localStorage.getItem(RKEY) || "null");
-    if (r && typeof r === "object" && !Array.isArray(r)) raw.rel = r;
-  } catch {
-    // ignore
-  }
-  try {
-    const c = JSON.parse(localStorage.getItem(CKEY) || "null");
-    if (c && typeof c === "object") {
-      if (c.custom && typeof c.custom === "object") raw.custom = c.custom;
-      if (c.cn) raw.cn = Math.max(Number(raw.cn) || 0, Number(c.cn) || 0);
-      if (Array.isArray(c.utypes)) raw.utypes = c.utypes;
-    }
-  } catch {
-    // ignore
-  }
-
+function loadScopedInitialState(uid: string): AppState {
+  const raw = readScopedRawState(uid);
   const s = hydrateState(raw);
   Object.keys(s.custom).forEach((n) => {
     if (!Array.isArray(s.custom[n])) s.custom[n] = [];
@@ -359,16 +347,6 @@ function loadInitialState(): AppState {
     }
   }
   return s;
-}
-
-function loadSavedProjects(): SavedProject[] {
-  try {
-    const raw = JSON.parse(localStorage.getItem(PKEY) || "[]");
-    if (!Array.isArray(raw)) return [];
-    return raw.filter((p): p is SavedProject => Boolean(p && p.id && p.name && p.data));
-  } catch {
-    return [];
-  }
 }
 
 const dstr = () => {
@@ -493,9 +471,22 @@ export default function App() {
   const [subModalOpen, setSubModalOpen] = useState(false);
   const [adminPanelOpen, setAdminPanelOpen] = useState(false);
   const [nowTick, setNowTick] = useState(() => Date.now());
+  const [serverOffsetMs, setServerOffsetMs] = useState(0);
+  const [emailVerifiedFlag, setEmailVerifiedFlag] = useState(false);
+  const [oobReset, setOobReset] = useState<{
+    code: string;
+    email: string;
+    expired: boolean;
+    error: string;
+    done: boolean;
+    newPass: string;
+    confirmPass: string;
+    busy: boolean;
+  } | null>(null);
 
-  const [state, setState] = useState<AppState>(() => loadInitialState());
-  const [projects, setProjects] = useState<SavedProject[]>(() => loadSavedProjects());
+  const [state, setState] = useState<AppState>(() => createDefaultState());
+  const [projects, setProjects] = useState<SavedProject[]>([]);
+  const loadedStorageUidRef = useRef<string | null>(null);
   const [pjName, setPjName] = useState<string>("");
   const [newProjName, setNewProjName] = useState<string>("");
   const [editingProjId, setEditingProjId] = useState<string | null>(null);
@@ -633,18 +624,20 @@ export default function App() {
   const cat: RuntimeCatalog = useMemo(() => createRuntimeCatalog(state), [state]);
   const res = useMemo(() => buildResults(state, negHighlightedRows), [state, negHighlightedRows]);
 
+  const serverNowMs = nowTick + serverOffsetMs;
+
   const isAdminUser = useMemo(
     () =>
       Boolean(
-        tenant?.role === "admin" ||
-          (isOwnerAdminEmail(authUser?.email) && Boolean(authUser?.emailVerified))
+        emailVerifiedFlag &&
+          (tenant?.role === "admin" || isOwnerAdminEmail(authUser?.email))
       ),
-    [tenant?.role, authUser?.email, authUser?.emailVerified]
+    [emailVerifiedFlag, tenant?.role, authUser?.email]
   );
 
   const tenantAccess = useMemo(
-    () => evaluateTenantAccess(tenant, nowTick),
-    [tenant, nowTick]
+    () => evaluateTenantAccess(tenant, serverNowMs, { emailVerified: emailVerifiedFlag }),
+    [tenant, serverNowMs, emailVerifiedFlag]
   );
 
   const activePlan = useMemo(() => {
@@ -653,15 +646,24 @@ export default function App() {
     return plans.find((p) => p.id === tenant.planId) || null;
   }, [isAdminUser, tenant, plans]);
 
-  // PDF & Excel saving/sharing is disallowed during the free trial and on the cheapest (starter) plan
+  // تصدير PDF و Excel غير مسموح في الفترة التجريبية ولا في الباقة الأساسية
   const canExportFiles = useMemo(() => {
     if (isAdminUser) return true;
     if (!tenant || tenantAccess.state !== "active") return false;
     return Boolean(activePlan?.allowExport);
   }, [isAdminUser, tenant, tenantAccess.state, activePlan]);
 
-  // Periodic tick so expired trials lock automatically without requiring page reload
+  // الأنواع المخصصة حسب صلاحية الباقة
+  const canUseCustomTypes = useMemo(() => {
+    if (isAdminUser) return true;
+    if (!tenant) return false;
+    if (tenant.planId === "trial") return true;
+    return activePlan ? Boolean(activePlan.allowCustomTypes) : true;
+  }, [isAdminUser, tenant, activePlan]);
+
+  // مزامنة توقيت الخادم الموثوق عند التشغيل وتحديث المؤقت كل دقيقة لإقفال التجربة المنتهية تلقائياً
   useEffect(() => {
+    void fetchServerTimeOffsetMs().then(setServerOffsetMs);
     const id = window.setInterval(() => setNowTick(Date.now()), 60000);
     return () => window.clearInterval(id);
   }, []);
@@ -670,8 +672,10 @@ export default function App() {
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
       setAuthUser(u);
+      setEmailVerifiedFlag(Boolean(u?.emailVerified));
       setAuthReady(true);
       if (!u) {
+        loadedStorageUidRef.current = null;
         setTenant(null);
         setTenantLoaded(false);
         setMyRequests([]);
@@ -679,14 +683,29 @@ export default function App() {
         setAdminExpiringCount(0);
         setAdminPanelOpen(false);
         setSubModalOpen(false);
+        setState(createDefaultState());
+        setProjects([]);
+        setPjName("");
+        setNewProjName("");
       }
     });
     return () => unsub();
   }, []);
 
-  // Bootstrap tenant record + live Firestore subscriptions
+  // تحميل بيانات الحاسبة المعزولة لكل uid فقط بعد توثيق البريد الإلكتروني
   useEffect(() => {
-    if (!authUser) return;
+    if (!authUser || !emailVerifiedFlag) return;
+    if (loadedStorageUidRef.current === authUser.uid) return;
+    loadedStorageUidRef.current = authUser.uid;
+    setState(loadScopedInitialState(authUser.uid));
+    setProjects(loadScopedProjects(authUser.uid));
+    setPjName("");
+    setNewProjName("");
+  }, [authUser, emailVerifiedFlag]);
+
+  // تهيئة حساب الورشة واشتراكات Firestore الحية فقط بعد توثيق البريد الإلكتروني بنجاح
+  useEffect(() => {
+    if (!authUser || !emailVerifiedFlag) return;
     let active = true;
     let unsubTenant: (() => void) | null = null;
     let unsubConfig: (() => void) | null = null;
@@ -695,7 +714,8 @@ export default function App() {
     let unsubAdminReqs: (() => void) | null = null;
     let unsubAdminTenants: (() => void) | null = null;
 
-    const pendingProfile = pendingSignupProfileRef.current;
+    const pendingProfile =
+      pendingSignupProfileRef.current || consumePendingSignupProfile(authUser.uid);
     pendingSignupProfileRef.current = undefined;
 
     setTenantLoaded(false);
@@ -727,7 +747,7 @@ export default function App() {
           unsubAdminTenants = subscribeAllTenants((allTenants) => {
             if (active) {
               setAdminExpiringCount(
-                allTenants.filter((t) => evaluateTenantAccess(t).isExpiringSoon).length
+                allTenants.filter((t) => evaluateTenantAccess(t, Date.now() + serverOffsetMs).isExpiringSoon).length
               );
             }
           });
@@ -748,14 +768,14 @@ export default function App() {
       unsubAdminReqs?.();
       unsubAdminTenants?.();
     };
-  }, [authUser]);
+  }, [authUser, emailVerifiedFlag, serverOffsetMs]);
 
-  // Automatically record & dispatch expiry alert once per cycle when < 2 days remain (trial or paid)
+  // إرسال تنبيه قرب الانتهاء مرة واحدة عند تبقي أقل من يومين (عبر الخادم الآمن)
   useEffect(() => {
-    if (!authUser || !tenant || !tenantLoaded || isAdminUser) return;
+    if (!authUser || !emailVerifiedFlag || !tenant || !tenantLoaded || isAdminUser) return;
     if (!tenantAccess.isExpiringSoon) return;
     void triggerExpiryAlertOnce(authUser, tenant, tenantAccess, platformConfig);
-  }, [authUser, tenant, tenantLoaded, isAdminUser, tenantAccess, platformConfig]);
+  }, [authUser, emailVerifiedFlag, tenant, tenantLoaded, isAdminUser, tenantAccess, platformConfig]);
 
   // Real-time cloud projects sync for active tenants
   useEffect(() => {
@@ -826,32 +846,113 @@ export default function App() {
   const handleEmailSignUp = useCallback(
     async (payload: EmailSignUpPayload) => {
       setAuthError("");
-      pendingSignupProfileRef.current = {
+      const profile = {
         workshopName: payload.workshopName,
         phone: payload.phone,
       };
+      pendingSignupProfileRef.current = profile;
       try {
         const cred = await createUserWithEmailAndPassword(
           auth,
           payload.email.trim(),
           payload.password
         );
+        savePendingSignupProfile(cred.user.uid, profile);
         if (payload.workshopName.trim()) {
           await updateProfile(cred.user, { displayName: payload.workshopName.trim() });
+        }
+        try {
+          await sendEmailVerificationSafe(cred.user);
+          toast("تم إنشاء الحساب وإرسال رابط التوثيق إلى بريدك الإلكتروني ✓", 4200);
+        } catch {
+          toast("تم إنشاء الحساب — اضغط «إعادة إرسال رسالة التوثيق» لتأكيد بريدك", 4200);
         }
       } catch (err) {
         pendingSignupProfileRef.current = undefined;
         setAuthError(mapAuthError(err));
       }
     },
-    [mapAuthError]
+    [mapAuthError, toast]
   );
+
+  const handleResendVerification = useCallback(async (): Promise<boolean> => {
+    if (!authUser) return false;
+    try {
+      await sendEmailVerificationSafe(authUser);
+      return true;
+    } catch {
+      return false;
+    }
+  }, [authUser]);
+
+  const handleCheckVerified = useCallback(async (): Promise<boolean> => {
+    if (!authUser) return false;
+    const ok = await refreshUserVerificationStatus(authUser);
+    if (ok) {
+      setEmailVerifiedFlag(true);
+      setAuthUser(auth.currentUser || authUser);
+      toast("تم توثيق البريد الإلكتروني بنجاح! جارٍ تجهيز حساب الورشة ✓", 3500);
+    }
+    return ok;
+  }, [authUser, toast]);
+
+  // Detect Firebase password-reset links opened inside our app (?mode=resetPassword&oobCode=...)
+  useEffect(() => {
+    try {
+      const sp = new URLSearchParams(window.location.search);
+      const mode = sp.get("mode");
+      const code = sp.get("oobCode");
+      if (mode === "resetPassword" && code) {
+        const expParam = Number(sp.get("resetExpiresAt") || 0);
+        if (expParam > 0 && Date.now() > expParam) {
+          setOobReset({
+            code,
+            email: "",
+            expired: true,
+            error: "انتهت صلاحية رابط إعادة تعيين كلمة المرور (المدة المسموحة 10 دقائق). يرجى طلب رابط جديد.",
+            done: false,
+            newPass: "",
+            confirmPass: "",
+            busy: false,
+          });
+          return;
+        }
+        verifyInAppResetCode(code)
+          .then((email) => {
+            setOobReset({
+              code,
+              email,
+              expired: false,
+              error: "",
+              done: false,
+              newPass: "",
+              confirmPass: "",
+              busy: false,
+            });
+          })
+          .catch(() => {
+            setOobReset({
+              code,
+              email: "",
+              expired: true,
+              error: "رابط إعادة تعيين كلمة المرور منتهي الصلاحية أو تم استخدامه مسبقاً. اطلب رابطاً جديداً وافتح أحدث رسالة فقط.",
+              done: false,
+              newPass: "",
+              confirmPass: "",
+              busy: false,
+            });
+          });
+      }
+    } catch {
+      // ignore malformed URL params
+    }
+  }, []);
 
   const handleForgotPassword = useCallback(
     async (email: string): Promise<boolean> => {
       setAuthError("");
       try {
-        await sendPasswordResetEmail(auth, email.trim());
+        await sendPasswordResetSafe(email);
         return true;
       } catch (err) {
         setAuthError(mapAuthError(err));
@@ -862,10 +963,16 @@ export default function App() {
   );
 
   const handleSignOut = useCallback(async () => {
+    cleanupLegacyGlobalKeys();
+    loadedStorageUidRef.current = null;
     await signOut(auth);
+    setState(createDefaultState());
     setProjects([]);
     setPjName("");
-    toast("تم تسجيل الخروج");
+    setNewProjName("");
+    setTenant(null);
+    setEmailVerifiedFlag(false);
+    toast("تم تسجيل الخروج مع حفظ مشاريعك السحابية بأمان");
   }, [toast]);
 
   // Apply Theme, Palette & Font Scale to <html>
@@ -910,37 +1017,16 @@ export default function App() {
     document.body.classList.toggle("wide4", state.step === 4 && state.view === "table");
   }, [state.step, state.view]);
 
-  // Persist AppState & Projects to localStorage
-  const persistState = useCallback((s: AppState) => {
-    if (noSaveRef.current) return;
-    try {
-      localStorage.setItem(
-        KEY,
-        JSON.stringify({
-          type: s.type,
-          rows: s.rows,
-          sel: s.sel,
-          inc: s.inc,
-          dec: s.dec,
-          rel: s.rel,
-          rnd: s.rnd,
-          gr: s.gr,
-          custom: s.custom,
-          cn: s.cn,
-          utypes: s.utypes,
-          cascade: s.cascade,
-          view: s.view,
-          layout: s.layout,
-          unit: s.unit,
-          step: s.step,
-        })
-      );
-      localStorage.setItem(RKEY, JSON.stringify(s.rel || {}));
-      localStorage.setItem(CKEY, JSON.stringify({ custom: s.custom, cn: s.cn, utypes: s.utypes }));
-    } catch {
-      // ignore
-    }
-  }, []);
+  // حفظ حالة الحاسبة والمشاريع محلياً بشكل معزول لكل uid فقط
+  const persistState = useCallback(
+    (s: AppState) => {
+      if (noSaveRef.current) return;
+      if (!authUser?.uid || !emailVerifiedFlag) return;
+      if (loadedStorageUidRef.current !== authUser.uid) return;
+      saveScopedAppState(authUser.uid, s);
+    },
+    [authUser?.uid, emailVerifiedFlag]
+  );
 
   useEffect(() => {
     const t = window.setTimeout(() => persistState(state), 220);
@@ -954,12 +1040,10 @@ export default function App() {
   }, [state, persistState]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(PKEY, JSON.stringify(projects));
-    } catch {
-      // ignore
-    }
-  }, [projects]);
+    if (!authUser?.uid || !emailVerifiedFlag) return;
+    if (loadedStorageUidRef.current !== authUser.uid) return;
+    saveScopedProjects(authUser.uid, projects);
+  }, [projects, authUser?.uid, emailVerifiedFlag]);
 
   // Escape-key dismissal for all open dialogs (WCAG / Pro Max escape-routes)
   useEffect(() => {
@@ -1684,22 +1768,21 @@ export default function App() {
         setPjName(name);
         setNewProjName(name);
         toast(`تم حفظ مشروع «${name}» سحابياً ✓`);
-      } catch {
-        toast("تعذر حفظ المشروع — تحقق من صلاحية الاشتراك", 3500);
+      } catch (err) {
+        const msg =
+          err instanceof Error && err.message && !err.message.startsWith("{")
+            ? err.message
+            : "تعذر حفظ المشروع — تحقق من صلاحية الاشتراك أو حدود الباقة";
+        toast(msg, 4200);
+        if (msg.includes("الحد الأقصى") || msg.includes("ترقية")) {
+          setSubModalOpen(true);
+        }
       }
       return;
     }
 
-    const nowIso = new Date().toISOString();
-    setProjects((prev) => {
-      if (existing) {
-        return prev.map((p) => (p.id === existing.id ? { ...p, updatedAt: nowIso, data: rest } : p));
-      }
-      return [{ id: `pj_${Date.now()}`, name, updatedAt: nowIso, data: rest }, ...prev];
-    });
-    setPjName(name);
-    setNewProjName(name);
-    toast(`تم حفظ مشروع «${name}» ✓`);
+    toast("انتهت صلاحية الاشتراك، يرجى التفعيل لحفظ المشاريع سحابياً", 3800);
+    setSubModalOpen(true);
   };
 
   const handleOpenProject = (proj: SavedProject) => {
@@ -2481,6 +2564,11 @@ export default function App() {
 
   // ---------- Step 1 Type Actions ----------
   const handleCreateType = () => {
+    if (!canUseCustomTypes) {
+      toast("باقتك الحالية لا تسمح بإضافة أنواع شبابيك مخصصة. قم بترقية الباقة.", 4000);
+      setSubModalOpen(true);
+      return;
+    }
     const v = clean(ntName).trim();
     if (!v) {
       toast("اكتب اسم النوع أولاً");
@@ -3695,7 +3783,108 @@ export default function App() {
   const activeThemeEff = DARK_ONLY_PALS.has(pal) ? "dark" : themeMode;
   const curStepTab = state.step === 3 ? 4 : state.step;
 
-  if (!authReady || (authUser && !tenantLoaded)) {
+  if (oobReset) {
+    return (
+      <div className="saas-gate-wrap" dir="rtl">
+        <div className="saas-gate-card" style={{ maxWidth: 460 }}>
+          <h2 style={{ marginTop: 0 }}>إعادة تعيين كلمة المرور</h2>
+          {oobReset.email && (
+            <p className="saas-cliq-note">
+              الحساب: <b dir="ltr">{oobReset.email}</b>
+            </p>
+          )}
+          {oobReset.error && <div className="saas-err-box">{oobReset.error}</div>}
+          {oobReset.done ? (
+            <>
+              <div className="saas-ok-box">
+                تم تحديث كلمة المرور بنجاح ✓ يمكنك الآن تسجيل الدخول بكلمة المرور الجديدة.
+              </div>
+              <button
+                type="button"
+                className="btn p full"
+                onClick={() => {
+                  window.history.replaceState({}, "", window.location.pathname);
+                  setOobReset(null);
+                }}
+              >
+                الانتقال لتسجيل الدخول
+              </button>
+            </>
+          ) : oobReset.expired ? (
+            <button
+              type="button"
+              className="btn p full"
+              onClick={() => {
+                window.history.replaceState({}, "", window.location.pathname);
+                setOobReset(null);
+              }}
+            >
+              العودة لطلب رابط جديد
+            </button>
+          ) : (
+            <form
+              className="saas-auth-form"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (oobReset.newPass.length < 6) {
+                  setOobReset((p) => (p ? { ...p, error: "كلمة المرور يجب أن تكون 6 أحرف على الأقل." } : null));
+                  return;
+                }
+                if (oobReset.newPass !== oobReset.confirmPass) {
+                  setOobReset((p) => (p ? { ...p, error: "كلمتا المرور غير متطابقتين." } : null));
+                  return;
+                }
+                setOobReset((p) => (p ? { ...p, busy: true, error: "" } : null));
+                try {
+                  await confirmInAppPasswordReset(oobReset.code, oobReset.newPass);
+                  setOobReset((p) => (p ? { ...p, busy: false, done: true } : null));
+                } catch {
+                  setOobReset((p) =>
+                    p
+                      ? {
+                          ...p,
+                          busy: false,
+                          expired: true,
+                          error: "انتهت صلاحية الرابط أو تم استخدامه. يرجى طلب رابط جديد.",
+                        }
+                      : null
+                  );
+                }
+              }}
+            >
+              <label className="saas-note-input">
+                <span>كلمة المرور الجديدة (6 أحرف على الأقل)</span>
+                <input
+                  type="password"
+                  dir="ltr"
+                  value={oobReset.newPass}
+                  onChange={(e) =>
+                    setOobReset((p) => (p ? { ...p, newPass: e.target.value } : null))
+                  }
+                />
+              </label>
+              <label className="saas-note-input">
+                <span>تأكيد كلمة المرور الجديدة</span>
+                <input
+                  type="password"
+                  dir="ltr"
+                  value={oobReset.confirmPass}
+                  onChange={(e) =>
+                    setOobReset((p) => (p ? { ...p, confirmPass: e.target.value } : null))
+                  }
+                />
+              </label>
+              <button type="submit" className="btn p full" disabled={oobReset.busy}>
+                {oobReset.busy ? "جارٍ الحفظ..." : "حفظ كلمة المرور الجديدة"}
+              </button>
+            </form>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (!authReady) {
     return (
       <>
         {showSplash && <Splash onDone={() => setShowSplash(false)} />}
@@ -3725,6 +3914,38 @@ export default function App() {
         />
         <div id="toast" role="status" aria-live="polite" className={toastOn ? "on" : ""}>
           {toastMsg}
+        </div>
+      </>
+    );
+  }
+
+  // بوابة إلزامية لتوثيق البريد الإلكتروني قبل إنشاء حساب الورشة أو بدء التجربة المجانية
+  if (!emailVerifiedFlag) {
+    return (
+      <>
+        {showSplash && <Splash onDone={() => setShowSplash(false)} />}
+        <EmailVerificationGate
+          user={authUser}
+          onResendVerification={handleResendVerification}
+          onCheckVerified={handleCheckVerified}
+          onSignOut={handleSignOut}
+        />
+        <div id="toast" role="status" aria-live="polite" className={toastOn ? "on" : ""}>
+          {toastMsg}
+        </div>
+      </>
+    );
+  }
+
+  if (!tenantLoaded) {
+    return (
+      <>
+        {showSplash && <Splash onDone={() => setShowSplash(false)} />}
+        <div className="saas-gate-wrap" dir="rtl">
+          <div className="saas-gate-card" style={{ textAlign: "center" }}>
+            <h2>جارٍ تحميل بيانات الورشة والاشتراك...</h2>
+            <p className="saas-gate-sub">يرجى الانتظار لحظة</p>
+          </div>
         </div>
       </>
     );
@@ -3833,10 +4054,10 @@ export default function App() {
                 <span className="saas-top-name">{tenant.workshopName || tenant.displayName}</span>
                 <span className={`saas-status-tag st-${tenantAccess.state}`}>
                   {tenantAccess.state === "owner_free"
-                    ? "مالك المنصة · مجاني"
+                    ? "إدارة المنصة · مجاني"
                     : tenantAccess.state === "active"
                       ? `مشترك · ${activePlan?.name || tenant.planId}${tenantAccess.activeUntilMs ? ` (${tenantAccess.daysLeft} يوم)` : ""}`
-                      : `تجربة مجانية · متبقي ${tenantAccess.daysLeft} ${tenantAccess.daysLeft === 1 ? "يوم" : "أيام"}`}
+                      : `تجربة مجانية · متبقي ${tenantAccess.daysLeft} ${tenantAccess.daysLeft === 1 ? "يوم" : "أيام"}${tenantAccess.hasPendingPayment ? " · طلب دفع قيد المراجعة" : ""}`}
                 </span>
               </div>
               <div className="saas-top-acts">
@@ -6914,6 +7135,7 @@ export default function App() {
           adminUser={authUser}
           plans={plans}
           config={platformConfig}
+          serverNowMs={serverNowMs}
           onClose={() => setAdminPanelOpen(false)}
           onToast={toast}
         />

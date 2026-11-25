@@ -30,6 +30,7 @@ import type {
 } from "./types";
 import {
   changeOwnPassword,
+  linkPasswordToAccount,
   sendOwnPasswordReset,
   submitActivationRequest,
   updateTenantProfile,
@@ -76,11 +77,15 @@ export function SubscriptionModal({
   const [savingProfile, setSavingProfile] = useState(false);
   const [curPass, setCurPass] = useState("");
   const [newPass, setNewPass] = useState("");
+  const [confirmNewPass, setConfirmNewPass] = useState("");
   const [passBusy, setPassBusy] = useState(false);
+  const [passwordLinkedNow, setPasswordLinkedNow] = useState(false);
 
   const hasPasswordProvider = useMemo(
-    () => Boolean(user.providerData?.some((p) => p.providerId === "password")),
-    [user.providerData]
+    () =>
+      passwordLinkedNow ||
+      Boolean(user.providerData?.some((p) => p.providerId === "password")),
+    [user.providerData, passwordLinkedNow]
   );
 
   const selectedPlan = activePlans.find((p) => p.id === selectedPlanId) || activePlans[0];
@@ -179,12 +184,46 @@ export function SubscriptionModal({
     }
   };
 
+  const handleLinkPassword = async () => {
+    if (newPass.length < 6) {
+      onToast("كلمة المرور يجب أن تكون 6 أحرف على الأقل", 3200);
+      return;
+    }
+    if (newPass !== confirmNewPass) {
+      onToast("كلمتا المرور غير متطابقتين", 3200);
+      return;
+    }
+    setPassBusy(true);
+    try {
+      await linkPasswordToAccount(user, newPass);
+      setNewPass("");
+      setConfirmNewPass("");
+      setPasswordLinkedNow(true);
+      onToast("تم تعيين كلمة مرور لحسابك بنجاح! يمكنك الآن الدخول بالإيميل وكلمة المرور ✓", 4200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      if (msg.includes("provider-already-linked")) {
+        setPasswordLinkedNow(true);
+        onToast("الحساب مرتبط بكلمة مرور مسبقاً، استخدم تغيير كلمة المرور", 3500);
+      } else if (msg.includes("operation-not-allowed")) {
+        onToast("يرجى تفعيل مزوّد Email/Password أولاً في Firebase Console", 4500);
+      } else {
+        onToast("تعذر ربط كلمة المرور حالياً، حاول مرة أخرى", 3500);
+      }
+    } finally {
+      setPassBusy(false);
+    }
+  };
+
   const handleSendOwnReset = async () => {
     if (!tenant.email) return;
     setPassBusy(true);
     try {
       await sendOwnPasswordReset(tenant.email);
-      onToast(`تم إرسال رابط تعيين كلمة المرور إلى ${tenant.email} ✓`, 3800);
+      onToast(
+        `تم إرسال رابط التعيين إلى ${tenant.email}. افتح أحدث رسالة فقط (طلب رابط جديد يُلغي السابق) ✓`,
+        4500
+      );
     } catch {
       onToast("تعذر إرسال رابط التعيين حالياً", 3200);
     } finally {
@@ -206,17 +245,21 @@ export function SubscriptionModal({
               {locked
                 ? access.state === "suspended"
                   ? "الحساب موقوف حالياً"
-                  : "انتهت فترة التجربة المجانية"
+                  : access.state === "pending_payment"
+                    ? "انتهت التجربة — طلب الدفع قيد المراجعة"
+                    : "انتهت فترة التجربة المجانية"
                 : "حساب الورشة والاشتراك"}
             </h2>
             <p>
               {locked
-                ? "تم إغلاق استخدام الحاسبة لحين تفعيل الاشتراك عبر كليك (CliQ). بياناتك ومشاريعك محفوظة بأمان وستعود فور التفعيل."
+                ? access.state === "pending_payment"
+                  ? "انتهت مدة التجربة ويبقى الحساب موقوفاً لحين تأكيد المدير لحوالة كليك (CliQ). جميع مشاريعك وبياناتك محفوظة بأمان وستعود فور تأكيد الدفع."
+                  : "تم إغلاق استخدام الحاسبة والمشاريع السحابية لحين تفعيل الاشتراك عبر كليك (CliQ). حسابك ومشاريعك محفوظة بأمان ولن يتم حذفها."
                 : access.state === "owner_free"
                   ? "حساب مالك المنصة — مجاني دائم بدون قيود."
                   : access.state === "active"
-                    ? `اشتراك فعّال (${selectedPlan?.name || tenant.planId})${access.activeUntilMs ? ` · متبقي ${access.daysLeft} يوم` : " · دائم"}`
-                    : `تجربة مجانية فعالة · متبقي ${access.daysLeft} ${access.daysLeft === 1 ? "يوم" : "أيام"}`}
+                    ? `اشتراك فعّال (${selectedPlan?.name || tenant.planId})${access.activeUntilMs ? ` · متبقي ${access.daysLeft} يوم` : " · دائم"}${access.hasPendingPayment ? " · طلب تجديد قيد المراجعة" : ""}`
+                    : `تجربة مجانية فعالة · متبقي ${access.daysLeft} ${access.daysLeft === 1 ? "يوم" : "أيام"}${access.hasPendingPayment ? " · طلب دفع قيد المراجعة" : ""}`}
             </p>
           </div>
         </div>
@@ -233,15 +276,20 @@ export function SubscriptionModal({
         </div>
       )}
 
-      {latestPending && (
+      {(latestPending || access.hasPendingPayment) && (
         <div className="saas-pending-banner">
           <Clock className="ico-sm" aria-hidden="true" />
           <div>
-            <b>لديك طلب تفعيل قيد المراجعة</b>
+            <b>لديك طلب دفع قيد المراجعة الإدارية</b>
             <small>
-              الباقة: {activePlans.find((p) => p.id === latestPending.planId)?.name || latestPending.planId} ·{" "}
-              {BILLING_CYCLE_LABELS[latestPending.billingCycle]?.label} — بمجرد تأكيد حوالة كليك على
-              الواتساب سيُفتح حسابك تلقائياً خلال لحظات.
+              {latestPending ? (
+                <>
+                  الباقة: {activePlans.find((p) => p.id === latestPending.planId)?.name || latestPending.planId} ·{" "}
+                  {BILLING_CYCLE_LABELS[latestPending.billingCycle]?.label} —{" "}
+                </>
+              ) : null}
+              تقديم الطلب لا يفعّل الاشتراك تلقائياً؛ عند تأكيد المدير لاستلام حوالة كليك تبدأ مدة
+              الباقة من تاريخ التأكيد ويُفتح حسابك فوراً.
             </small>
           </div>
         </div>
@@ -289,7 +337,7 @@ export function SubscriptionModal({
             <span>كلمة المرور والأمان</span>
           </summary>
           <div className="saas-pass-box">
-            {hasPasswordProvider && (
+            {hasPasswordProvider ? (
               <>
                 <div className="saas-form-row">
                   <label>
@@ -320,6 +368,43 @@ export function SubscriptionModal({
                   onClick={() => void handleChangeOwnPassword()}
                 >
                   {passBusy ? "جارٍ التحديث..." : "تحديث كلمة المرور"}
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="saas-cliq-note" style={{ marginBottom: 4 }}>
+                  حسابك مسجّل عبر Google. يمكنك إضافة كلمة مرور مباشرة الآن للدخول بالبريد الإلكتروني
+                  وكلمة المرور أيضاً بدون الحاجة لرابط بريد:
+                </p>
+                <div className="saas-form-row">
+                  <label>
+                    <span>كلمة المرور الجديدة (6 أحرف+)</span>
+                    <input
+                      type="password"
+                      dir="ltr"
+                      value={newPass}
+                      placeholder="••••••••"
+                      onChange={(e) => setNewPass(e.target.value)}
+                    />
+                  </label>
+                  <label>
+                    <span>تأكيد كلمة المرور</span>
+                    <input
+                      type="password"
+                      dir="ltr"
+                      value={confirmNewPass}
+                      placeholder="••••••••"
+                      onChange={(e) => setConfirmNewPass(e.target.value)}
+                    />
+                  </label>
+                </div>
+                <button
+                  type="button"
+                  className="btn sm p"
+                  disabled={passBusy}
+                  onClick={() => void handleLinkPassword()}
+                >
+                  {passBusy ? "جارٍ التعيين..." : "تعيين كلمة مرور لحسابي الآن"}
                 </button>
               </>
             )}

@@ -2,7 +2,7 @@
   "entities": {
     "AdminRecord": {
       "title": "AdminRecord",
-      "description": "Explicit platform administrator registry entry",
+      "description": "Explicit platform administrator registry entry managed solely by the primary owner",
       "type": "object",
       "properties": {
         "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -13,7 +13,7 @@
     },
     "PlatformConfig": {
       "title": "PlatformConfig",
-      "description": "Global SaaS payment (CliQ/WhatsApp) and trial configuration",
+      "description": "Public non-sensitive SaaS payment (CliQ/WhatsApp) and trial configuration",
       "type": "object",
       "properties": {
         "whatsappPhone": { "type": "string", "maxLength": 30 },
@@ -22,12 +22,22 @@
         "cliqHolderName": { "type": "string", "maxLength": 120 },
         "trialDaysDefault": { "type": "number" },
         "supportNote": { "type": "string", "maxLength": 500 },
-        "adminAlertEmail": { "type": "string", "format": "email", "maxLength": 200 },
-        "expiryWebhookUrl": { "type": "string", "maxLength": 300 },
         "updatedBy": { "type": "string", "maxLength": 128 },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["whatsappPhone", "cliqAlias", "cliqBankName", "cliqHolderName", "trialDaysDefault", "supportNote", "updatedBy", "updatedAt"]
+    },
+    "PrivateNotificationConfig": {
+      "title": "PrivateNotificationConfig",
+      "description": "Admin-only private notification preferences isolated from regular users",
+      "type": "object",
+      "properties": {
+        "adminAlertEmail": { "type": "string", "format": "email", "maxLength": 200 },
+        "notificationsEnabled": { "type": "boolean" },
+        "updatedBy": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["adminAlertEmail", "notificationsEnabled", "updatedBy", "updatedAt"]
     },
     "SubscriptionPlan": {
       "title": "SubscriptionPlan",
@@ -59,11 +69,13 @@
         "workshopName": { "type": "string", "maxLength": 120 },
         "phone": { "type": "string", "maxLength": 30 },
         "role": { "type": "string", "enum": ["owner", "admin"] },
-        "subscriptionStatus": { "type": "string", "enum": ["trialing", "active", "expired", "suspended"] },
+        "subscriptionStatus": { "type": "string", "enum": ["trialing", "pending_payment", "active", "expired", "suspended"] },
         "planId": { "type": "string", "maxLength": 40, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "trialDays": { "type": "number" },
         "activeUntil": { "type": "string", "format": "date-time" },
         "adminNote": { "type": "string", "maxLength": 500 },
+        "projectCount": { "type": "number" },
+        "lastProjectActionId": { "type": "string", "maxLength": 128 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -107,7 +119,7 @@
     },
     "AuditLog": {
       "title": "AuditLog",
-      "description": "Immutable administrative action log",
+      "description": "Immutable administrative action log with before/after state snapshots",
       "type": "object",
       "properties": {
         "actorUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -115,6 +127,8 @@
         "action": { "type": "string", "maxLength": 80 },
         "targetTenantId": { "type": "string", "maxLength": 128 },
         "details": { "type": "string", "maxLength": 500 },
+        "beforeState": { "type": "string", "maxLength": 600 },
+        "afterState": { "type": "string", "maxLength": 600 },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["actorUid", "actorEmail", "action", "targetTenantId", "details", "createdAt"]
@@ -144,11 +158,15 @@
   "firestore": {
     "/admins/{adminUid}": {
       "schema": { "$ref": "#/entities/AdminRecord" },
-      "description": "Platform administrator registry"
+      "description": "Platform administrator registry managed solely by primary owner"
     },
     "/config/{configId}": {
       "schema": { "$ref": "#/entities/PlatformConfig" },
-      "description": "Platform CliQ/WhatsApp/email alert settings document (config/platform)"
+      "description": "Public CliQ/WhatsApp platform settings (config/platform)"
+    },
+    "/config_private/{configId}": {
+      "schema": { "$ref": "#/entities/PrivateNotificationConfig" },
+      "description": "Admin-only private notification preferences (config_private/notifications)"
     },
     "/plans/{planId}": {
       "schema": { "$ref": "#/entities/SubscriptionPlan" },
@@ -168,11 +186,11 @@
     },
     "/expiry_alerts/{alertId}": {
       "schema": { "$ref": "#/entities/ExpiryAlert" },
-      "description": "Automated under-48h trial/subscription expiry notifications for admin and user"
+      "description": "Under-48h trial/subscription expiry notifications for admin and user"
     },
     "/audit_logs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },
-      "description": "Immutable admin action audit trail"
+      "description": "Immutable admin action audit trail with before/after snapshots"
     }
   }
 }

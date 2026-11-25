@@ -1,41 +1,47 @@
 import { deleteApp, initializeApp } from "firebase/app";
 import {
   EmailAuthProvider,
+  confirmPasswordReset,
   createUserWithEmailAndPassword,
   getAuth,
+  linkWithCredential,
   reauthenticateWithCredential,
+  reauthenticateWithPopup,
+  sendEmailVerification,
   sendPasswordResetEmail,
   signOut,
   updatePassword,
   updateProfile,
+  verifyPasswordResetCode,
 } from "firebase/auth";
 import type { User } from "firebase/auth";
 import {
   Timestamp,
   collection,
-  deleteDoc,
   doc,
   getDoc,
   getDocs,
-  getFirestore,
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
   updateDoc,
   where,
 } from "firebase/firestore";
 import firebaseConfig from "../../firebase-applet-config.json";
-import { auth, db, handleFirestoreError, OperationType } from "../firebase";
+import { auth, db, googleProvider, handleFirestoreError, OperationType } from "../firebase";
 import type { AppState, SavedProject } from "../types";
 import {
   BLUEPRINT_LIMITS,
   DEFAULT_PLANS,
   DEFAULT_PLATFORM_CONFIG,
+  DEFAULT_PRIVATE_NOTIFICATION_CONFIG,
   DEFAULT_TRIAL_DAYS,
   DEFAULT_WHATSAPP_PHONE,
   OWNER_ADMIN_EMAIL,
+  TRIAL_MAX_PROJECTS,
   buildExpiryReminderEmailContent,
   isOwnerAdminEmail,
   sanitizeStr,
@@ -43,10 +49,12 @@ import {
 } from "./types";
 import type {
   ActivationRequestDoc,
+  AdminRecord,
   AuditLogDoc,
   BillingCycle,
   ExpiryAlertDoc,
   PlatformConfig,
+  PrivateNotificationConfig,
   SubscriptionPlan,
   TenantAccessEvaluation,
   TenantAccount,
@@ -73,13 +81,91 @@ export function makeSafeDocId(prefix: string): string {
   return `${prefix}_${Date.now()}_${rand}`.replace(/[^a-zA-Z0-9_\-]/g, "");
 }
 
+function summarizeTenantState(t: Partial<TenantAccount>): string {
+  const untilMs = tsToMs(t.activeUntil as Timestamp | null | undefined);
+  const summary = {
+    status: t.subscriptionStatus || "",
+    planId: t.planId || "",
+    role: t.role || "",
+    trialDays: t.trialDays ?? 0,
+    activeUntil: untilMs ? new Date(untilMs).toISOString().slice(0, 10) : null,
+  };
+  return sanitizeStr(JSON.stringify(summary), BLUEPRINT_LIMITS.stateSnapMax);
+}
+
+/** جلب فرق التوقيت مع الخادم الموثوق حتى لا يتأثر الحساب بتعديل ساعة جهاز المستخدم */
+export async function fetchServerTimeOffsetMs(): Promise<number> {
+  try {
+    const t0 = Date.now();
+    const res = await fetch("/api/server-time", { cache: "no-store" });
+    if (!res.ok) return 0;
+    const data = (await res.json()) as { nowMs?: number };
+    const t1 = Date.now();
+    if (typeof data.nowMs !== "number" || !Number.isFinite(data.nowMs)) return 0;
+    const midpoint = Math.round((t0 + t1) / 2);
+    return data.nowMs - midpoint;
+  } catch {
+    return 0;
+  }
+}
+
+/** إرسال رسالة توثيق البريد الإلكتروني عبر Firebase Authentication */
+export async function sendEmailVerificationSafe(user: User): Promise<void> {
+  auth.languageCode = "ar";
+  try {
+    await sendEmailVerification(user, {
+      url: `${window.location.origin}/`,
+      handleCodeInApp: false,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("unauthorized-continue-uri") || msg.includes("invalid-continue-uri")) {
+      await sendEmailVerification(user);
+      return;
+    }
+    throw err;
+  }
+}
+
+/** إعادة تحميل حالة المستخدم وتحديث رمز الهوية للتحقق من إتمام توثيق البريد */
+export async function refreshUserVerificationStatus(user: User): Promise<boolean> {
+  await user.reload();
+  const fresh = auth.currentUser || user;
+  if (fresh.emailVerified) {
+    await fresh.getIdToken(true);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * إنشاء بيانات الورشة فقط بعد التحقق الفعلي من توثيق البريد الإلكتروني
+ * (ممنوع منعاً باتاً إنشاء tenant أو بدء التجربة قبل توثيق البريد)
+ */
 export async function ensureTenantAndDefaults(
   user: User,
   initialProfile?: { workshopName?: string; phone?: string }
 ): Promise<TenantAccount> {
+  if (!user.emailVerified) {
+    throw new Error("يجب توثيق البريد الإلكتروني أولاً قبل إنشاء حساب الورشة وبدء التجربة.");
+  }
+
+  // تأكد من تحديث الرمز المميز حتى تعكس قواعد Firestore قيمة email_verified == true
+  await user.getIdToken(true);
+
   const tenantPath = `tenants/${user.uid}`;
   const tenantRef = doc(db, "tenants", user.uid);
-  const isOwner = isOwnerAdminEmail(user.email) && Boolean(user.emailVerified);
+  const isPrimaryOwner = isOwnerAdminEmail(user.email) && Boolean(user.emailVerified);
+
+  let isRegisteredAdmin = isPrimaryOwner;
+  if (!isRegisteredAdmin) {
+    try {
+      const adminSnap = await getDoc(doc(db, "admins", user.uid));
+      isRegisteredAdmin = adminSnap.exists();
+    } catch {
+      isRegisteredAdmin = false;
+    }
+  }
 
   let snap;
   try {
@@ -89,21 +175,24 @@ export async function ensureTenantAndDefaults(
   }
 
   if (!snap.exists()) {
-    const email = sanitizeStr(user.email || "", BLUEPRINT_LIMITS.emailMax);
+    const email = sanitizeStr((user.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax);
     const displayName = sanitizeStr(
       initialProfile?.workshopName || user.displayName || email.split("@")[0] || "مستخدم",
       BLUEPRINT_LIMITS.nameMax
     );
     const workshopName = sanitizeStr(
-      initialProfile?.workshopName || user.displayName || email.split("@")[0] || (isOwner ? "إدارة المنصة" : "ورشتي"),
+      initialProfile?.workshopName ||
+        user.displayName ||
+        email.split("@")[0] ||
+        (isRegisteredAdmin ? "إدارة المنصة" : "ورشتي"),
       BLUEPRINT_LIMITS.nameMax
     );
     const phone = sanitizeStr(
-      initialProfile?.phone || (isOwner ? DEFAULT_PLATFORM_CONFIG.whatsappPhone : ""),
+      initialProfile?.phone || (isPrimaryOwner ? DEFAULT_PLATFORM_CONFIG.whatsappPhone : ""),
       BLUEPRINT_LIMITS.phoneMax
     );
 
-    const payload = isOwner
+    const payload = isRegisteredAdmin
       ? {
           ownerUid: user.uid,
           email,
@@ -115,7 +204,8 @@ export async function ensureTenantAndDefaults(
           planId: "owner_free",
           trialDays: 0,
           activeUntil: null,
-          adminNote: "حساب مالك المنصة - مجاني دائم",
+          adminNote: isPrimaryOwner ? "حساب مالك المنصة - مجاني دائم" : "حساب مدير منصة",
+          projectCount: 0,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         }
@@ -131,6 +221,7 @@ export async function ensureTenantAndDefaults(
           trialDays: DEFAULT_TRIAL_DAYS,
           activeUntil: null,
           adminNote: "",
+          projectCount: 0,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         };
@@ -142,8 +233,7 @@ export async function ensureTenantAndDefaults(
     }
   }
 
-  // If the primary owner logs in, ensure platform config and default plans exist in Firestore
-  if (isOwner) {
+  if (isPrimaryOwner) {
     await seedDefaultsIfMissing(user.uid);
   }
 
@@ -168,9 +258,61 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
         updatedBy: adminUid,
         updatedAt: serverTimestamp(),
       });
+    } else {
+      // تنظيف أي حقول حساسة قديمة (expiryWebhookUrl / adminAlertEmail) من الوثيقة العامة تلقائياً
+      const existingData = cfgSnap.data() as Record<string, unknown>;
+      if ("expiryWebhookUrl" in existingData || "adminAlertEmail" in existingData) {
+        const legacyAdminEmail =
+          typeof existingData.adminAlertEmail === "string" && existingData.adminAlertEmail.includes("@")
+            ? existingData.adminAlertEmail
+            : OWNER_ADMIN_EMAIL;
+
+        // ترحيل بريد التنبيه للإعدادات الخاصة قبل تنظيف الوثيقة العامة
+        const privRef = doc(db, "config_private", "notifications");
+        const privSnap = await getDoc(privRef);
+        if (!privSnap.exists()) {
+          await setDoc(privRef, {
+            adminAlertEmail: sanitizeStr(legacyAdminEmail, BLUEPRINT_LIMITS.emailMax),
+            notificationsEnabled: true,
+            updatedBy: adminUid,
+            updatedAt: serverTimestamp(),
+          });
+        }
+
+        await setDoc(cfgRef, {
+          whatsappPhone:
+            sanitizeStr(String(existingData.whatsappPhone || ""), BLUEPRINT_LIMITS.phoneMax) ||
+            DEFAULT_PLATFORM_CONFIG.whatsappPhone,
+          cliqAlias: sanitizeStr(String(existingData.cliqAlias || ""), 100),
+          cliqBankName: sanitizeStr(String(existingData.cliqBankName || ""), 100),
+          cliqHolderName: sanitizeStr(String(existingData.cliqHolderName || ""), 120),
+          trialDaysDefault: Math.max(
+            0,
+            Math.min(90, Math.round(Number(existingData.trialDaysDefault) || DEFAULT_TRIAL_DAYS))
+          ),
+          supportNote: sanitizeStr(String(existingData.supportNote || ""), BLUEPRINT_LIMITS.adminNoteMax),
+          updatedBy: adminUid,
+          updatedAt: serverTimestamp(),
+        });
+      }
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, cfgPath);
+  }
+
+  // ضمان وجود وثيقة الإعدادات الخاصة بالمدير فقط
+  try {
+    const privRef = doc(db, "config_private", "notifications");
+    const privSnap = await getDoc(privRef);
+    if (!privSnap.exists()) {
+      await setDoc(privRef, {
+        ...DEFAULT_PRIVATE_NOTIFICATION_CONFIG,
+        updatedBy: adminUid,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, "config_private/notifications");
   }
 
   const plansPath = "plans";
@@ -182,26 +324,6 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
           ...p,
           updatedAt: serverTimestamp(),
         });
-      }
-    } else {
-      // Auto-migrate previously seeded starter plan so PDF/Excel export is disabled by default
-      const starterSnap = existingPlans.docs.find((d) => d.id === "starter");
-      if (starterSnap) {
-        const sd = starterSnap.data() as SubscriptionPlan;
-        const hasLegacyFeature =
-          Array.isArray(sd.features) &&
-          sd.features.some((f) => f.includes("تصدير PDF و Excel ومشاركة واتساب"));
-        if (sd.allowExport === true && hasLegacyFeature) {
-          const updatedStarter = DEFAULT_PLANS.find((p) => p.id === "starter");
-          if (updatedStarter) {
-            await setDoc(doc(db, "plans", "starter"), {
-              ...sd,
-              allowExport: false,
-              features: updatedStarter.features,
-              updatedAt: serverTimestamp(),
-            });
-          }
-        }
       }
     }
   } catch (err) {
@@ -225,7 +347,7 @@ export function subscribeTenant(
       try {
         handleFirestoreError(error, OperationType.GET, path);
       } catch {
-        // surfaced via onError
+        // تم التمرير عبر onError
       }
     }
   );
@@ -239,7 +361,18 @@ export function subscribePlatformConfig(
     doc(db, "config", "platform"),
     (snap) => {
       if (snap.exists()) {
-        onData(snap.data() as PlatformConfig);
+        const d = snap.data() as Partial<PlatformConfig>;
+        onData({
+          whatsappPhone: d.whatsappPhone || DEFAULT_PLATFORM_CONFIG.whatsappPhone,
+          cliqAlias: d.cliqAlias || "",
+          cliqBankName: d.cliqBankName || "",
+          cliqHolderName: d.cliqHolderName || "",
+          trialDaysDefault:
+            typeof d.trialDaysDefault === "number" ? d.trialDaysDefault : DEFAULT_TRIAL_DAYS,
+          supportNote: d.supportNote || "",
+          updatedBy: d.updatedBy || "system",
+          updatedAt: d.updatedAt ?? null,
+        });
       } else {
         onData(DEFAULT_PLATFORM_CONFIG);
       }
@@ -249,6 +382,29 @@ export function subscribePlatformConfig(
         handleFirestoreError(error, OperationType.GET, path);
       } catch {
         onData(DEFAULT_PLATFORM_CONFIG);
+      }
+    }
+  );
+}
+
+export function subscribePrivateNotificationConfig(
+  onData: (cfg: PrivateNotificationConfig) => void
+): () => void {
+  const path = "config_private/notifications";
+  return onSnapshot(
+    doc(db, "config_private", "notifications"),
+    (snap) => {
+      if (snap.exists()) {
+        onData(snap.data() as PrivateNotificationConfig);
+      } else {
+        onData(DEFAULT_PRIVATE_NOTIFICATION_CONFIG);
+      }
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.GET, path);
+      } catch {
+        onData(DEFAULT_PRIVATE_NOTIFICATION_CONFIG);
       }
     }
   );
@@ -314,12 +470,16 @@ export function subscribeTenantProjects(
       try {
         handleFirestoreError(error, OperationType.LIST, path);
       } catch {
-        // handled via onError
+        // تم التعامل معه عبر onError
       }
     }
   );
 }
 
+/**
+ * حفظ مشروع سحابي داخل معاملة ذرية تفرض حد المشاريع (maxProjects) والأنواع المخصصة (allowCustomTypes)
+ * بالتزامن مع قواعد Firestore.
+ */
 export async function saveCloudProject(
   uid: string,
   projectId: string | null,
@@ -347,6 +507,10 @@ export async function saveCloudProject(
       });
       return projectId;
     } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      if (msg.includes("permission-denied") || msg.includes("PERMISSION_DENIED")) {
+        throw new Error("تعذر تعديل المشروع: تحقق من صلاحية اشتراكك أو حدود الباقة الحالية.");
+      }
       handleFirestoreError(err, OperationType.UPDATE, path);
     }
   }
@@ -354,18 +518,68 @@ export async function saveCloudProject(
   const newId = makeSafeDocId("pj");
   const path = `tenants/${uid}/projects/${newId}`;
   try {
-    await setDoc(doc(db, "tenants", uid, "projects", newId), {
-      ownerUid: uid,
-      name: safeName,
-      windowType: safeType,
-      unit: snapshot.unit,
-      windowCount,
-      snapshot: cleanSnapshot,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+    await runTransaction(db, async (tx) => {
+      const tenantRef = doc(db, "tenants", uid);
+      const tenantSnap = await tx.get(tenantRef);
+      if (!tenantSnap.exists()) {
+        throw new Error("حساب الورشة غير موجود.");
+      }
+      const tenant = tenantSnap.data() as TenantAccount;
+      const currentCount = typeof tenant.projectCount === "number" ? tenant.projectCount : 0;
+
+      if (tenant.role !== "admin") {
+        let maxProjects = TRIAL_MAX_PROJECTS;
+        let allowCustomTypes = true;
+        if (tenant.planId && tenant.planId !== "trial") {
+          const planSnap = await tx.get(doc(db, "plans", tenant.planId));
+          if (planSnap.exists()) {
+            const p = planSnap.data() as SubscriptionPlan;
+            maxProjects = p.maxProjects;
+            allowCustomTypes = Boolean(p.allowCustomTypes);
+          }
+        }
+        if (maxProjects >= 0 && currentCount >= maxProjects) {
+          throw new Error(
+            `وصلت إلى الحد الأقصى لعدد المشاريع في باقتك (${maxProjects} مشروع). قم بترقية الباقة لحفظ المزيد.`
+          );
+        }
+        const hasCustomTypes = Array.isArray(cleanSnapshot.utypes) && cleanSnapshot.utypes.length > 0;
+        if (hasCustomTypes && !allowCustomTypes) {
+          throw new Error("باقتك الحالية لا تسمح بحفظ أنواع شبابيك مخصصة. قم بترقية الباقة.");
+        }
+      }
+
+      const projectRef = doc(db, "tenants", uid, "projects", newId);
+      tx.set(projectRef, {
+        ownerUid: uid,
+        name: safeName,
+        windowType: safeType,
+        unit: snapshot.unit,
+        windowCount,
+        snapshot: cleanSnapshot,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      if (tenant.role !== "admin") {
+        tx.update(tenantRef, {
+          projectCount: currentCount + 1,
+          lastProjectActionId: newId,
+          updatedAt: serverTimestamp(),
+        });
+      }
     });
     return newId;
   } catch (err) {
+    if (err instanceof Error && (err.message.includes("الحد الأقصى") || err.message.includes("باقتك الحالية"))) {
+      throw err;
+    }
+    const msg = err instanceof Error ? err.message : "";
+    if (msg.includes("permission-denied") || msg.includes("PERMISSION_DENIED")) {
+      throw new Error(
+        "تعذر حفظ المشروع: انتهت مدة الاشتراك أو وصلت إلى الحد الأقصى للمشاريع في باقتك."
+      );
+    }
     handleFirestoreError(err, OperationType.CREATE, path);
   }
 }
@@ -388,10 +602,30 @@ export async function renameCloudProject(
   }
 }
 
+/** حذف مشروع سحابي داخل معاملة ذرية تنقص عدّاد projectCount بشكل متزامن مع القواعد */
 export async function deleteCloudProject(uid: string, projectId: string): Promise<void> {
   const path = `tenants/${uid}/projects/${projectId}`;
   try {
-    await deleteDoc(doc(db, "tenants", uid, "projects", projectId));
+    await runTransaction(db, async (tx) => {
+      const tenantRef = doc(db, "tenants", uid);
+      const projectRef = doc(db, "tenants", uid, "projects", projectId);
+      const [tenantSnap, projectSnap] = await Promise.all([tx.get(tenantRef), tx.get(projectRef)]);
+      if (!projectSnap.exists()) return;
+
+      tx.delete(projectRef);
+
+      if (tenantSnap.exists()) {
+        const tenant = tenantSnap.data() as TenantAccount;
+        const currentCount = typeof tenant.projectCount === "number" ? tenant.projectCount : 0;
+        if (tenant.role !== "admin" && currentCount > 0) {
+          tx.update(tenantRef, {
+            projectCount: currentCount - 1,
+            lastProjectActionId: projectId,
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+    });
   } catch (err) {
     handleFirestoreError(err, OperationType.DELETE, path);
   }
@@ -417,6 +651,10 @@ export async function updateTenantProfile(
   }
 }
 
+/**
+ * تقديم طلب دفع يدوي عبر CliQ — ينشئ الطلب بحالة pending ويحوّل حالة الحساب إلى pending_payment
+ * (دون تفعيل الاشتراك ودون تمديد التجربة المنتهية)
+ */
 export async function submitActivationRequest(
   user: User,
   params: {
@@ -427,22 +665,44 @@ export async function submitActivationRequest(
     cliqNote: string;
   }
 ): Promise<string> {
+  if (!user.emailVerified) {
+    throw new Error("يجب توثيق البريد الإلكتروني قبل تقديم طلب الدفع.");
+  }
+
   const reqId = makeSafeDocId("req");
   const path = `activation_requests/${reqId}`;
   try {
-    await setDoc(doc(db, "activation_requests", reqId), {
-      tenantId: user.uid,
-      ownerUid: user.uid,
-      email: sanitizeStr(user.email || "", BLUEPRINT_LIMITS.emailMax),
-      workshopName: sanitizeStr(params.workshopName || "ورشتي", BLUEPRINT_LIMITS.nameMax) || "ورشتي",
-      phone: sanitizeStr(params.phone, BLUEPRINT_LIMITS.phoneMax),
-      planId: sanitizeStr(params.planId, BLUEPRINT_LIMITS.planIdMax) || "starter",
-      billingCycle: params.billingCycle,
-      cliqNote: sanitizeStr(params.cliqNote, BLUEPRINT_LIMITS.noteMax),
-      status: "pending",
-      reviewedBy: "",
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+    await runTransaction(db, async (tx) => {
+      const tenantRef = doc(db, "tenants", user.uid);
+      const tenantSnap = await tx.get(tenantRef);
+      if (!tenantSnap.exists()) {
+        throw new Error("لم يتم العثور على بيانات الورشة.");
+      }
+      const tenant = tenantSnap.data() as TenantAccount;
+
+      tx.set(doc(db, "activation_requests", reqId), {
+        tenantId: user.uid,
+        ownerUid: user.uid,
+        email: sanitizeStr((user.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+        workshopName:
+          sanitizeStr(params.workshopName || tenant.workshopName || "ورشتي", BLUEPRINT_LIMITS.nameMax) ||
+          "ورشتي",
+        phone: sanitizeStr(params.phone, BLUEPRINT_LIMITS.phoneMax),
+        planId: sanitizeStr(params.planId, BLUEPRINT_LIMITS.planIdMax) || "starter",
+        billingCycle: params.billingCycle,
+        cliqNote: sanitizeStr(params.cliqNote, BLUEPRINT_LIMITS.noteMax),
+        status: "pending",
+        reviewedBy: "",
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      if (tenant.subscriptionStatus === "trialing" || tenant.subscriptionStatus === "expired") {
+        tx.update(tenantRef, {
+          subscriptionStatus: "pending_payment",
+          updatedAt: serverTimestamp(),
+        });
+      }
     });
     return reqId;
   } catch (err) {
@@ -474,23 +734,26 @@ export function subscribeMyActivationRequests(
   );
 }
 
-// ==================== ADMIN SERVICES ====================
+// ==================== ADMIN SERVICES (TRANSACTIONAL & AUDITED) ====================
 
 async function writeAuditLog(
   adminUser: User,
   action: string,
   targetTenantId: string,
-  details: string
+  details: string,
+  snapshots?: { beforeState?: string; afterState?: string }
 ): Promise<void> {
   const logId = makeSafeDocId("log");
   const path = `audit_logs/${logId}`;
   try {
     await setDoc(doc(db, "audit_logs", logId), {
       actorUid: adminUser.uid,
-      actorEmail: sanitizeStr(adminUser.email || "", BLUEPRINT_LIMITS.emailMax),
+      actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
       action: sanitizeStr(action, 80),
       targetTenantId: sanitizeStr(targetTenantId, BLUEPRINT_LIMITS.idMax),
       details: sanitizeStr(details, BLUEPRINT_LIMITS.adminNoteMax),
+      beforeState: sanitizeStr(snapshots?.beforeState || "", BLUEPRINT_LIMITS.stateSnapMax),
+      afterState: sanitizeStr(snapshots?.afterState || "", BLUEPRINT_LIMITS.stateSnapMax),
       createdAt: serverTimestamp(),
     });
   } catch (err) {
@@ -507,6 +770,28 @@ export function subscribeAllTenants(
     (snap) => {
       const list = snap.docs
         .map((d) => d.data() as TenantAccount)
+        .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
+      onData(list);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, path);
+      } catch {
+        onData([]);
+      }
+    }
+  );
+}
+
+export function subscribeAdditionalAdmins(
+  onData: (admins: AdminRecord[]) => void
+): () => void {
+  const path = "admins";
+  return onSnapshot(
+    query(collection(db, "admins")),
+    (snap) => {
+      const list = snap.docs
+        .map((d) => d.data() as AdminRecord)
         .sort((a, b) => (tsToMs(b.createdAt) || 0) - (tsToMs(a.createdAt) || 0));
       onData(list);
     },
@@ -548,7 +833,7 @@ export function subscribeAuditLogs(onData: (logs: AuditLogDoc[]) => void): () =>
     query(collection(db, "audit_logs"), orderBy("createdAt", "desc")),
     (snap) => {
       const list = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<AuditLogDoc, "id">) }));
-      onData(list.slice(0, 100));
+      onData(list.slice(0, 120));
     },
     (error) => {
       try {
@@ -560,64 +845,123 @@ export function subscribeAuditLogs(onData: (logs: AuditLogDoc[]) => void): () =>
   );
 }
 
+/** تفعيل اشتراك مدفوع داخل معاملة ذرية تبدأ مدتها من تاريخ التأكيد وتسجّل قبل/بعد في audit_logs */
 export async function adminActivateTenant(
   adminUser: User,
   target: TenantAccount,
-  opts: { planId: string; durationDays: number | null; adminNote?: string }
+  opts: { planId: string; durationDays: number | null; adminNote?: string },
+  serverNowMs = Date.now()
 ): Promise<void> {
   const path = `tenants/${target.ownerUid}`;
+  const cleanPlan = sanitizeStr(opts.planId, BLUEPRINT_LIMITS.planIdMax) || "starter";
   const activeUntil =
     opts.durationDays === null
       ? null
-      : Timestamp.fromMillis(Date.now() + opts.durationDays * 86400000);
+      : Timestamp.fromMillis(serverNowMs + opts.durationDays * 86400000);
+  const note = sanitizeStr(
+    opts.adminNote ??
+      `تفعيل عبر كليك (${opts.durationDays === null ? "دائم" : `${opts.durationDays} يوم`})`,
+    BLUEPRINT_LIMITS.adminNoteMax
+  );
+  const logId = makeSafeDocId("log");
+
   try {
-    await updateDoc(doc(db, "tenants", target.ownerUid), {
-      subscriptionStatus: "active",
-      planId: sanitizeStr(opts.planId, BLUEPRINT_LIMITS.planIdMax) || "starter",
-      activeUntil,
-      adminNote: sanitizeStr(
-        opts.adminNote ?? `تفعيل عبر كليك (${opts.durationDays === null ? "دائم" : `${opts.durationDays} يوم`})`,
-        BLUEPRINT_LIMITS.adminNoteMax
-      ),
-      updatedAt: serverTimestamp(),
+    await runTransaction(db, async (tx) => {
+      const tenantRef = doc(db, "tenants", target.ownerUid);
+      const snap = await tx.get(tenantRef);
+      if (!snap.exists()) {
+        throw new Error("لم يتم العثور على حساب الورشة.");
+      }
+      const prev = snap.data() as TenantAccount;
+      const beforeState = summarizeTenantState(prev);
+      const afterState = summarizeTenantState({
+        ...prev,
+        subscriptionStatus: "active",
+        planId: cleanPlan,
+        activeUntil,
+      });
+
+      tx.update(tenantRef, {
+        subscriptionStatus: "active",
+        planId: cleanPlan,
+        activeUntil,
+        adminNote: note,
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(doc(db, "audit_logs", logId), {
+        actorUid: adminUser.uid,
+        actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+        action: "activate_subscription",
+        targetTenantId: target.ownerUid,
+        details: sanitizeStr(
+          `تفعيل ${prev.email} على باقة ${cleanPlan} لمدة ${
+            opts.durationDays === null ? "دائمة" : `${opts.durationDays} يوم`
+          }`,
+          BLUEPRINT_LIMITS.adminNoteMax
+        ),
+        beforeState,
+        afterState,
+        createdAt: serverTimestamp(),
+      });
     });
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, path);
   }
-  await writeAuditLog(
-    adminUser,
-    "activate_subscription",
-    target.ownerUid,
-    `تفعيل ${target.email} على باقة ${opts.planId} لمدة ${opts.durationDays === null ? "دائمة" : `${opts.durationDays} يوم`}`
-  );
 }
 
 export async function adminExtendTrial(
   adminUser: User,
   target: TenantAccount,
-  extraDays: number
+  extraDays: number,
+  serverNowMs = Date.now()
 ): Promise<void> {
   const path = `tenants/${target.ownerUid}`;
-  const createdMs = tsToMs(target.createdAt) || Date.now();
-  const elapsedDays = Math.max(0, Math.ceil((Date.now() - createdMs) / 86400000));
-  const nextTrialDays = Math.min(3650, Math.max(target.trialDays + extraDays, elapsedDays + extraDays));
+  const logId = makeSafeDocId("log");
 
   try {
-    await updateDoc(doc(db, "tenants", target.ownerUid), {
-      subscriptionStatus: "trialing",
-      trialDays: nextTrialDays,
-      adminNote: sanitizeStr(`تمديد التجربة +${extraDays} يوم`, BLUEPRINT_LIMITS.adminNoteMax),
-      updatedAt: serverTimestamp(),
+    await runTransaction(db, async (tx) => {
+      const tenantRef = doc(db, "tenants", target.ownerUid);
+      const snap = await tx.get(tenantRef);
+      if (!snap.exists()) {
+        throw new Error("لم يتم العثور على حساب الورشة.");
+      }
+      const prev = snap.data() as TenantAccount;
+      const createdMs = tsToMs(prev.createdAt) || serverNowMs;
+      const elapsedDays = Math.max(0, Math.ceil((serverNowMs - createdMs) / 86400000));
+      const nextTrialDays = Math.min(3650, Math.max((prev.trialDays || 0) + extraDays, elapsedDays + extraDays));
+
+      const beforeState = summarizeTenantState(prev);
+      const afterState = summarizeTenantState({
+        ...prev,
+        subscriptionStatus: "trialing",
+        trialDays: nextTrialDays,
+      });
+
+      tx.update(tenantRef, {
+        subscriptionStatus: "trialing",
+        trialDays: nextTrialDays,
+        adminNote: sanitizeStr(`تمديد التجربة +${extraDays} يوم`, BLUEPRINT_LIMITS.adminNoteMax),
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(doc(db, "audit_logs", logId), {
+        actorUid: adminUser.uid,
+        actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+        action: "extend_trial",
+        targetTenantId: target.ownerUid,
+        details: sanitizeStr(
+          `تمديد تجربة ${prev.email} بمقدار ${extraDays} يوم (الإجمالي ${nextTrialDays} يوم)`,
+          BLUEPRINT_LIMITS.adminNoteMax
+        ),
+        beforeState,
+        afterState,
+        createdAt: serverTimestamp(),
+      });
     });
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, path);
   }
-  await writeAuditLog(
-    adminUser,
-    "extend_trial",
-    target.ownerUid,
-    `تمديد تجربة ${target.email} بمقدار ${extraDays} يوم`
-  );
 }
 
 export async function adminSuspendTenant(
@@ -626,55 +970,312 @@ export async function adminSuspendTenant(
   reason: string
 ): Promise<void> {
   const path = `tenants/${target.ownerUid}`;
+  const logId = makeSafeDocId("log");
+  const cleanReason = sanitizeStr(reason || "تم إيقاف الحساب من الإدارة", BLUEPRINT_LIMITS.adminNoteMax);
+
   try {
-    await updateDoc(doc(db, "tenants", target.ownerUid), {
-      subscriptionStatus: "suspended",
-      adminNote: sanitizeStr(reason || "تم إيقاف الحساب من الإدارة", BLUEPRINT_LIMITS.adminNoteMax),
-      updatedAt: serverTimestamp(),
+    await runTransaction(db, async (tx) => {
+      const tenantRef = doc(db, "tenants", target.ownerUid);
+      const snap = await tx.get(tenantRef);
+      if (!snap.exists()) {
+        throw new Error("لم يتم العثور على حساب الورشة.");
+      }
+      const prev = snap.data() as TenantAccount;
+      const beforeState = summarizeTenantState(prev);
+      const afterState = summarizeTenantState({ ...prev, subscriptionStatus: "suspended" });
+
+      tx.update(tenantRef, {
+        subscriptionStatus: "suspended",
+        adminNote: cleanReason,
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(doc(db, "audit_logs", logId), {
+        actorUid: adminUser.uid,
+        actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+        action: "suspend_tenant",
+        targetTenantId: target.ownerUid,
+        details: sanitizeStr(`إيقاف حساب ${prev.email}: ${cleanReason}`, BLUEPRINT_LIMITS.adminNoteMax),
+        beforeState,
+        afterState,
+        createdAt: serverTimestamp(),
+      });
     });
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, path);
   }
-  await writeAuditLog(
-    adminUser,
-    "suspend_tenant",
-    target.ownerUid,
-    `إيقاف حساب ${target.email}: ${reason || "عدم السداد"}`
-  );
 }
 
+export async function adminReactivateTenant(
+  adminUser: User,
+  target: TenantAccount,
+  serverNowMs = Date.now()
+): Promise<void> {
+  const path = `tenants/${target.ownerUid}`;
+  const logId = makeSafeDocId("log");
+
+  try {
+    await runTransaction(db, async (tx) => {
+      const tenantRef = doc(db, "tenants", target.ownerUid);
+      const snap = await tx.get(tenantRef);
+      if (!snap.exists()) {
+        throw new Error("لم يتم العثور على حساب الورشة.");
+      }
+      const prev = snap.data() as TenantAccount;
+      const activeUntilMs = tsToMs(prev.activeUntil);
+      const createdMs = tsToMs(prev.createdAt) || serverNowMs;
+      const trialEndMs = createdMs + (prev.trialDays || 0) * 86400000;
+
+      const nextStatus: TenantAccount["subscriptionStatus"] =
+        activeUntilMs !== null && activeUntilMs > serverNowMs
+          ? "active"
+          : trialEndMs > serverNowMs
+            ? "trialing"
+            : "expired";
+
+      const beforeState = summarizeTenantState(prev);
+      const afterState = summarizeTenantState({ ...prev, subscriptionStatus: nextStatus });
+
+      tx.update(tenantRef, {
+        subscriptionStatus: nextStatus,
+        adminNote: "تمت إعادة تفعيل الحساب من الإدارة",
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(doc(db, "audit_logs", logId), {
+        actorUid: adminUser.uid,
+        actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+        action: "reactivate_tenant",
+        targetTenantId: target.ownerUid,
+        details: sanitizeStr(`إعادة تفعيل حساب ${prev.email} (الحالة: ${nextStatus})`, BLUEPRINT_LIMITS.adminNoteMax),
+        beforeState,
+        afterState,
+        createdAt: serverTimestamp(),
+      });
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
+  }
+}
+
+/**
+ * مراجعة طلب تفعيل CliQ داخل معاملة ذرية واحدة:
+ * تمنع الموافقة المزدوجة على نفس الطلب، وتحدّث الطلب + الاشتراك + سجل التدقيق ذرياً.
+ */
 export async function adminReviewActivationRequest(
   adminUser: User,
   req: ActivationRequestDoc,
-  targetTenant: TenantAccount | undefined,
   decision: "approved" | "rejected",
-  durationDays: number | null
+  durationDays: number | null,
+  serverNowMs = Date.now()
 ): Promise<void> {
   const reqPath = `activation_requests/${req.id}`;
+  const logId = makeSafeDocId("log");
+
   try {
-    await updateDoc(doc(db, "activation_requests", req.id), {
-      status: decision,
-      reviewedBy: adminUser.uid,
-      updatedAt: serverTimestamp(),
+    await runTransaction(db, async (tx) => {
+      const reqRef = doc(db, "activation_requests", req.id);
+      const tenantRef = doc(db, "tenants", req.tenantId);
+
+      const [reqSnap, tenantSnap] = await Promise.all([tx.get(reqRef), tx.get(tenantRef)]);
+      if (!reqSnap.exists()) {
+        throw new Error("لم يتم العثور على طلب الدفع.");
+      }
+      const liveReq = reqSnap.data() as Omit<ActivationRequestDoc, "id">;
+      if (liveReq.status !== "pending") {
+        throw new Error("تمت معالجة هذا الطلب مسبقاً ولا يمكن تأكيده أو تغييره مرتين.");
+      }
+
+      tx.update(reqRef, {
+        status: decision,
+        reviewedBy: adminUser.uid,
+        updatedAt: serverTimestamp(),
+      });
+
+      if (tenantSnap.exists()) {
+        const prevTenant = tenantSnap.data() as TenantAccount;
+        const beforeState = summarizeTenantState(prevTenant);
+
+        if (decision === "approved") {
+          const activeUntil =
+            durationDays === null
+              ? null
+              : Timestamp.fromMillis(serverNowMs + durationDays * 86400000);
+          const cleanPlan = sanitizeStr(liveReq.planId, BLUEPRINT_LIMITS.planIdMax) || "starter";
+
+          tx.update(tenantRef, {
+            subscriptionStatus: "active",
+            planId: cleanPlan,
+            activeUntil,
+            adminNote: sanitizeStr(
+              `تأكيد دفع كليك #${req.id.slice(-6)} (${
+                durationDays === null ? "دائم" : `${durationDays} يوم`
+              })`,
+              BLUEPRINT_LIMITS.adminNoteMax
+            ),
+            updatedAt: serverTimestamp(),
+          });
+
+          const afterState = summarizeTenantState({
+            ...prevTenant,
+            subscriptionStatus: "active",
+            planId: cleanPlan,
+            activeUntil,
+          });
+
+          tx.set(doc(db, "audit_logs", logId), {
+            actorUid: adminUser.uid,
+            actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+            action: "approve_payment_request",
+            targetTenantId: req.tenantId,
+            details: sanitizeStr(
+              `تأكيد دفع كليك للورشة ${liveReq.email} على باقة ${cleanPlan} لمدة ${
+                durationDays === null ? "دائمة" : `${durationDays} يوم`
+              }`,
+              BLUEPRINT_LIMITS.adminNoteMax
+            ),
+            beforeState,
+            afterState,
+            createdAt: serverTimestamp(),
+          });
+        } else {
+          // عند رفض الطلب: إذا كانت الحالة pending_payment نعيدها لحالتها الحقيقية (trialing أو expired)
+          let nextStatus = prevTenant.subscriptionStatus;
+          if (prevTenant.subscriptionStatus === "pending_payment") {
+            const createdMs = tsToMs(prevTenant.createdAt) || serverNowMs;
+            const trialEndMs = createdMs + (prevTenant.trialDays || 0) * 86400000;
+            nextStatus = trialEndMs > serverNowMs ? "trialing" : "expired";
+            tx.update(tenantRef, {
+              subscriptionStatus: nextStatus,
+              adminNote: sanitizeStr(`تم رفض طلب الدفع #${req.id.slice(-6)}`, BLUEPRINT_LIMITS.adminNoteMax),
+              updatedAt: serverTimestamp(),
+            });
+          }
+
+          const afterState = summarizeTenantState({
+            ...prevTenant,
+            subscriptionStatus: nextStatus,
+          });
+
+          tx.set(doc(db, "audit_logs", logId), {
+            actorUid: adminUser.uid,
+            actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+            action: "reject_payment_request",
+            targetTenantId: req.tenantId,
+            details: sanitizeStr(
+              `رفض طلب دفع ${liveReq.email} (${liveReq.planId})`,
+              BLUEPRINT_LIMITS.adminNoteMax
+            ),
+            beforeState,
+            afterState,
+            createdAt: serverTimestamp(),
+          });
+        }
+      } else {
+        tx.set(doc(db, "audit_logs", logId), {
+          actorUid: adminUser.uid,
+          actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+          action: decision === "approved" ? "approve_payment_request" : "reject_payment_request",
+          targetTenantId: req.tenantId,
+          details: sanitizeStr(
+            `${decision === "approved" ? "قبول" : "رفض"} طلب تفعيل ${liveReq.email}`,
+            BLUEPRINT_LIMITS.adminNoteMax
+          ),
+          beforeState: "",
+          afterState: "",
+          createdAt: serverTimestamp(),
+        });
+      }
     });
   } catch (err) {
+    if (err instanceof Error && err.message.includes("معالجة هذا الطلب مسبقاً")) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.UPDATE, reqPath);
   }
+}
 
-  if (decision === "approved" && targetTenant) {
-    await adminActivateTenant(adminUser, targetTenant, {
-      planId: req.planId,
-      durationDays,
-      adminNote: `موافقة على طلب كليك #${req.id.slice(-6)}`,
-    });
-  } else {
-    await writeAuditLog(
-      adminUser,
-      decision === "approved" ? "approve_request" : "reject_request",
-      req.tenantId,
-      `${decision === "approved" ? "قبول" : "رفض"} طلب تفعيل ${req.email} (${req.planId})`
-    );
+/** إضافة مدير إضافي من قِبل مالك المنصة الأساسي فقط */
+export async function adminAddAdditionalAdmin(
+  ownerUser: User,
+  target: TenantAccount
+): Promise<void> {
+  if (!isOwnerAdminEmail(ownerUser.email) || !ownerUser.emailVerified) {
+    throw new Error("إدارة المدراء الإضافيين متاحة لمالك المنصة الأساسي فقط.");
   }
+  const logId = makeSafeDocId("log");
+  await runTransaction(db, async (tx) => {
+    const adminRef = doc(db, "admins", target.ownerUid);
+    const tenantRef = doc(db, "tenants", target.ownerUid);
+    const tenantSnap = await tx.get(tenantRef);
+    const prev = tenantSnap.exists() ? (tenantSnap.data() as TenantAccount) : target;
+
+    tx.set(adminRef, {
+      uid: target.ownerUid,
+      email: sanitizeStr(target.email.toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+      createdAt: serverTimestamp(),
+    });
+
+    if (tenantSnap.exists()) {
+      tx.update(tenantRef, {
+        role: "admin",
+        subscriptionStatus: "active",
+        adminNote: "تم منحه صلاحية مدير منصة",
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    tx.set(doc(db, "audit_logs", logId), {
+      actorUid: ownerUser.uid,
+      actorEmail: sanitizeStr((ownerUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+      action: "grant_admin",
+      targetTenantId: target.ownerUid,
+      details: sanitizeStr(`منح صلاحية مدير إضافي لـ ${target.email}`, BLUEPRINT_LIMITS.adminNoteMax),
+      beforeState: summarizeTenantState(prev),
+      afterState: summarizeTenantState({ ...prev, role: "admin", subscriptionStatus: "active" }),
+      createdAt: serverTimestamp(),
+    });
+  });
+}
+
+/** سحب صلاحية مدير إضافي من قِبل مالك المنصة الأساسي فقط */
+export async function adminRemoveAdditionalAdmin(
+  ownerUser: User,
+  adminUid: string,
+  adminEmail: string
+): Promise<void> {
+  if (!isOwnerAdminEmail(ownerUser.email) || !ownerUser.emailVerified) {
+    throw new Error("إدارة المدراء الإضافيين متاحة لمالك المنصة الأساسي فقط.");
+  }
+  if (adminUid === ownerUser.uid || isOwnerAdminEmail(adminEmail)) {
+    throw new Error("لا يمكن سحب صلاحية مالك المنصة الأساسي.");
+  }
+  const logId = makeSafeDocId("log");
+  await runTransaction(db, async (tx) => {
+    const adminRef = doc(db, "admins", adminUid);
+    const tenantRef = doc(db, "tenants", adminUid);
+    const tenantSnap = await tx.get(tenantRef);
+
+    tx.delete(adminRef);
+    if (tenantSnap.exists()) {
+      const prev = tenantSnap.data() as TenantAccount;
+      tx.update(tenantRef, {
+        role: "owner",
+        adminNote: "تم سحب صلاحية المدير",
+        updatedAt: serverTimestamp(),
+      });
+      tx.set(doc(db, "audit_logs", logId), {
+        actorUid: ownerUser.uid,
+        actorEmail: sanitizeStr((ownerUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+        action: "revoke_admin",
+        targetTenantId: adminUid,
+        details: sanitizeStr(`سحب صلاحية المدير من ${adminEmail}`, BLUEPRINT_LIMITS.adminNoteMax),
+        beforeState: summarizeTenantState(prev),
+        afterState: summarizeTenantState({ ...prev, role: "owner" }),
+        createdAt: serverTimestamp(),
+      });
+    }
+  });
 }
 
 export async function adminSavePlan(
@@ -708,28 +1309,22 @@ export async function adminSavePlan(
   await writeAuditLog(adminUser, "save_plan", safeId, `تحديث باقة ${plan.name} (${plan.priceLabel})`);
 }
 
+/** حفظ الإعدادات العامة (كليك وواتساب فقط — لا تخزن أي أسرار أو روابط Webhook) */
 export async function adminSavePlatformConfig(
   adminUser: User,
   cfg: PlatformConfig
 ): Promise<void> {
   const path = "config/platform";
-  const cleanWebhook = sanitizeStr(cfg.expiryWebhookUrl || "", 300);
-  const safeWebhook =
-    cleanWebhook && /^https:\/\/[^\s]+$/i.test(cleanWebhook) ? cleanWebhook : "";
-  const cleanAdminEmail =
-    sanitizeStr(cfg.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax) ||
-    OWNER_ADMIN_EMAIL;
-
   try {
     await setDoc(doc(db, "config", "platform"), {
-      whatsappPhone: sanitizeStr(cfg.whatsappPhone, BLUEPRINT_LIMITS.phoneMax) || DEFAULT_PLATFORM_CONFIG.whatsappPhone,
+      whatsappPhone:
+        sanitizeStr(cfg.whatsappPhone, BLUEPRINT_LIMITS.phoneMax) ||
+        DEFAULT_PLATFORM_CONFIG.whatsappPhone,
       cliqAlias: sanitizeStr(cfg.cliqAlias, 100),
       cliqBankName: sanitizeStr(cfg.cliqBankName, 100),
       cliqHolderName: sanitizeStr(cfg.cliqHolderName, 120),
       trialDaysDefault: Math.max(0, Math.min(90, Math.round(Number(cfg.trialDaysDefault) || 7))),
       supportNote: sanitizeStr(cfg.supportNote, BLUEPRINT_LIMITS.adminNoteMax),
-      adminAlertEmail: cleanAdminEmail,
-      expiryWebhookUrl: safeWebhook,
       updatedBy: adminUser.uid,
       updatedAt: serverTimestamp(),
     });
@@ -740,25 +1335,96 @@ export async function adminSavePlatformConfig(
     adminUser,
     "update_platform_config",
     "platform",
-    `تحديث إعدادات كليك وواتساب وتنبيهات الإيميل (${cfg.whatsappPhone})`
+    `تحديث إعدادات كليك وواتساب (${cfg.whatsappPhone})`
   );
 }
 
-async function postExpiryWebhook(
-  webhookUrl: string,
-  payload: Record<string, unknown>
-): Promise<boolean> {
-  if (!webhookUrl || !/^https:\/\/[^\s]+$/i.test(webhookUrl)) return false;
+/** حفظ إعدادات التنبيهات الخاصة بالمدير فقط في config_private/notifications */
+export async function adminSavePrivateNotificationConfig(
+  adminUser: User,
+  cfg: PrivateNotificationConfig
+): Promise<void> {
+  const path = "config_private/notifications";
+  const cleanAdminEmail =
+    sanitizeStr(cfg.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax).toLowerCase() ||
+    OWNER_ADMIN_EMAIL;
   try {
-    await fetch(webhookUrl, {
+    await setDoc(doc(db, "config_private", "notifications"), {
+      adminAlertEmail: cleanAdminEmail,
+      notificationsEnabled: Boolean(cfg.notificationsEnabled),
+      updatedBy: adminUser.uid,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, path);
+  }
+  await writeAuditLog(
+    adminUser,
+    "update_private_notifications_config",
+    "notifications",
+    `تحديث إعدادات تنبيهات الإدارة الخاصة (${cleanAdminEmail})`
+  );
+}
+
+/** فحص حالة ضبط EXPIRY_WEBHOOK_URL على الخادم (للمدير الموثّق فقط) */
+export async function fetchNotificationWebhookStatus(
+  adminUser: User
+): Promise<{ webhookConfigured: boolean; secretConfigured: boolean }> {
+  try {
+    const idToken = await adminUser.getIdToken();
+    const res = await fetch("/api/notifications/status", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${idToken}` },
+      cache: "no-store",
+    });
+    if (!res.ok) return { webhookConfigured: false, secretConfigured: false };
+    const data = (await res.json()) as {
+      webhookConfigured?: boolean;
+      secretConfigured?: boolean;
+    };
+    return {
+      webhookConfigured: Boolean(data.webhookConfigured),
+      secretConfigured: Boolean(data.secretConfigured),
+    };
+  } catch {
+    return { webhookConfigured: false, secretConfigured: false };
+  }
+}
+
+/** إرسال تنبيه قرب الانتهاء عبر خادم Express المحمي مع التحقق الفعلي من الاستجابة */
+async function dispatchExpiryNotificationViaServer(
+  user: User,
+  payload: Record<string, unknown>
+): Promise<{ delivered: boolean; status: "sent" | "failed" | "unconfigured"; error?: string }> {
+  try {
+    const idToken = await user.getIdToken();
+    const resp = await fetch("/api/notifications/expiry", {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${idToken}`,
+      },
       body: JSON.stringify(payload),
     });
-    return true;
+    const data = (await resp.json().catch(() => ({}))) as {
+      delivered?: boolean;
+      status?: "sent" | "failed" | "unconfigured";
+      error?: string;
+    };
+    if (resp.ok && data.delivered) {
+      return { delivered: true, status: "sent" };
+    }
+    return {
+      delivered: false,
+      status: data.status === "unconfigured" ? "unconfigured" : "failed",
+      error: data.error,
+    };
   } catch {
-    return false;
+    return {
+      delivered: false,
+      status: "failed",
+      error: "تعذر الاتصال بخادم الإشعارات.",
+    };
   }
 }
 
@@ -768,6 +1434,7 @@ export async function triggerExpiryAlertOnce(
   access: TenantAccessEvaluation,
   config: PlatformConfig
 ): Promise<void> {
+  if (!user.emailVerified) return;
   if (!access.isExpiringSoon || !access.expiresAtMs) return;
   if (access.state !== "trialing" && access.state !== "active") return;
 
@@ -780,65 +1447,65 @@ export async function triggerExpiryAlertOnce(
     const existingSnap = await getDoc(alertRef);
     if (existingSnap.exists()) return;
 
-    const adminEmail =
-      sanitizeStr(config.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax) ||
-      OWNER_ADMIN_EMAIL;
     const isTrial = access.state === "trialing";
     const clampedHours = Math.max(0, Math.min(48, Math.round(access.hoursLeft)));
 
     await setDoc(alertRef, {
       tenantId: user.uid,
       ownerUid: user.uid,
-      email: sanitizeStr(user.email || tenant.email, BLUEPRINT_LIMITS.emailMax),
+      email: sanitizeStr((user.email || tenant.email).toLowerCase(), BLUEPRINT_LIMITS.emailMax),
       workshopName: sanitizeStr(tenant.workshopName || tenant.displayName, BLUEPRINT_LIMITS.nameMax),
       phone: sanitizeStr(tenant.phone || "", BLUEPRINT_LIMITS.phoneMax),
       alertType: isTrial ? "trial_expiring" : "subscription_expiring",
       expiresAt: Timestamp.fromMillis(access.expiresAtMs),
       hoursLeft: clampedHours,
-      adminEmail,
+      adminEmail: OWNER_ADMIN_EMAIL,
       emailStatus: "pending",
       acknowledged: false,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
 
-    const webhookUrl = (config.expiryWebhookUrl || "").trim();
-    if (webhookUrl) {
-      const content = buildExpiryReminderEmailContent({
-        workshopName: tenant.workshopName || tenant.displayName || "ورشتي",
-        userEmail: tenant.email,
-        adminEmail,
-        phone: tenant.phone,
-        isTrial,
-        remainingLabel: access.remainingLabel,
-        expiresAtIso: new Date(access.expiresAtMs).toISOString().slice(0, 10),
-        whatsappPhone: config.whatsappPhone || DEFAULT_WHATSAPP_PHONE,
-      });
-      const sent = await postExpiryWebhook(webhookUrl, {
-        adminEmail,
-        userEmail: tenant.email,
-        workshopName: tenant.workshopName || tenant.displayName || "ورشتي",
-        phone: tenant.phone || "",
-        alertType: isTrial ? "trial_expiring" : "subscription_expiring",
-        hoursLeft: clampedHours,
-        remainingLabel: access.remainingLabel,
-        expiresAtIso: new Date(access.expiresAtMs).toISOString().slice(0, 10),
-        subject: content.subject,
-        userBody: content.userBody,
-        adminBody: content.adminBody,
-      });
+    const expiresAtIso = new Date(access.expiresAtMs).toISOString().slice(0, 10);
+    const content = buildExpiryReminderEmailContent({
+      workshopName: tenant.workshopName || tenant.displayName || "ورشتي",
+      userEmail: tenant.email,
+      adminEmail: OWNER_ADMIN_EMAIL,
+      phone: tenant.phone,
+      isTrial,
+      remainingLabel: access.remainingLabel,
+      expiresAtIso,
+      whatsappPhone: config.whatsappPhone || DEFAULT_WHATSAPP_PHONE,
+    });
+
+    const result = await dispatchExpiryNotificationViaServer(user, {
+      alertId,
+      tenantId: user.uid,
+      adminEmail: OWNER_ADMIN_EMAIL,
+      userEmail: tenant.email,
+      workshopName: tenant.workshopName || tenant.displayName || "ورشتي",
+      phone: tenant.phone || "",
+      alertType: isTrial ? "trial_expiring" : "subscription_expiring",
+      hoursLeft: clampedHours,
+      remainingLabel: access.remainingLabel,
+      expiresAtIso,
+      subject: content.subject,
+      userBody: content.userBody,
+      adminBody: content.adminBody,
+    });
+
+    if (result.status !== "unconfigured") {
       await updateDoc(alertRef, {
-        emailStatus: sent ? "sent" : "failed",
+        emailStatus: result.delivered ? "sent" : "failed",
         hoursLeft: clampedHours,
         updatedAt: serverTimestamp(),
       });
     }
   } catch (err) {
-    // Non-blocking background alert — log cleanly without crashing the calculator
     try {
       handleFirestoreError(err, OperationType.WRITE, path);
     } catch {
-      // already logged
+      // مسجّل بالفعل بدون تعطيل الواجهة
     }
   }
 }
@@ -870,10 +1537,16 @@ export async function adminDispatchExpiryEmail(
   target: TenantAccount,
   access: TenantAccessEvaluation,
   config: PlatformConfig,
+  privateConfig: PrivateNotificationConfig,
   existingAlertId?: string
-): Promise<{ sentViaWebhook: boolean; mailtoUrl: string }> {
+): Promise<{
+  sentViaServer: boolean;
+  status: "sent" | "failed" | "unconfigured";
+  error?: string;
+  mailtoUrl: string;
+}> {
   const adminEmail =
-    sanitizeStr(config.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax) ||
+    sanitizeStr(privateConfig.adminAlertEmail || OWNER_ADMIN_EMAIL, BLUEPRINT_LIMITS.emailMax) ||
     OWNER_ADMIN_EMAIL;
   const isTrial = access.state === "trialing";
   const expiresAtIso = access.expiresAtMs
@@ -891,32 +1564,40 @@ export async function adminDispatchExpiryEmail(
     whatsappPhone: config.whatsappPhone || DEFAULT_WHATSAPP_PHONE,
   });
 
-  const webhookUrl = (config.expiryWebhookUrl || "").trim();
-  const sentViaWebhook = webhookUrl
-    ? await postExpiryWebhook(webhookUrl, {
-        adminEmail,
-        userEmail: target.email,
-        workshopName: target.workshopName || target.displayName || "ورشتي",
-        phone: target.phone || "",
-        alertType: isTrial ? "trial_expiring" : "subscription_expiring",
-        hoursLeft: Math.max(0, Math.min(48, Math.round(access.hoursLeft))),
-        remainingLabel: access.remainingLabel,
-        expiresAtIso,
-        subject: content.subject,
-        userBody: content.userBody,
-        adminBody: content.adminBody,
-      })
-    : false;
+  const alertId =
+    existingAlertId ||
+    `exp_${target.ownerUid}_${Math.floor((access.expiresAtMs || Date.now()) / 86400000)}`;
+
+  const result = await dispatchExpiryNotificationViaServer(adminUser, {
+    alertId,
+    tenantId: target.ownerUid,
+    adminEmail,
+    userEmail: target.email,
+    workshopName: target.workshopName || target.displayName || "ورشتي",
+    phone: target.phone || "",
+    alertType: isTrial ? "trial_expiring" : "subscription_expiring",
+    hoursLeft: Math.max(0, Math.min(48, Math.round(access.hoursLeft))),
+    remainingLabel: access.remainingLabel,
+    expiresAtIso,
+    subject: content.subject,
+    userBody: content.userBody,
+    adminBody: content.adminBody,
+    forceResend: true,
+  });
 
   if (existingAlertId) {
     try {
       await updateDoc(doc(db, "expiry_alerts", existingAlertId), {
-        emailStatus: sentViaWebhook ? "sent" : "manual",
+        emailStatus: result.delivered
+          ? "sent"
+          : result.status === "unconfigured"
+            ? "manual"
+            : "failed",
         acknowledged: true,
         updatedAt: serverTimestamp(),
       });
     } catch {
-      // ignore if alert doc doesn't exist yet
+      // تجاهل إن لم توجد الوثيقة
     }
   }
 
@@ -924,14 +1605,21 @@ export async function adminDispatchExpiryEmail(
     adminUser,
     "send_expiry_reminder_email",
     target.ownerUid,
-    `إرسال تنبيه قرب الانتهاء إلى ${target.email} ونسخة إلى ${adminEmail} (${sentViaWebhook ? "تلقائي" : "بريد يدوي"})`
+    `إرسال تنبيه قرب الانتهاء إلى ${target.email} ونسخة إلى ${adminEmail} (${
+      result.delivered ? "إرسال مؤكد من الخادم" : result.status === "unconfigured" ? "بريد يدوي" : "فشل الإرسال"
+    })`
   );
 
-  return { sentViaWebhook, mailtoUrl: content.mailtoUrl };
+  return {
+    sentViaServer: result.delivered,
+    status: result.status,
+    error: result.error,
+    mailtoUrl: content.mailtoUrl,
+  };
 }
 
 export async function adminAcknowledgeExpiryAlert(
-  adminUser: User,
+  _adminUser: User,
   alertId: string
 ): Promise<void> {
   const path = `expiry_alerts/${alertId}`;
@@ -945,11 +1633,33 @@ export async function adminAcknowledgeExpiryAlert(
   }
 }
 
+export const PASSWORD_RESET_TTL_MS = 10 * 60 * 1000; // 10 دقائق
+
+export async function sendPasswordResetSafe(email: string): Promise<void> {
+  auth.languageCode = "ar";
+  const cleanEmail = email.trim();
+  const now = Date.now();
+  const actionCodeSettings = {
+    url: `${window.location.origin}/?resetSentAt=${now}&resetExpiresAt=${now + PASSWORD_RESET_TTL_MS}`,
+    handleCodeInApp: false,
+  };
+  try {
+    await sendPasswordResetEmail(auth, cleanEmail, actionCodeSettings);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("unauthorized-continue-uri") || msg.includes("invalid-continue-uri")) {
+      await sendPasswordResetEmail(auth, cleanEmail);
+      return;
+    }
+    throw err;
+  }
+}
+
 export async function adminSendPasswordResetLink(
   adminUser: User,
   target: TenantAccount
 ): Promise<void> {
-  await sendPasswordResetEmail(auth, target.email);
+  await sendPasswordResetSafe(target.email);
   await writeAuditLog(
     adminUser,
     "send_password_reset",
@@ -958,6 +1668,10 @@ export async function adminSendPasswordResetLink(
   );
 }
 
+/**
+ * إنشاء حساب دخول بالبريد وكلمة المرور من لوحة المدير مع إرسال رسالة التوثيق تلقائياً.
+ * التزاماً بسياسة الأمان: لا يُنشأ tenant ولا تبدأ التجربة إلا بعد توثيق العميل لبريده الإلكتروني.
+ */
 export async function adminCreateWorkshopAccount(
   adminUser: User,
   params: {
@@ -971,56 +1685,29 @@ export async function adminCreateWorkshopAccount(
 ): Promise<{ uid: string; email: string }> {
   const cleanEmail = sanitizeStr(params.email, BLUEPRINT_LIMITS.emailMax).toLowerCase();
   const cleanName = sanitizeStr(params.workshopName, BLUEPRINT_LIMITS.nameMax) || "ورشة جديدة";
-  const cleanPhone = sanitizeStr(params.phone, BLUEPRINT_LIMITS.phoneMax);
   const secondaryName = `admin_create_${Date.now()}`;
   const secondaryApp = initializeApp(firebaseConfig, secondaryName);
 
   try {
     const secAuth = getAuth(secondaryApp);
-    const secDb = getFirestore(secondaryApp, firebaseConfig.firestoreDatabaseId);
+    secAuth.languageCode = "ar";
     const cred = await createUserWithEmailAndPassword(secAuth, cleanEmail, params.password);
     await updateProfile(cred.user, { displayName: cleanName });
-
-    // Create the tenant doc under the newly created user's session (matches strict self-registration rule)
-    await setDoc(doc(secDb, "tenants", cred.user.uid), {
-      ownerUid: cred.user.uid,
-      email: cleanEmail,
-      displayName: cleanName,
-      workshopName: cleanName,
-      phone: cleanPhone,
-      role: "owner",
-      subscriptionStatus: "trialing",
-      planId: "trial",
-      trialDays: DEFAULT_TRIAL_DAYS,
-      activeUntil: null,
-      adminNote: "",
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    try {
+      await sendEmailVerification(cred.user);
+    } catch {
+      // يمكن للعميل إعادة إرسال رسالة التوثيق من شاشة التوثيق عند أول دخول
+    }
 
     const newUid = cred.user.uid;
     await signOut(secAuth);
     await deleteApp(secondaryApp);
 
-    // If admin selected a paid plan immediately, activate using primary admin credentials
-    if (params.planId && params.planId !== "trial") {
-      await updateDoc(doc(db, "tenants", newUid), {
-        subscriptionStatus: "active",
-        planId: sanitizeStr(params.planId, BLUEPRINT_LIMITS.planIdMax),
-        activeUntil:
-          params.durationDays === null
-            ? null
-            : Timestamp.fromMillis(Date.now() + params.durationDays * 86400000),
-        adminNote: "تم إنشاء الحساب وتفعيله يدوياً من الإدارة",
-        updatedAt: serverTimestamp(),
-      });
-    }
-
     await writeAuditLog(
       adminUser,
       "create_workshop_manual",
       newUid,
-      `إنشاء حساب يدوي للورشة ${cleanName} (${cleanEmail}) — الباقة: ${params.planId}`
+      `إنشاء حساب دخول للورشة ${cleanName} (${cleanEmail}) وإرسال رسالة توثيق البريد`
     );
 
     return { uid: newUid, email: cleanEmail };
@@ -1028,14 +1715,33 @@ export async function adminCreateWorkshopAccount(
     try {
       await deleteApp(secondaryApp);
     } catch {
-      // ignore cleanup errors
+      // تجاهل أخطاء التنظيف
     }
     throw err;
   }
 }
 
 export async function sendOwnPasswordReset(email: string): Promise<void> {
-  await sendPasswordResetEmail(auth, email.trim());
+  await sendPasswordResetSafe(email);
+}
+
+export async function linkPasswordToAccount(
+  user: User,
+  newPassword: string
+): Promise<void> {
+  if (!user.email) throw new Error("لا يوجد بريد إلكتروني مرتبط بالحساب.");
+  const credential = EmailAuthProvider.credential(user.email, newPassword);
+  try {
+    await linkWithCredential(user, credential);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("requires-recent-login")) {
+      await reauthenticateWithPopup(user, googleProvider);
+      await linkWithCredential(user, credential);
+      return;
+    }
+    throw err;
+  }
 }
 
 export async function changeOwnPassword(
@@ -1049,3 +1755,13 @@ export async function changeOwnPassword(
   await updatePassword(user, newPassword);
 }
 
+export async function verifyInAppResetCode(oobCode: string): Promise<string> {
+  return verifyPasswordResetCode(auth, oobCode);
+}
+
+export async function confirmInAppPasswordReset(
+  oobCode: string,
+  newPassword: string
+): Promise<void> {
+  await confirmPasswordReset(auth, oobCode, newPassword);
+}

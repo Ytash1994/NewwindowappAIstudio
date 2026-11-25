@@ -3659,6 +3659,10 @@ html[data-pal="flame"][data-theme] {
   background: #4a3a10;
   color: #ffd77a;
 }
+.saas-status-tag.st-pending_payment {
+  background: #3b2d59;
+  color: #d6c2ff;
+}
 .saas-status-tag.st-expired,
 .saas-status-tag.st-suspended {
   background: #4e1c1c;
