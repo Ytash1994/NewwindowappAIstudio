@@ -16,7 +16,7 @@ import {
   saveScopedProjects,
 } from "../src/saas/storage";
 import type { StorageLike } from "../src/saas/storage";
-import { evaluateTenantAccess } from "../src/saas/types";
+import { DEFAULT_PLANS, evaluateTenantAccess, resolvePlanLimits } from "../src/saas/types";
 import type { TenantAccount } from "../src/saas/types";
 import {
   IdempotencyGuard,
@@ -211,12 +211,74 @@ runTest("التحقق الثابت من بنية firestore.rules وغياب no-c
   assert.ok(rulesText.includes("match /config_private/{configId}"));
   assert.ok(rulesText.includes("existing().status == 'pending'"));
   assert.ok(rulesText.includes("planAllowsNewProject"));
+  assert.ok(rulesText.includes("planAllowsExtraTypesAddon"));
+  assert.ok(rulesText.includes("extraCustomTypesQuota"));
   assert.ok(rulesText.includes("allow update: if false;\n      allow delete: if false;"));
   assert.equal(rulesText.includes("expiryWebhookUrl"), true); // فقط لتنظيف الحقل القديم الممنوع في incoming
 
   const serviceText = fs.readFileSync(path.resolve("src/saas/service.ts"), "utf8");
   assert.equal(serviceText.includes("no-cors"), false, "يجب إزالة mode: no-cors نهائياً");
   assert.ok(serviceText.includes("runTransaction"), "يجب استخدام المعاملات الذرية");
+});
+
+runTest("حدود الباقات الثلاث والتجربة المجانية وحزمة الأنواع الإضافية لآخر باقة فقط", () => {
+  const starterPlan = DEFAULT_PLANS.find((p) => p.id === "starter")!;
+  const proPlan = DEFAULT_PLANS.find((p) => p.id === "pro")!;
+  const businessPlan = DEFAULT_PLANS.find((p) => p.id === "business")!;
+
+  // التجربة المجانية: بدون أنواع جديدة، وعلاقتين لكل نوع، وترتيب مسموح
+  const trialLim = resolvePlanLimits(
+    makeTenant({ planId: "trial", subscriptionStatus: "trialing" }),
+    null,
+    false
+  );
+  assert.equal(trialLim.maxCustomTypes, 0);
+  assert.equal(trialLim.maxCustomFieldsPerType, 2);
+  assert.equal(trialLim.allowReorder, true);
+  assert.equal(trialLim.canRequestExtraTypesAddon, false);
+
+  // الباقة الأولى (الأساسية): بدون أنواع جديدة، وعلاقتين لكل نوع فقط
+  const starterLim = resolvePlanLimits(
+    makeTenant({ planId: "starter", subscriptionStatus: "active" }),
+    starterPlan,
+    false
+  );
+  assert.equal(starterLim.maxCustomTypes, 0);
+  assert.equal(starterLim.maxCustomFieldsPerType, 2);
+  assert.equal(starterLim.allowReorder, true);
+  assert.equal(starterLim.canRequestExtraTypesAddon, false);
+
+  // الباقة الثانية (الاحترافية): نوعين جديدين + 5 علاقات لكل نوع (بدون حزمة إضافية)
+  const proLim = resolvePlanLimits(
+    makeTenant({ planId: "pro", subscriptionStatus: "active", extraCustomTypesQuota: 5 }),
+    proPlan,
+    false
+  );
+  assert.equal(proLim.maxCustomTypes, 2, "الحزمة الإضافية لا تنطبق على الباقة الثانية");
+  assert.equal(proLim.maxCustomFieldsPerType, 5);
+  assert.equal(proLim.allowReorder, true);
+  assert.equal(proLim.canRequestExtraTypesAddon, false);
+
+  // الباقة الثالثة (الورش والمصانع): 5 أنواع + حزمة إضافية 5 أنواع بـ 10 دنانير لمرة واحدة مع الاشتراك
+  const bizLim = resolvePlanLimits(
+    makeTenant({ planId: "business", subscriptionStatus: "active", extraCustomTypesQuota: 0 }),
+    businessPlan,
+    false
+  );
+  assert.equal(bizLim.maxCustomTypes, 5);
+  assert.equal(bizLim.maxCustomFieldsPerType, -1);
+  assert.equal(bizLim.allowReorder, true);
+  assert.equal(bizLim.canRequestExtraTypesAddon, true);
+  assert.equal(bizLim.extraTypesPackSize, 5);
+  assert.equal(bizLim.extraTypesPackPriceJod, 10);
+
+  // بعد شراء حزمة +5 أنواع على الباقة الأخيرة تصبح الحصة 10
+  const bizWithAddon = resolvePlanLimits(
+    makeTenant({ planId: "business", subscriptionStatus: "active", extraCustomTypesQuota: 5 }),
+    businessPlan,
+    false
+  );
+  assert.equal(bizWithAddon.maxCustomTypes, 10);
 });
 
 console.log(`\nاكتملت جميع اختبارات الأمان والاشتراكات بنجاح (${passed}/${passed}).`);

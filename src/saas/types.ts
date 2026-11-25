@@ -5,6 +5,10 @@ export const OWNER_ADMIN_EMAIL = "xtashtoush@gmail.com";
 export const DEFAULT_WHATSAPP_PHONE = "0798904182";
 export const DEFAULT_TRIAL_DAYS = 7;
 export const TRIAL_MAX_PROJECTS = 25;
+export const TRIAL_MAX_CUSTOM_TYPES = 0;
+export const TRIAL_MAX_CUSTOM_FIELDS_PER_TYPE = 2;
+export const DEFAULT_EXTRA_TYPES_PACK_SIZE = 5;
+export const DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD = 10;
 
 export type SubscriptionStatus =
   | "trialing"
@@ -14,6 +18,7 @@ export type SubscriptionStatus =
   | "suspended";
 export type BillingCycle = "monthly" | "quarterly" | "yearly";
 export type ActivationStatus = "pending" | "approved" | "rejected";
+export type ActivationRequestType = "subscription" | "extra_types_addon";
 export type TenantRole = "owner" | "admin";
 
 export interface AdminRecord {
@@ -50,6 +55,11 @@ export interface SubscriptionPlan {
   maxProjects: number; // -1 يعني غير محدود
   allowExport: boolean;
   allowCustomTypes: boolean;
+  maxCustomTypes?: number; // 0 ممنوع، -1 غير محدود
+  maxCustomFieldsPerType?: number; // عدد العلاقات/الخانات الجديدة المسموحة لكل نوع (-1 غير محدود)
+  allowExtraTypesAddon?: boolean; // متاح للباقة الأخيرة فقط (حزمة أنواع إضافية مرة واحدة مع الاشتراك)
+  extraTypesPackSize?: number; // عدد الأنواع الإضافية في الحزمة الواحدة (افتراضياً 5)
+  extraTypesPackPriceJod?: number; // السعر لمرة واحدة مع الاشتراك الحالي (افتراضياً 10 دينار)
   active: boolean;
   sortOrder: number;
   features: string[];
@@ -70,6 +80,8 @@ export interface TenantAccount {
   adminNote: string;
   projectCount?: number;
   lastProjectActionId?: string;
+  /** حصة الأنواع الإضافية المدفوعة للاشتراك الحالي فقط (تنطبق على الباقة الأخيرة وتُصفّر عند التجديد) */
+  extraCustomTypesQuota?: number;
   createdAt: Timestamp | null;
   updatedAt: Timestamp | null;
 }
@@ -98,6 +110,9 @@ export interface ActivationRequestDoc {
   cliqNote: string;
   status: ActivationStatus;
   reviewedBy: string;
+  requestType?: ActivationRequestType;
+  extraTypesCount?: number;
+  addonPriceJod?: number;
   createdAt: Timestamp | null;
   updatedAt: Timestamp | null;
 }
@@ -147,6 +162,17 @@ export interface TenantAccessEvaluation {
   remainingLabel: string;
 }
 
+export interface ResolvedPlanLimits {
+  baseMaxCustomTypes: number; // -1 غير محدود
+  extraTypesQuota: number;
+  maxCustomTypes: number; // -1 غير محدود
+  maxCustomFieldsPerType: number; // -1 غير محدود
+  allowReorder: true; // تغيير الترتيب مسموح دائماً لجميع العلاقات في كل الباقات
+  canRequestExtraTypesAddon: boolean;
+  extraTypesPackSize: number;
+  extraTypesPackPriceJod: number;
+}
+
 export const EXPIRY_WARNING_MS = 2 * 86400000; // أقل من يومين (48 ساعة)
 
 export const DEFAULT_PLATFORM_CONFIG: PlatformConfig = {
@@ -173,13 +199,19 @@ export const DEFAULT_PLANS: SubscriptionPlan[] = [
     priceMonthlyJod: 10,
     maxProjects: 25,
     allowExport: false,
-    allowCustomTypes: true,
+    allowCustomTypes: false,
+    maxCustomTypes: 0,
+    maxCustomFieldsPerType: 2,
+    allowExtraTypesAddon: false,
+    extraTypesPackSize: 0,
+    extraTypesPackPriceJod: 0,
     active: true,
     sortOrder: 1,
     features: [
-      "جميع أنظمة الشبابيك والمعادلات",
-      "حفظ حتى 25 مشروعاً سحابياً",
-      "نسخ ومشاركة نصية (بدون حفظ PDF/Excel)",
+      "الأنواع الأساسية الأربعة الموجودة فقط (بدون إضافة أنواع جديدة)",
+      "إضافة علاقتين (خانتين) جديدتين كحد أقصى لكل نوع",
+      "تغيير ترتيب جميع العلاقات مسموح بالكامل",
+      "حفظ حتى 25 مشروعاً سحابياً (بدون تصدير PDF/Excel)",
     ],
   },
   {
@@ -190,13 +222,18 @@ export const DEFAULT_PLANS: SubscriptionPlan[] = [
     maxProjects: 150,
     allowExport: true,
     allowCustomTypes: true,
+    maxCustomTypes: 2,
+    maxCustomFieldsPerType: 5,
+    allowExtraTypesAddon: false,
+    extraTypesPackSize: 0,
+    extraTypesPackPriceJod: 0,
     active: true,
     sortOrder: 2,
     features: [
-      "حفظ حتى 150 مشروعاً سحابياً",
-      "إضافة أنواع وخانات مخصصة للورشة",
-      "تصدير PDF و Excel ونسخ احتياطي كامل",
-      "أولوية في الدعم والتفعيل",
+      "إضافة حتى نوعين شبابيك جديدين مخصصين للورشة",
+      "إضافة حتى 5 علاقات (خانات) جديدة لكل نوع",
+      "تغيير ترتيب جميع العلاقات مسموح بالكامل",
+      "حفظ حتى 150 مشروعاً سحابياً + تصدير PDF و Excel",
     ],
   },
   {
@@ -207,16 +244,135 @@ export const DEFAULT_PLANS: SubscriptionPlan[] = [
     maxProjects: -1,
     allowExport: true,
     allowCustomTypes: true,
+    maxCustomTypes: 5,
+    maxCustomFieldsPerType: -1,
+    allowExtraTypesAddon: true,
+    extraTypesPackSize: DEFAULT_EXTRA_TYPES_PACK_SIZE,
+    extraTypesPackPriceJod: DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
     active: true,
     sortOrder: 3,
     features: [
-      "مشاريع سحابية غير محدودة",
-      "أنواع مخصصة ومعادلات غير محدودة",
-      "تصدير PDF و Excel بدون قيود",
-      "دعم مباشر عبر الواتساب",
+      "إضافة حتى 5 أنواع شبابيك جديدة (+ طلب حزم إضافية مقابل 10 دنانير لمرة واحدة مع الاشتراك)",
+      "إضافة علاقات وخانات جديدة غير محدودة لكل نوع",
+      "تغيير ترتيب جميع العلاقات مسموح بالكامل",
+      "مشاريع سحابية غير محدودة + تصدير PDF و Excel ودعم واتساب",
     ],
   },
 ];
+
+/** استنتاج حدود الباقة بدقة مع توافق كامل للوثائق القديمة التي لا تحتوي الحقول الجديدة بعد */
+export function getPlanDefaultsById(plan?: Partial<SubscriptionPlan> | null): {
+  maxCustomTypes: number;
+  maxCustomFieldsPerType: number;
+  allowExtraTypesAddon: boolean;
+  extraTypesPackSize: number;
+  extraTypesPackPriceJod: number;
+} {
+  const id = (plan?.id || "").trim().toLowerCase();
+  const fallback =
+    DEFAULT_PLANS.find((p) => p.id === id) ||
+    (id === "trial"
+      ? {
+          maxCustomTypes: TRIAL_MAX_CUSTOM_TYPES,
+          maxCustomFieldsPerType: TRIAL_MAX_CUSTOM_FIELDS_PER_TYPE,
+          allowExtraTypesAddon: false,
+          extraTypesPackSize: 0,
+          extraTypesPackPriceJod: 0,
+        }
+      : {
+          maxCustomTypes: plan?.allowCustomTypes === false ? 0 : 2,
+          maxCustomFieldsPerType: 5,
+          allowExtraTypesAddon: false,
+          extraTypesPackSize: DEFAULT_EXTRA_TYPES_PACK_SIZE,
+          extraTypesPackPriceJod: DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
+        });
+
+  const maxCustomTypes =
+    typeof plan?.maxCustomTypes === "number" && Number.isFinite(plan.maxCustomTypes)
+      ? Math.round(plan.maxCustomTypes)
+      : fallback.maxCustomTypes ?? 0;
+
+  const maxCustomFieldsPerType =
+    typeof plan?.maxCustomFieldsPerType === "number" && Number.isFinite(plan.maxCustomFieldsPerType)
+      ? Math.round(plan.maxCustomFieldsPerType)
+      : fallback.maxCustomFieldsPerType ?? 2;
+
+  const allowExtraTypesAddon =
+    typeof plan?.allowExtraTypesAddon === "boolean"
+      ? plan.allowExtraTypesAddon
+      : Boolean(fallback.allowExtraTypesAddon);
+
+  const extraTypesPackSize =
+    typeof plan?.extraTypesPackSize === "number" && plan.extraTypesPackSize > 0
+      ? Math.round(plan.extraTypesPackSize)
+      : fallback.extraTypesPackSize || DEFAULT_EXTRA_TYPES_PACK_SIZE;
+
+  const extraTypesPackPriceJod =
+    typeof plan?.extraTypesPackPriceJod === "number" && plan.extraTypesPackPriceJod >= 0
+      ? plan.extraTypesPackPriceJod
+      : fallback.extraTypesPackPriceJod ?? DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD;
+
+  return {
+    maxCustomTypes,
+    maxCustomFieldsPerType,
+    allowExtraTypesAddon,
+    extraTypesPackSize,
+    extraTypesPackPriceJod,
+  };
+}
+
+/** حساب صلاحيات الأنواع المخصصة والعلاقات الجديدة للورشة الحالية */
+export function resolvePlanLimits(
+  tenant: TenantAccount | null,
+  plan: SubscriptionPlan | null,
+  isAdmin: boolean
+): ResolvedPlanLimits {
+  if (isAdmin || tenant?.role === "admin") {
+    return {
+      baseMaxCustomTypes: -1,
+      extraTypesQuota: 0,
+      maxCustomTypes: -1,
+      maxCustomFieldsPerType: -1,
+      allowReorder: true,
+      canRequestExtraTypesAddon: false,
+      extraTypesPackSize: DEFAULT_EXTRA_TYPES_PACK_SIZE,
+      extraTypesPackPriceJod: DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
+    };
+  }
+
+  if (!tenant || tenant.planId === "trial" || tenant.subscriptionStatus !== "active") {
+    return {
+      baseMaxCustomTypes: TRIAL_MAX_CUSTOM_TYPES,
+      extraTypesQuota: 0,
+      maxCustomTypes: TRIAL_MAX_CUSTOM_TYPES,
+      maxCustomFieldsPerType: TRIAL_MAX_CUSTOM_FIELDS_PER_TYPE,
+      allowReorder: true,
+      canRequestExtraTypesAddon: false,
+      extraTypesPackSize: DEFAULT_EXTRA_TYPES_PACK_SIZE,
+      extraTypesPackPriceJod: DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
+    };
+  }
+
+  const resolved = getPlanDefaultsById(plan || { id: tenant.planId });
+  const extraTypesQuota =
+    resolved.allowExtraTypesAddon && typeof tenant.extraCustomTypesQuota === "number" && tenant.extraCustomTypesQuota > 0
+      ? Math.round(tenant.extraCustomTypesQuota)
+      : 0;
+
+  const maxCustomTypes =
+    resolved.maxCustomTypes < 0 ? -1 : resolved.maxCustomTypes + extraTypesQuota;
+
+  return {
+    baseMaxCustomTypes: resolved.maxCustomTypes,
+    extraTypesQuota,
+    maxCustomTypes,
+    maxCustomFieldsPerType: resolved.maxCustomFieldsPerType,
+    allowReorder: true,
+    canRequestExtraTypesAddon: resolved.allowExtraTypesAddon,
+    extraTypesPackSize: resolved.extraTypesPackSize,
+    extraTypesPackPriceJod: resolved.extraTypesPackPriceJod,
+  };
+}
 
 export const BILLING_CYCLE_LABELS: Record<BillingCycle, { label: string; months: number; days: number }> = {
   monthly: { label: "شهري (30 يوم)", months: 1, days: 30 },

@@ -59,6 +59,7 @@ import {
   buildWhatsAppActivationUrl,
   evaluateTenantAccess,
   isOwnerAdminEmail,
+  resolvePlanLimits,
 } from "./saas/types";
 import type {
   ActivationRequestDoc,
@@ -653,13 +654,11 @@ export default function App() {
     return Boolean(activePlan?.allowExport);
   }, [isAdminUser, tenant, tenantAccess.state, activePlan]);
 
-  // الأنواع المخصصة حسب صلاحية الباقة
-  const canUseCustomTypes = useMemo(() => {
-    if (isAdminUser) return true;
-    if (!tenant) return false;
-    if (tenant.planId === "trial") return true;
-    return activePlan ? Boolean(activePlan.allowCustomTypes) : true;
-  }, [isAdminUser, tenant, activePlan]);
+  // حدود الأنواع المخصصة والعلاقات الجديدة لكل نوع حسب الباقة (تغيير الترتيب مسموح دائماً)
+  const planLimits = useMemo(
+    () => resolvePlanLimits(tenant, activePlan, isAdminUser),
+    [tenant, activePlan, isAdminUser]
+  );
 
   // مزامنة توقيت الخادم الموثوق عند التشغيل وتحديث المؤقت كل دقيقة لإقفال التجربة المنتهية تلقائياً
   useEffect(() => {
@@ -1905,6 +1904,18 @@ export default function App() {
   };
 
   const addCustomField = (group = "") => {
+    const existingForType = (state.custom[state.type] || []).length;
+    if (
+      planLimits.maxCustomFieldsPerType >= 0 &&
+      existingForType >= planLimits.maxCustomFieldsPerType
+    ) {
+      toast(
+        `وصلت للحد الأقصى لإضافة العلاقات الجديدة لهذا النوع في باقتك (${planLimits.maxCustomFieldsPerType} علاقات لكل نوع). يمكنك تعديل الترتيب بحرية أو ترقية الباقة لإضافة المزيد.`,
+        4800
+      );
+      setSubModalOpen(true);
+      return;
+    }
     let createdId = "";
     setState((prev) => {
       const cn = (prev.cn || 0) + 1;
@@ -2564,8 +2575,26 @@ export default function App() {
 
   // ---------- Step 1 Type Actions ----------
   const handleCreateType = () => {
-    if (!canUseCustomTypes) {
-      toast("باقتك الحالية لا تسمح بإضافة أنواع شبابيك مخصصة. قم بترقية الباقة.", 4000);
+    if (planLimits.maxCustomTypes === 0) {
+      toast(
+        "باقتك الحالية لا تسمح بإضافة أنواع شبابيك جديدة (الأنواع الأساسية الأربعة فقط). قم بترقية الباقة.",
+        4500
+      );
+      setSubModalOpen(true);
+      return;
+    }
+    if (planLimits.maxCustomTypes > 0 && state.utypes.length >= planLimits.maxCustomTypes) {
+      if (planLimits.canRequestExtraTypesAddon) {
+        toast(
+          `وصلت للحد المسموح من الأنواع المخصصة (${planLimits.maxCustomTypes}). يمكنك طلب حزمة +${planLimits.extraTypesPackSize} أنواع إضافية مقابل ${planLimits.extraTypesPackPriceJod} دنانير تُدفع مرة واحدة مع اشتراكك الحالي.`,
+          5200
+        );
+      } else {
+        toast(
+          `وصلت للحد الأقصى للأنواع المخصصة في باقتك (${planLimits.maxCustomTypes} أنواع). قم بترقية الباقة إلى باقة الورش والمصانع لإضافة حتى 5 أنواع.`,
+          4800
+        );
+      }
       setSubModalOpen(true);
       return;
     }
@@ -3163,6 +3192,27 @@ export default function App() {
         onConfirm: () => {
           try {
             const restored = hydrateState(dataObj);
+            if (planLimits.maxCustomTypes >= 0 && restored.utypes.length > planLimits.maxCustomTypes) {
+              toast(
+                `النسخة تحتوي على ${restored.utypes.length} أنواع مخصصة، بينما حد باقتك الحالية هو ${planLimits.maxCustomTypes}. قم بترقية الباقة أولاً.`,
+                4800
+              );
+              setSubModalOpen(true);
+              return;
+            }
+            if (planLimits.maxCustomFieldsPerType >= 0) {
+              const overType = Object.entries(restored.custom || {}).find(
+                ([, list]) => Array.isArray(list) && list.length > planLimits.maxCustomFieldsPerType
+              );
+              if (overType) {
+                toast(
+                  `النسخة تحتوي على أكثر من ${planLimits.maxCustomFieldsPerType} علاقات جديدة لنوع «${overType[0]}» وهو ما يتجاوز حد باقتك الحالية.`,
+                  4800
+                );
+                setSubModalOpen(true);
+                return;
+              }
+            }
             restored.layout = syncLayoutWithCustom(restored);
             restored.rows = withTrailingEmpty(restored.rows);
             setDeletedUndo(null);
@@ -4429,6 +4479,11 @@ export default function App() {
                             onClick={() => addCustomField("")}
                           >
                             ＋ إضافة خانة
+                            {planLimits.maxCustomFieldsPerType >= 0 && (
+                              <span className="saas-quota-pill">
+                                {(state.custom[n] || []).length}/{planLimits.maxCustomFieldsPerType}
+                              </span>
+                            )}
                           </button>
                           {isUser && (
                             <button
@@ -4500,12 +4555,45 @@ export default function App() {
                   type="button"
                   className="addnew"
                   onClick={() => {
+                    if (planLimits.maxCustomTypes === 0) {
+                      toast(
+                        "باقتك الحالية لا تسمح بإضافة أنواع شبابيك جديدة (الأنواع الأساسية الأربعة فقط). قم بترقية الباقة.",
+                        4500
+                      );
+                      setSubModalOpen(true);
+                      return;
+                    }
+                    if (
+                      planLimits.maxCustomTypes > 0 &&
+                      state.utypes.length >= planLimits.maxCustomTypes
+                    ) {
+                      if (planLimits.canRequestExtraTypesAddon) {
+                        toast(
+                          `وصلت للحد المسموح (${planLimits.maxCustomTypes} أنواع). اطلب حزمة +${planLimits.extraTypesPackSize} أنواع إضافية مقابل ${planLimits.extraTypesPackPriceJod} دنانير تُدفع مرة واحدة مع اشتراكك الحالي.`,
+                          5200
+                        );
+                      } else {
+                        toast(
+                          `وصلت للحد الأقصى للأنواع الجديدة في باقتك (${planLimits.maxCustomTypes}). قم بترقية الباقة لإضافة المزيد.`,
+                          4600
+                        );
+                      }
+                      setSubModalOpen(true);
+                      return;
+                    }
                     setNtForm(true);
                     setRelFor(null);
                   }}
                 >
                   <Plus className="ico-sm" aria-hidden="true" />
-                  إضافة نوع جديد
+                  <span>إضافة نوع جديد</span>
+                  {planLimits.maxCustomTypes === 0 ? (
+                    <span className="saas-quota-pill">يتطلب ترقية</span>
+                  ) : planLimits.maxCustomTypes > 0 ? (
+                    <span className="saas-quota-pill">
+                      {state.utypes.length}/{planLimits.maxCustomTypes}
+                    </span>
+                  ) : null}
                 </button>
               )
             )}
@@ -5492,6 +5580,11 @@ export default function App() {
 
               <button type="button" className="addnew advonly" onClick={() => addCustomField("")}>
                 ＋ إضافة خانة جديدة
+                {planLimits.maxCustomFieldsPerType >= 0 && (
+                  <span className="saas-quota-pill">
+                    {(state.custom[state.type] || []).length}/{planLimits.maxCustomFieldsPerType}
+                  </span>
+                )}
               </button>
             </div>
           </section>

@@ -99,16 +99,47 @@ service cloud.firestore {
         );
     }
 
-    // Server-side plan limit enforcement for allowCustomTypes
+    function tenantExtraTypesQuota(tenantData) {
+      return ('extraCustomTypesQuota' in tenantData &&
+        tenantData.extraCustomTypesQuota is int &&
+        tenantData.extraCustomTypesQuota > 0)
+        ? tenantData.extraCustomTypesQuota
+        : 0;
+    }
+
+    function planBaseMaxCustomTypes(planData) {
+      return ('maxCustomTypes' in planData && planData.maxCustomTypes is int)
+        ? planData.maxCustomTypes
+        : (planData.id == 'starter' ? 0 : (planData.id == 'pro' ? 2 : (planData.id == 'business' ? 5 : (planData.allowCustomTypes == true ? 2 : 0))));
+    }
+
+    function planAllowsExtraTypesAddon(planData) {
+      return ('allowExtraTypesAddon' in planData && planData.allowExtraTypesAddon is bool)
+        ? planData.allowExtraTypesAddon
+        : (planData.id == 'business');
+    }
+
+    // Server-side plan limit enforcement for maxCustomTypes (+ paid extraCustomTypesQuota on last plan only)
     function planAllowsCustomTypes(tenantData, projectData) {
       return tenantData.role == 'admin' ||
-        tenantData.planId == 'trial' ||
         !('utypes' in projectData.snapshot) ||
         !(projectData.snapshot.utypes is list) ||
         projectData.snapshot.utypes.size() == 0 ||
         (
+          tenantData.subscriptionStatus == 'active' &&
+          tenantData.planId != 'trial' &&
           exists(/databases/$(database)/documents/plans/$(tenantData.planId)) &&
-          get(/databases/$(database)/documents/plans/$(tenantData.planId)).data.allowCustomTypes == true
+          (
+            planBaseMaxCustomTypes(get(/databases/$(database)/documents/plans/$(tenantData.planId)).data) == -1 ||
+            projectData.snapshot.utypes.size() <= (
+              planBaseMaxCustomTypes(get(/databases/$(database)/documents/plans/$(tenantData.planId)).data) +
+              (
+                planAllowsExtraTypesAddon(get(/databases/$(database)/documents/plans/$(tenantData.planId)).data)
+                  ? tenantExtraTypesQuota(tenantData)
+                  : 0
+              )
+            )
+          )
         );
     }
 
@@ -162,7 +193,9 @@ service cloud.firestore {
         ]) &&
         data.keys().hasOnly([
           'id', 'name', 'priceLabel', 'priceMonthlyJod', 'maxProjects',
-          'allowExport', 'allowCustomTypes', 'active', 'sortOrder', 'features', 'updatedAt'
+          'allowExport', 'allowCustomTypes', 'maxCustomTypes', 'maxCustomFieldsPerType',
+          'allowExtraTypesAddon', 'extraTypesPackSize', 'extraTypesPackPriceJod',
+          'active', 'sortOrder', 'features', 'updatedAt'
         ]) &&
         isValidId(data.id) &&
         data.id.size() <= 40 &&
@@ -173,6 +206,11 @@ service cloud.firestore {
         data.maxProjects is int && data.maxProjects >= -1 && data.maxProjects <= 100000 &&
         data.allowExport is bool &&
         data.allowCustomTypes is bool &&
+        (!('maxCustomTypes' in data) || (data.maxCustomTypes is int && data.maxCustomTypes >= -1 && data.maxCustomTypes <= 500)) &&
+        (!('maxCustomFieldsPerType' in data) || (data.maxCustomFieldsPerType is int && data.maxCustomFieldsPerType >= -1 && data.maxCustomFieldsPerType <= 500)) &&
+        (!('allowExtraTypesAddon' in data) || data.allowExtraTypesAddon is bool) &&
+        (!('extraTypesPackSize' in data) || (data.extraTypesPackSize is int && data.extraTypesPackSize >= 0 && data.extraTypesPackSize <= 50)) &&
+        (!('extraTypesPackPriceJod' in data) || ((data.extraTypesPackPriceJod is int || data.extraTypesPackPriceJod is float) && data.extraTypesPackPriceJod >= 0 && data.extraTypesPackPriceJod <= 10000)) &&
         data.active is bool &&
         data.sortOrder is int && data.sortOrder >= 0 && data.sortOrder <= 100 &&
         data.features is list && data.features.size() <= 12 &&
@@ -190,7 +228,7 @@ service cloud.firestore {
           'ownerUid', 'email', 'displayName', 'workshopName', 'phone',
           'role', 'subscriptionStatus', 'planId', 'trialDays',
           'activeUntil', 'adminNote', 'projectCount', 'lastProjectActionId',
-          'createdAt', 'updatedAt'
+          'extraCustomTypesQuota', 'createdAt', 'updatedAt'
         ]) &&
         isValidId(data.ownerUid) &&
         data.ownerUid == expectedUid &&
@@ -206,6 +244,7 @@ service cloud.firestore {
         isValidString(data.adminNote, 0, 500) &&
         (!('projectCount' in data) || (data.projectCount is int && data.projectCount >= 0 && data.projectCount <= 100000)) &&
         (!('lastProjectActionId' in data) || isValidString(data.lastProjectActionId, 0, 128)) &&
+        (!('extraCustomTypesQuota' in data) || (data.extraCustomTypesQuota is int && data.extraCustomTypesQuota >= 0 && data.extraCustomTypesQuota <= 200)) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -239,6 +278,7 @@ service cloud.firestore {
         data.keys().hasOnly([
           'tenantId', 'ownerUid', 'email', 'workshopName', 'phone',
           'planId', 'billingCycle', 'cliqNote', 'status', 'reviewedBy',
+          'requestType', 'extraTypesCount', 'addonPriceJod',
           'createdAt', 'updatedAt'
         ]) &&
         isValidId(data.tenantId) &&
@@ -252,6 +292,9 @@ service cloud.firestore {
         isValidString(data.cliqNote, 0, 300) &&
         data.status in ['pending', 'approved', 'rejected'] &&
         isValidString(data.reviewedBy, 0, 128) &&
+        (!('requestType' in data) || data.requestType in ['subscription', 'extra_types_addon']) &&
+        (!('extraTypesCount' in data) || (data.extraTypesCount is int && data.extraTypesCount >= 0 && data.extraTypesCount <= 50)) &&
+        (!('addonPriceJod' in data) || ((data.addonPriceJod is int || data.addonPriceJod is float) && data.addonPriceJod >= 0 && data.addonPriceJod <= 10000)) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -375,7 +418,9 @@ service cloud.firestore {
         incoming().updatedAt == request.time &&
         incoming().diff(existing()).affectedKeys().hasOnly([
           'name', 'priceLabel', 'priceMonthlyJod', 'maxProjects',
-          'allowExport', 'allowCustomTypes', 'active', 'sortOrder', 'features', 'updatedAt'
+          'allowExport', 'allowCustomTypes', 'maxCustomTypes', 'maxCustomFieldsPerType',
+          'allowExtraTypesAddon', 'extraTypesPackSize', 'extraTypesPackPriceJod',
+          'active', 'sortOrder', 'features', 'updatedAt'
         ]) &&
         isAdmin();
       allow delete: if isOwnerAdmin() && isValidId(planId);
@@ -393,6 +438,7 @@ service cloud.firestore {
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
         tenantProjectCount(incoming()) == 0 &&
+        tenantExtraTypesQuota(incoming()) == 0 &&
         (
           (
             isAdmin() &&
@@ -426,7 +472,7 @@ service cloud.firestore {
             incoming().diff(existing()).affectedKeys().hasOnly([
               'workshopName', 'phone', 'displayName', 'subscriptionStatus',
               'planId', 'trialDays', 'activeUntil', 'adminNote', 'role',
-              'projectCount', 'lastProjectActionId', 'updatedAt'
+              'projectCount', 'lastProjectActionId', 'extraCustomTypesQuota', 'updatedAt'
             ])
           ) ||
           (
@@ -584,7 +630,8 @@ service cloud.firestore {
         resource.data.ownerUid == request.auth.uid || isOwnerAdmin()
       );
 
-      // Allowed even when trial/subscription is expired so locked users can submit CliQ payment requests!
+      // Allowed even when trial/subscription is expired for regular subscription requests.
+      // Extra-types add-on requests are strictly restricted to active tenants on the last plan!
       allow create: if isVerified() && isValidId(requestId) &&
         isValidActivationRequest(incoming()) &&
         incoming().ownerUid == request.auth.uid &&
@@ -594,7 +641,17 @@ service cloud.firestore {
         incoming().reviewedBy == '' &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
-        exists(/databases/$(database)/documents/tenants/$(request.auth.uid));
+        exists(/databases/$(database)/documents/tenants/$(request.auth.uid)) &&
+        (
+          !('requestType' in incoming()) ||
+          incoming().requestType == 'subscription' ||
+          (
+            incoming().requestType == 'extra_types_addon' &&
+            get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.subscriptionStatus == 'active' &&
+            exists(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)) &&
+            planAllowsExtraTypesAddon(get(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)).data)
+          )
+        );
 
       // Terminal State Locking: Admin can ONLY approve/reject a 'pending' request (prevents double-approval!)
       allow update: if isVerified() && isValidId(requestId) &&

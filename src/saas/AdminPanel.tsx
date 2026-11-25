@@ -26,11 +26,14 @@ import firebaseConfig from "../../firebase-applet-config.json";
 import {
   APPS_SCRIPT_EMAIL_TEMPLATE,
   BILLING_CYCLE_LABELS,
+  DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
+  DEFAULT_EXTRA_TYPES_PACK_SIZE,
   DEFAULT_PRIVATE_NOTIFICATION_CONFIG,
   DEFAULT_WHATSAPP_PHONE,
   OWNER_ADMIN_EMAIL,
   buildExpiryReminderEmailContent,
   evaluateTenantAccess,
+  getPlanDefaultsById,
   isOwnerAdminEmail,
   normalizeJordanWhatsApp,
   tsToMs,
@@ -52,6 +55,7 @@ import {
   adminCreateWorkshopAccount,
   adminDispatchExpiryEmail,
   adminExtendTrial,
+  adminGrantExtraTypesQuota,
   adminReactivateTenant,
   adminRemoveAdditionalAdmin,
   adminReviewActivationRequest,
@@ -291,12 +295,31 @@ export function AdminPanel({
     }
   };
 
+  const handleGrantExtraTypes = async (t: TenantAccount, delta: number) => {
+    setBusyId(t.ownerUid);
+    try {
+      await adminGrantExtraTypesQuota(adminUser, t, delta);
+      onToast(`تمت إضافة +${delta} أنواع مخصصة للورشة ${t.workshopName || t.email} ✓`);
+    } catch {
+      onToast("تعذر إضافة حصة الأنواع المخصصة");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const handleReviewReq = async (req: ActivationRequestDoc, decision: "approved" | "rejected") => {
     setBusyId(req.id);
     try {
       const duration = BILLING_CYCLE_LABELS[req.billingCycle]?.days || 30;
       await adminReviewActivationRequest(adminUser, req, decision, duration, serverNowMs);
-      onToast(decision === "approved" ? "تم تأكيد الدفع وتفعيل الاشتراك فوراً ✓" : "تم رفض الطلب");
+      const isAddon = req.requestType === "extra_types_addon";
+      onToast(
+        decision === "approved"
+          ? isAddon
+            ? `تم تأكيد الدفع وإضافة +${req.extraTypesCount || DEFAULT_EXTRA_TYPES_PACK_SIZE} أنواع مخصصة فوراً ✓`
+            : "تم تأكيد الدفع وتفعيل الاشتراك فوراً ✓"
+          : "تم رفض الطلب"
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : "";
       onToast(msg || "تعذر تنفيذ العملية على الطلب", 3800);
@@ -465,6 +488,8 @@ export function AdminPanel({
   const actionLabelAr = (action: string): string => {
     const map: Record<string, string> = {
       approve_payment_request: "تأكيد دفع كليك وتفعيل اشتراك",
+      approve_extra_types_addon: "تأكيد دفع حزمة أنواع مخصصة إضافية",
+      grant_extra_types: "منح حصة أنواع مخصصة إضافية",
       reject_payment_request: "رفض طلب دفع",
       activate_subscription: "تفعيل/تعديل اشتراك",
       extend_trial: "تمديد فترة التجربة",
@@ -490,43 +515,15 @@ export function AdminPanel({
             <Shield className="ico" aria-hidden="true" />
             <div>
               <h2>لوحة إدارة المنصة ({isPrimaryOwner ? "المالك الأساسي" : "مدير"})</h2>
-              <p>تحكم آمن ومؤرّخ باشتراكات الورش، طلبات كليك، الباقات، وسجل التدقيق</p>
+              <p>تحكم آمن باشتراكات الورش، طلبات كليك، الباقات، وسجل التدقيق</p>
             </div>
           </div>
-          <button type="button" className="thm" aria-label="إغلاق" onClick={onClose}>
+          <button type="button" className="saas-close-btn" aria-label="إغلاق" onClick={onClose}>
             <X className="ico-sm" aria-hidden="true" />
           </button>
         </div>
 
-        {/* مؤشرات سريعة */}
-        <div className="saas-kpi-grid">
-          <div className="saas-kpi">
-            <small>إجمالي الورش</small>
-            <b>{stats.total}</b>
-          </div>
-          <div className="saas-kpi ok">
-            <small>مشتركون فعّالون</small>
-            <b>{stats.active}</b>
-          </div>
-          <div className="saas-kpi warn">
-            <small>في التجربة</small>
-            <b>{stats.trialing}</b>
-          </div>
-          <div className="saas-kpi bad">
-            <small>حسابات مقفلة</small>
-            <b>{stats.locked}</b>
-          </div>
-          <div className="saas-kpi pri">
-            <small>طلبات كليك معلقة</small>
-            <b>{stats.pendingReqs}</b>
-          </div>
-          <div className="saas-kpi warn">
-            <small>قارب الانتهاء (&lt; يومين)</small>
-            <b>{stats.expiringSoon}</b>
-          </div>
-        </div>
-
-        {/* التبويبات */}
+        {/* التبويبات (ثابتة وملتفّة بشكل واضح دون قصّ نص) */}
         <div className="saas-admin-tabs">
           <button type="button" className={tab === "tenants" ? "on" : ""} onClick={() => setTab("tenants")}>
             <Users className="ico-xs" aria-hidden="true" />
@@ -542,7 +539,7 @@ export function AdminPanel({
           </button>
           <button type="button" className={tab === "settings" ? "on" : ""} onClick={() => setTab("settings")}>
             <Settings className="ico-xs" aria-hidden="true" />
-            <span>الباقات والإعدادات والمدراء</span>
+            <span>الباقات والإعدادات</span>
           </button>
           <button type="button" className={tab === "audit" ? "on" : ""} onClick={() => setTab("audit")}>
             <ClipboardList className="ico-xs" aria-hidden="true" />
@@ -551,6 +548,36 @@ export function AdminPanel({
         </div>
 
         <div className="saas-admin-body">
+          {/* مؤشرات سريعة داخل منطقة التمرير حتى لا تضغط الشاشة على الهاتف */}
+          {tab === "tenants" && (
+            <div className="saas-kpi-grid">
+              <div className="saas-kpi">
+                <small>إجمالي الورش</small>
+                <b>{stats.total}</b>
+              </div>
+              <div className="saas-kpi ok">
+                <small>فعّالون</small>
+                <b>{stats.active}</b>
+              </div>
+              <div className="saas-kpi warn">
+                <small>تجربة</small>
+                <b>{stats.trialing}</b>
+              </div>
+              <div className="saas-kpi bad">
+                <small>مقفلة</small>
+                <b>{stats.locked}</b>
+              </div>
+              <div className="saas-kpi pri">
+                <small>طلبات كليك</small>
+                <b>{stats.pendingReqs}</b>
+              </div>
+              <div className="saas-kpi warn">
+                <small>&lt; يومين</small>
+                <b>{stats.expiringSoon}</b>
+              </div>
+            </div>
+          )}
+
           {/* 1. الورش والاشتراكات */}
           {tab === "tenants" && (
             <>
@@ -722,6 +749,9 @@ export function AdminPanel({
                       <div className="saas-tenant-meta">
                         <span>الباقة: <b>{plans.find((p) => p.id === t.planId)?.name || t.planId}</b></span>
                         <span>المشاريع: <b>{t.projectCount ?? 0}</b></span>
+                        {(t.extraCustomTypesQuota || 0) > 0 && (
+                          <span>أنواع إضافية: <b>+{t.extraCustomTypesQuota}</b></span>
+                        )}
                         <span>التسجيل: <b>{fmtDate(tsToMs(t.createdAt))}</b></span>
                         {ev.activeUntilMs && <span>ينتهي: <b>{fmtDate(ev.activeUntilMs)}</b></span>}
                         {ev.trialEndsAtMs && <span>نهاية التجربة: <b>{fmtDate(ev.trialEndsAtMs)}</b></span>}
@@ -773,6 +803,28 @@ export function AdminPanel({
                           >
                             +7 أيام تجربة
                           </button>
+                          {ev.state === "active" &&
+                            getPlanDefaultsById(plans.find((p) => p.id === t.planId) || { id: t.planId })
+                              .allowExtraTypesAddon && (
+                              <button
+                                type="button"
+                                className="btn sm p"
+                                disabled={isBusy}
+                                onClick={() =>
+                                  void handleGrantExtraTypes(
+                                    t,
+                                    getPlanDefaultsById(plans.find((p) => p.id === t.planId) || { id: t.planId })
+                                      .extraTypesPackSize
+                                  )
+                                }
+                              >
+                                +{
+                                  getPlanDefaultsById(plans.find((p) => p.id === t.planId) || { id: t.planId })
+                                    .extraTypesPackSize
+                                }{" "}
+                                أنواع إضافية
+                              </button>
+                            )}
                           <button
                             type="button"
                             className="btn sm"
@@ -866,8 +918,22 @@ export function AdminPanel({
                     </div>
 
                     <div className="saas-tenant-meta">
-                      <span>الباقة: <b>{planName}</b></span>
-                      <span>المدة: <b>{BILLING_CYCLE_LABELS[req.billingCycle]?.label || req.billingCycle}</b></span>
+                      {req.requestType === "extra_types_addon" ? (
+                        <>
+                          <span>
+                            نوع الطلب: <b>حزمة أنواع إضافية (+{req.extraTypesCount || DEFAULT_EXTRA_TYPES_PACK_SIZE} أنواع)</b>
+                          </span>
+                          <span>
+                            المبلغ (مرة واحدة): <b>{req.addonPriceJod ?? DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD} دنانير</b>
+                          </span>
+                          <span>الباقة: <b>{planName}</b></span>
+                        </>
+                      ) : (
+                        <>
+                          <span>الباقة: <b>{planName}</b></span>
+                          <span>المدة: <b>{BILLING_CYCLE_LABELS[req.billingCycle]?.label || req.billingCycle}</b></span>
+                        </>
+                      )}
                       <span>التاريخ: <b>{fmtDate(tsToMs(req.createdAt))}</b></span>
                     </div>
 
@@ -887,7 +953,11 @@ export function AdminPanel({
                             onClick={() => void handleReviewReq(req, "approved")}
                           >
                             <CheckCircle2 className="ico-xs" aria-hidden="true" />
-                            <span>تأكيد الدفع وتفعيل الاشتراك فوراً</span>
+                            <span>
+                              {req.requestType === "extra_types_addon"
+                                ? `تأكيد الدفع وإضافة +${req.extraTypesCount || DEFAULT_EXTRA_TYPES_PACK_SIZE} أنواع فوراً`
+                                : "تأكيد الدفع وتفعيل الاشتراك فوراً"}
+                            </span>
                           </button>
                           <button
                             type="button"
@@ -1271,53 +1341,125 @@ export function AdminPanel({
                         />
                       </label>
                     </div>
-                    <div className="saas-plan-checks">
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={pl.allowExport}
-                          onChange={(e) => {
-                            const next = plansDraft.slice();
-                            next[idx] = { ...pl, allowExport: e.target.checked };
-                            setPlansDraft(next);
-                          }}
-                        />
-                        <span>السماح بتنزيل PDF/Excel</span>
-                      </label>
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={pl.allowCustomTypes}
-                          onChange={(e) => {
-                            const next = plansDraft.slice();
-                            next[idx] = { ...pl, allowCustomTypes: e.target.checked };
-                            setPlansDraft(next);
-                          }}
-                        />
-                        <span>السماح بالأنواع المخصصة</span>
-                      </label>
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={pl.active}
-                          onChange={(e) => {
-                            const next = plansDraft.slice();
-                            next[idx] = { ...pl, active: e.target.checked };
-                            setPlansDraft(next);
-                          }}
-                        />
-                        <span>الباقة مفعّلة</span>
-                      </label>
-                      <button
-                        type="button"
-                        className="btn sm g"
-                        disabled={busyId === `plan_${pl.id}`}
-                        onClick={() => void handleSavePlanItem(pl)}
-                      >
-                        <Save className="ico-xs" aria-hidden="true" />
-                        <span>حفظ الباقة</span>
-                      </button>
-                    </div>
+                    {(() => {
+                      const def = getPlanDefaultsById(pl);
+                      return (
+                        <>
+                          <div className="saas-form-row">
+                            <label>
+                              <span>حد الأنواع الجديدة (0 ممنوع، -1 مفتوح)</span>
+                              <input
+                                type="number"
+                                dir="ltr"
+                                value={pl.maxCustomTypes ?? def.maxCustomTypes}
+                                onChange={(e) => {
+                                  const val = Number(e.target.value);
+                                  const next = plansDraft.slice();
+                                  next[idx] = {
+                                    ...pl,
+                                    maxCustomTypes: val,
+                                    allowCustomTypes: val !== 0,
+                                  };
+                                  setPlansDraft(next);
+                                }}
+                              />
+                            </label>
+                            <label>
+                              <span>حد العلاقات الجديدة لكل نوع (-1 مفتوح)</span>
+                              <input
+                                type="number"
+                                dir="ltr"
+                                value={pl.maxCustomFieldsPerType ?? def.maxCustomFieldsPerType}
+                                onChange={(e) => {
+                                  const next = plansDraft.slice();
+                                  next[idx] = { ...pl, maxCustomFieldsPerType: Number(e.target.value) };
+                                  setPlansDraft(next);
+                                }}
+                              />
+                            </label>
+                          </div>
+
+                          {(pl.allowExtraTypesAddon ?? def.allowExtraTypesAddon) && (
+                            <div className="saas-form-row">
+                              <label>
+                                <span>عدد الأنواع في الحزمة الإضافية</span>
+                                <input
+                                  type="number"
+                                  dir="ltr"
+                                  value={pl.extraTypesPackSize ?? def.extraTypesPackSize}
+                                  onChange={(e) => {
+                                    const next = plansDraft.slice();
+                                    next[idx] = { ...pl, extraTypesPackSize: Number(e.target.value) || 5 };
+                                    setPlansDraft(next);
+                                  }}
+                                />
+                              </label>
+                              <label>
+                                <span>سعر الحزمة (دينار / مرة واحدة مع الاشتراك)</span>
+                                <input
+                                  type="number"
+                                  dir="ltr"
+                                  value={pl.extraTypesPackPriceJod ?? def.extraTypesPackPriceJod}
+                                  onChange={(e) => {
+                                    const next = plansDraft.slice();
+                                    next[idx] = { ...pl, extraTypesPackPriceJod: Number(e.target.value) || 0 };
+                                    setPlansDraft(next);
+                                  }}
+                                />
+                              </label>
+                            </div>
+                          )}
+
+                          <div className="saas-plan-checks">
+                            <label>
+                              <input
+                                type="checkbox"
+                                checked={pl.allowExport}
+                                onChange={(e) => {
+                                  const next = plansDraft.slice();
+                                  next[idx] = { ...pl, allowExport: e.target.checked };
+                                  setPlansDraft(next);
+                                }}
+                              />
+                              <span>السماح بتنزيل PDF/Excel</span>
+                            </label>
+                            <label>
+                              <input
+                                type="checkbox"
+                                checked={pl.allowExtraTypesAddon ?? def.allowExtraTypesAddon}
+                                onChange={(e) => {
+                                  const next = plansDraft.slice();
+                                  next[idx] = { ...pl, allowExtraTypesAddon: e.target.checked };
+                                  setPlansDraft(next);
+                                }}
+                              />
+                              <span>تفعيل حزم الأنواع الإضافية المدفوعة (لآخر باقة)</span>
+                            </label>
+                            <label>
+                              <input
+                                type="checkbox"
+                                checked={pl.active}
+                                onChange={(e) => {
+                                  const next = plansDraft.slice();
+                                  next[idx] = { ...pl, active: e.target.checked };
+                                  setPlansDraft(next);
+                                }}
+                              />
+                              <span>الباقة مفعّلة</span>
+                            </label>
+                            <button
+                              type="button"
+                              className="btn sm g"
+                              disabled={busyId === `plan_${pl.id}`}
+                              onClick={() => void handleSavePlanItem(pl)}
+                            >
+                              <Save className="ico-xs" aria-hidden="true" />
+                              <span>حفظ الباقة</span>
+                            </button>
+                          </div>
+                        </>
+                      );
+                    })()}
                   </div>
                 ))}
               </div>
@@ -1375,7 +1517,7 @@ export function AdminPanel({
                 </div>
                 <button
                   type="button"
-                  className="thm"
+                  className="saas-close-btn"
                   aria-label="إغلاق"
                   onClick={() => setResetTarget(null)}
                 >

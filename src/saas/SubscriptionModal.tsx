@@ -19,6 +19,8 @@ import {
   DEFAULT_WHATSAPP_PHONE,
   buildActivationMessage,
   buildWhatsAppActivationUrl,
+  getPlanDefaultsById,
+  resolvePlanLimits,
 } from "./types";
 import type {
   ActivationRequestDoc,
@@ -73,7 +75,9 @@ export function SubscriptionModal({
   const [workshopName, setWorkshopName] = useState<string>(tenant.workshopName || tenant.displayName || "");
   const [phone, setPhone] = useState<string>(tenant.phone || "");
   const [cliqNote, setCliqNote] = useState<string>("");
+  const [addonNote, setAddonNote] = useState<string>("");
   const [submitting, setSubmitting] = useState(false);
+  const [submittingAddon, setSubmittingAddon] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
   const [curPass, setCurPass] = useState("");
   const [newPass, setNewPass] = useState("");
@@ -86,6 +90,12 @@ export function SubscriptionModal({
       passwordLinkedNow ||
       Boolean(user.providerData?.some((p) => p.providerId === "password")),
     [user.providerData, passwordLinkedNow]
+  );
+
+  const currentPlanObj = activePlans.find((p) => p.id === tenant.planId) || null;
+  const currentLimits = useMemo(
+    () => resolvePlanLimits(tenant, currentPlanObj, access.state === "owner_free"),
+    [tenant, currentPlanObj, access.state]
   );
 
   const selectedPlan = activePlans.find((p) => p.id === selectedPlanId) || activePlans[0];
@@ -110,7 +120,60 @@ export function SubscriptionModal({
     [waPhoneDisplay, waMessage]
   );
 
-  const latestPending = myRequests.find((r) => r.status === "pending");
+  const addonWaUrl = useMemo(() => {
+    const lines = [
+      "السلام عليكم، أرغب بطلب حزمة أنواع شبابيك إضافية (مرة واحدة مع الاشتراك الحالي):",
+      `• الورشة: ${workshopName.trim() || tenant.workshopName || "ورشتي"}`,
+      `• البريد: ${tenant.email}`,
+      phone.trim() ? `• الهاتف: ${phone.trim()}` : "",
+      `• الباقة الحالية: ${currentPlanObj?.name || tenant.planId}`,
+      `• الحزمة المطلوبة: +${currentLimits.extraTypesPackSize} أنواع إضافية (${currentLimits.extraTypesPackPriceJod} دنانير — مرة واحدة مع الاشتراك)`,
+      addonNote.trim() ? `• مرجع كليك: ${addonNote.trim()}` : "",
+    ].filter(Boolean);
+    return buildWhatsAppActivationUrl(waPhoneDisplay, lines.join("\n"));
+  }, [
+    workshopName,
+    tenant.workshopName,
+    tenant.email,
+    phone,
+    currentPlanObj?.name,
+    tenant.planId,
+    currentLimits.extraTypesPackSize,
+    currentLimits.extraTypesPackPriceJod,
+    addonNote,
+    waPhoneDisplay,
+  ]);
+
+  const latestPending = myRequests.find(
+    (r) => r.status === "pending" && r.requestType !== "extra_types_addon"
+  );
+  const latestPendingAddon = myRequests.find(
+    (r) => r.status === "pending" && r.requestType === "extra_types_addon"
+  );
+
+  const handleRequestExtraTypesAddon = async () => {
+    setSubmittingAddon(true);
+    try {
+      await submitActivationRequest(user, {
+        workshopName: workshopName.trim() || tenant.workshopName || "ورشتي",
+        phone: phone.trim(),
+        planId: tenant.planId,
+        billingCycle: "monthly",
+        cliqNote:
+          addonNote.trim() ||
+          `طلب حزمة +${currentLimits.extraTypesPackSize} أنواع إضافية (${currentLimits.extraTypesPackPriceJod} دنانير)`,
+        requestType: "extra_types_addon",
+        extraTypesCount: currentLimits.extraTypesPackSize,
+        addonPriceJod: currentLimits.extraTypesPackPriceJod,
+      });
+      setAddonNote("");
+      onToast("تم تسجيل طلب حزمة الأنواع الإضافية بنجاح! سيتم إضافتها لحسابك فور تأكيد حوالة كليك ✓", 4200);
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : "تعذر تسجيل طلب الحزمة الإضافية", 3800);
+    } finally {
+      setSubmittingAddon(false);
+    }
+  };
 
   const handleSaveProfile = async () => {
     setSavingProfile(true);
@@ -264,7 +327,7 @@ export function SubscriptionModal({
           </div>
         </div>
         {!locked && onClose && (
-          <button type="button" className="thm" aria-label="إغلاق" onClick={onClose}>
+          <button type="button" className="saas-close-btn" aria-label="إغلاق" onClick={onClose}>
             <X className="ico-sm" aria-hidden="true" />
           </button>
         )}
@@ -421,6 +484,68 @@ export function SubscriptionModal({
         </details>
       </div>
 
+      {/* حزمة الأنواع الإضافية — خاصة بباقة الورش والمصانع الفعالة فقط */}
+      {access.state === "active" && currentLimits.canRequestExtraTypesAddon && (
+        <div className="saas-section saas-addon-box">
+          <h3>حزمة أنواع شبابيك إضافية (خاصة بالباقة الأخيرة فقط)</h3>
+          <p className="saas-cliq-note" style={{ marginBottom: 8 }}>
+            حصتك الحالية في باقة <b>{currentPlanObj?.name || tenant.planId}</b>:{" "}
+            <b>{currentLimits.baseMaxCustomTypes}</b> أنواع أساسية
+            {currentLimits.extraTypesQuota > 0
+              ? ` + ${currentLimits.extraTypesQuota} أنواع إضافية = ${currentLimits.maxCustomTypes} أنواع`
+              : ""}.
+            {" "}إذا احتجت لأكثر من ذلك، يمكنك طلب حزمة{" "}
+            <b>+{currentLimits.extraTypesPackSize} أنواع إضافية</b> مقابل{" "}
+            <b>{currentLimits.extraTypesPackPriceJod} دنانير</b> تُدفع مرة واحدة مع اشتراكك الحالي عبر كليك (CliQ).
+          </p>
+
+          {latestPendingAddon && (
+            <div className="saas-pending-banner">
+              <Clock className="ico-sm" aria-hidden="true" />
+              <div>
+                <b>لديك طلب حزمة أنواع إضافية قيد المراجعة (+{latestPendingAddon.extraTypesCount || currentLimits.extraTypesPackSize} أنواع)</b>
+                <small>ستُضاف الحصة لحسابك فور تأكيد المدير لحوالة كليك دون انقطاع اشتراكك.</small>
+              </div>
+            </div>
+          )}
+
+          <label className="saas-note-input">
+            <span>مرجع حوالة كليك لحزمة الأنواع الإضافية (اختياري)</span>
+            <input
+              value={addonNote}
+              maxLength={300}
+              placeholder="مثال: حوالة كليك لحزمة الأنواع الإضافية"
+              onChange={(e) => setAddonNote(e.target.value)}
+            />
+          </label>
+
+          <div className="saas-action-stack">
+            <button
+              type="button"
+              className="btn p full"
+              disabled={submittingAddon}
+              onClick={() => void handleRequestExtraTypesAddon()}
+            >
+              <ShieldCheck className="ico-sm" aria-hidden="true" />
+              <span>
+                {submittingAddon
+                  ? "جارٍ تسجيل الطلب..."
+                  : `طلب +${currentLimits.extraTypesPackSize} أنواع إضافية (${currentLimits.extraTypesPackPriceJod} دنانير — مرة واحدة)`}
+              </span>
+            </button>
+            <a
+              href={addonWaUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn g full"
+            >
+              <MessageCircle className="ico-sm" aria-hidden="true" />
+              <span>إرسال طلب الحزمة عبر واتساب ({waPhoneDisplay})</span>
+            </a>
+          </div>
+        </div>
+      )}
+
       {/* اختيار الباقة والتفعيل عبر كليك وواتساب */}
       {access.state !== "owner_free" && (
         <>
@@ -429,6 +554,19 @@ export function SubscriptionModal({
             <div className="saas-plan-grid">
               {activePlans.map((pl) => {
                 const isSel = pl.id === selectedPlan?.id;
+                const plLim = getPlanDefaultsById(pl);
+                const typesLine =
+                  plLim.maxCustomTypes === 0
+                    ? "بدون إضافة أنواع جديدة (الأنواع الـ 4 الأساسية فقط)"
+                    : plLim.maxCustomTypes < 0
+                      ? "إضافة أنواع جديدة غير محدودة"
+                      : plLim.allowExtraTypesAddon
+                        ? `إضافة حتى ${plLim.maxCustomTypes} أنواع جديدة (+ حزم إضافية مقابل ${plLim.extraTypesPackPriceJod} دينار/اشتراك)`
+                        : `إضافة حتى ${plLim.maxCustomTypes} أنواع جديدة`;
+                const fieldsLine =
+                  plLim.maxCustomFieldsPerType < 0
+                    ? "إضافة علاقات جديدة غير محدودة لكل نوع"
+                    : `إضافة حتى ${plLim.maxCustomFieldsPerType} علاقات جديدة لكل نوع`;
                 return (
                   <button
                     key={pl.id}
@@ -441,12 +579,27 @@ export function SubscriptionModal({
                       <span className="saas-price-tag">{pl.priceLabel}</span>
                     </div>
                     <ul>
-                      {(pl.features || []).map((f, idx) => (
-                        <li key={idx}>
-                          <Check className="ico-xs" aria-hidden="true" />
-                          <span>{f}</span>
-                        </li>
-                      ))}
+                      <li>
+                        <Check className="ico-xs" aria-hidden="true" />
+                        <span>{typesLine}</span>
+                      </li>
+                      <li>
+                        <Check className="ico-xs" aria-hidden="true" />
+                        <span>{fieldsLine}</span>
+                      </li>
+                      <li>
+                        <Check className="ico-xs" aria-hidden="true" />
+                        <span>تغيير ترتيب جميع العلاقات مسموح بالكامل</span>
+                      </li>
+                      <li>
+                        <Check className="ico-xs" aria-hidden="true" />
+                        <span>
+                          {pl.maxProjects < 0
+                            ? "مشاريع سحابية غير محدودة"
+                            : `حتى ${pl.maxProjects} مشروعاً سحابياً`}{" "}
+                          · {pl.allowExport ? "تصدير PDF و Excel" : "بدون تصدير PDF/Excel"}
+                        </span>
+                      </li>
                     </ul>
                   </button>
                 );

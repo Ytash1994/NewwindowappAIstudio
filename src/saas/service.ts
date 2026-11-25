@@ -35,6 +35,8 @@ import { auth, db, googleProvider, handleFirestoreError, OperationType } from ".
 import type { AppState, SavedProject } from "../types";
 import {
   BLUEPRINT_LIMITS,
+  DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
+  DEFAULT_EXTRA_TYPES_PACK_SIZE,
   DEFAULT_PLANS,
   DEFAULT_PLATFORM_CONFIG,
   DEFAULT_PRIVATE_NOTIFICATION_CONFIG,
@@ -43,12 +45,15 @@ import {
   OWNER_ADMIN_EMAIL,
   TRIAL_MAX_PROJECTS,
   buildExpiryReminderEmailContent,
+  getPlanDefaultsById,
   isOwnerAdminEmail,
+  resolvePlanLimits,
   sanitizeStr,
   tsToMs,
 } from "./types";
 import type {
   ActivationRequestDoc,
+  ActivationRequestType,
   AdminRecord,
   AuditLogDoc,
   BillingCycle,
@@ -325,6 +330,30 @@ async function seedDefaultsIfMissing(adminUid: string): Promise<void> {
           updatedAt: serverTimestamp(),
         });
       }
+    } else {
+      // ترقية هادئة لحقول حدود الأنواع والعلاقات الجديدة على الباقات الموجودة دون مسح تعديلات المدير
+      for (const d of existingPlans.docs) {
+        const cur = d.data() as Partial<SubscriptionPlan>;
+        if (typeof cur.maxCustomTypes !== "number" || typeof cur.maxCustomFieldsPerType !== "number") {
+          const def = DEFAULT_PLANS.find((p) => p.id === d.id);
+          if (def) {
+            try {
+              await updateDoc(doc(db, "plans", d.id), {
+                allowCustomTypes: def.maxCustomTypes !== 0,
+                maxCustomTypes: def.maxCustomTypes,
+                maxCustomFieldsPerType: def.maxCustomFieldsPerType,
+                allowExtraTypesAddon: Boolean(def.allowExtraTypesAddon),
+                extraTypesPackSize: def.extraTypesPackSize ?? 0,
+                extraTypesPackPriceJod: def.extraTypesPackPriceJod ?? 0,
+                features: def.features,
+                updatedAt: serverTimestamp(),
+              });
+            } catch {
+              // يتم تطبيق القيم الافتراضية تلقائياً عبر getPlanDefaultsById لحين نشر القواعد المحدثة
+            }
+          }
+        }
+      }
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, plansPath);
@@ -476,8 +505,44 @@ export function subscribeTenantProjects(
   );
 }
 
+/** التحقق من حدود الأنواع المخصصة والعلاقات الجديدة على لقطة المشروع قبل الحفظ السحابي */
+function assertSnapshotWithinPlanLimits(
+  tenant: TenantAccount,
+  plan: SubscriptionPlan | null,
+  snapshot: Omit<AppState, "raw">
+): void {
+  if (tenant.role === "admin") return;
+  const limits = resolvePlanLimits(tenant, plan, false);
+  const customTypesCount = Array.isArray(snapshot.utypes) ? snapshot.utypes.length : 0;
+
+  if (limits.maxCustomTypes === 0 && customTypesCount > 0) {
+    throw new Error(
+      "باقتك الحالية لا تسمح بحفظ أنواع شبابيك مخصصة (الأنواع الأساسية الأربعة فقط). قم بترقية الباقة."
+    );
+  }
+  if (limits.maxCustomTypes >= 0 && customTypesCount > limits.maxCustomTypes) {
+    throw new Error(
+      limits.canRequestExtraTypesAddon
+        ? `تجاوزت الحد المسموح من الأنواع المخصصة (${limits.maxCustomTypes}). يمكنك طلب حزمة أنواع إضافية من نافذة الاشتراك.`
+        : `تجاوزت الحد الأقصى للأنواع المخصصة في باقتك (${limits.maxCustomTypes}). قم بترقية الباقة لحفظ المزيد.`
+    );
+  }
+
+  if (limits.maxCustomFieldsPerType >= 0 && snapshot.custom && typeof snapshot.custom === "object") {
+    for (const [typeName, fieldsList] of Object.entries(snapshot.custom)) {
+      const cnt = Array.isArray(fieldsList) ? fieldsList.length : 0;
+      if (cnt > limits.maxCustomFieldsPerType) {
+        throw new Error(
+          `تجاوزت الحد الأقصى لإضافة العلاقات الجديدة لنوع «${typeName}» في باقتك (${limits.maxCustomFieldsPerType} علاقات لكل نوع). قم بترقية الباقة.`
+        );
+      }
+    }
+  }
+}
+
 /**
- * حفظ مشروع سحابي داخل معاملة ذرية تفرض حد المشاريع (maxProjects) والأنواع المخصصة (allowCustomTypes)
+ * حفظ مشروع سحابي داخل معاملة ذرية تفرض حد المشاريع (maxProjects)
+ * وحد الأنواع المخصصة (maxCustomTypes + extraCustomTypesQuota) وحد العلاقات الجديدة لكل نوع
  * بالتزامن مع قواعد Firestore.
  */
 export async function saveCloudProject(
@@ -497,16 +562,34 @@ export async function saveCloudProject(
   if (projectId) {
     const path = `tenants/${uid}/projects/${projectId}`;
     try {
-      await updateDoc(doc(db, "tenants", uid, "projects", projectId), {
-        name: safeName,
-        windowType: safeType,
-        unit: snapshot.unit,
-        windowCount,
-        snapshot: cleanSnapshot,
-        updatedAt: serverTimestamp(),
+      await runTransaction(db, async (tx) => {
+        const tenantRef = doc(db, "tenants", uid);
+        const tenantSnap = await tx.get(tenantRef);
+        if (!tenantSnap.exists()) {
+          throw new Error("حساب الورشة غير موجود.");
+        }
+        const tenant = tenantSnap.data() as TenantAccount;
+        let plan: SubscriptionPlan | null = null;
+        if (tenant.role !== "admin" && tenant.planId && tenant.planId !== "trial") {
+          const planSnap = await tx.get(doc(db, "plans", tenant.planId));
+          if (planSnap.exists()) plan = planSnap.data() as SubscriptionPlan;
+        }
+        assertSnapshotWithinPlanLimits(tenant, plan, cleanSnapshot);
+
+        tx.update(doc(db, "tenants", uid, "projects", projectId), {
+          name: safeName,
+          windowType: safeType,
+          unit: snapshot.unit,
+          windowCount,
+          snapshot: cleanSnapshot,
+          updatedAt: serverTimestamp(),
+        });
       });
       return projectId;
     } catch (err) {
+      if (err instanceof Error && (err.message.includes("الحد") || err.message.includes("باقتك الحالية"))) {
+        throw err;
+      }
       const msg = err instanceof Error ? err.message : "";
       if (msg.includes("permission-denied") || msg.includes("PERMISSION_DENIED")) {
         throw new Error("تعذر تعديل المشروع: تحقق من صلاحية اشتراكك أو حدود الباقة الحالية.");
@@ -529,13 +612,12 @@ export async function saveCloudProject(
 
       if (tenant.role !== "admin") {
         let maxProjects = TRIAL_MAX_PROJECTS;
-        let allowCustomTypes = true;
+        let plan: SubscriptionPlan | null = null;
         if (tenant.planId && tenant.planId !== "trial") {
           const planSnap = await tx.get(doc(db, "plans", tenant.planId));
           if (planSnap.exists()) {
-            const p = planSnap.data() as SubscriptionPlan;
-            maxProjects = p.maxProjects;
-            allowCustomTypes = Boolean(p.allowCustomTypes);
+            plan = planSnap.data() as SubscriptionPlan;
+            maxProjects = plan.maxProjects;
           }
         }
         if (maxProjects >= 0 && currentCount >= maxProjects) {
@@ -543,10 +625,7 @@ export async function saveCloudProject(
             `وصلت إلى الحد الأقصى لعدد المشاريع في باقتك (${maxProjects} مشروع). قم بترقية الباقة لحفظ المزيد.`
           );
         }
-        const hasCustomTypes = Array.isArray(cleanSnapshot.utypes) && cleanSnapshot.utypes.length > 0;
-        if (hasCustomTypes && !allowCustomTypes) {
-          throw new Error("باقتك الحالية لا تسمح بحفظ أنواع شبابيك مخصصة. قم بترقية الباقة.");
-        }
+        assertSnapshotWithinPlanLimits(tenant, plan, cleanSnapshot);
       }
 
       const projectRef = doc(db, "tenants", uid, "projects", newId);
@@ -571,13 +650,13 @@ export async function saveCloudProject(
     });
     return newId;
   } catch (err) {
-    if (err instanceof Error && (err.message.includes("الحد الأقصى") || err.message.includes("باقتك الحالية"))) {
+    if (err instanceof Error && (err.message.includes("الحد") || err.message.includes("باقتك الحالية"))) {
       throw err;
     }
     const msg = err instanceof Error ? err.message : "";
     if (msg.includes("permission-denied") || msg.includes("PERMISSION_DENIED")) {
       throw new Error(
-        "تعذر حفظ المشروع: انتهت مدة الاشتراك أو وصلت إلى الحد الأقصى للمشاريع في باقتك."
+        "تعذر حفظ المشروع: انتهت مدة الاشتراك أو تجاوزت حدود باقتك الحالية."
       );
     }
     handleFirestoreError(err, OperationType.CREATE, path);
@@ -652,8 +731,9 @@ export async function updateTenantProfile(
 }
 
 /**
- * تقديم طلب دفع يدوي عبر CliQ — ينشئ الطلب بحالة pending ويحوّل حالة الحساب إلى pending_payment
- * (دون تفعيل الاشتراك ودون تمديد التجربة المنتهية)
+ * تقديم طلب دفع يدوي عبر CliQ:
+ * - لاشتراك جديد/تجديد: ينشئ الطلب بحالة pending ويحوّل حالة الحساب إلى pending_payment (دون تفعيل الاشتراك)
+ * - لحزمة أنواع إضافية (خاصة بباقة الورش والمصانع الفعالة فقط): ينشئ الطلب بحالة pending دون إيقاف الاشتراك الفعال
  */
 export async function submitActivationRequest(
   user: User,
@@ -663,14 +743,20 @@ export async function submitActivationRequest(
     planId: string;
     billingCycle: BillingCycle;
     cliqNote: string;
+    requestType?: ActivationRequestType;
+    extraTypesCount?: number;
+    addonPriceJod?: number;
   }
 ): Promise<string> {
   if (!user.emailVerified) {
     throw new Error("يجب توثيق البريد الإلكتروني قبل تقديم طلب الدفع.");
   }
 
-  const reqId = makeSafeDocId("req");
+  const reqType: ActivationRequestType =
+    params.requestType === "extra_types_addon" ? "extra_types_addon" : "subscription";
+  const reqId = makeSafeDocId(reqType === "extra_types_addon" ? "addon" : "req");
   const path = `activation_requests/${reqId}`;
+
   try {
     await runTransaction(db, async (tx) => {
       const tenantRef = doc(db, "tenants", user.uid);
@@ -680,7 +766,32 @@ export async function submitActivationRequest(
       }
       const tenant = tenantSnap.data() as TenantAccount;
 
-      tx.set(doc(db, "activation_requests", reqId), {
+      let extraTypesCount = 0;
+      let addonPriceJod = 0;
+      let effectivePlanId = sanitizeStr(params.planId, BLUEPRINT_LIMITS.planIdMax) || "starter";
+
+      if (reqType === "extra_types_addon") {
+        if (tenant.subscriptionStatus !== "active") {
+          throw new Error("طلب حزمة الأنواع الإضافية متاح فقط للاشتراكات الفعّالة على الباقة الأخيرة.");
+        }
+        const planSnap = await tx.get(doc(db, "plans", tenant.planId));
+        const livePlan = planSnap.exists() ? (planSnap.data() as SubscriptionPlan) : null;
+        const resolved = getPlanDefaultsById(livePlan || { id: tenant.planId });
+        if (!resolved.allowExtraTypesAddon) {
+          throw new Error("حزمة الأنواع الإضافية متاحة فقط للباقة الأخيرة (باقة الورش والمصانع).");
+        }
+        effectivePlanId = tenant.planId;
+        extraTypesCount = Math.max(
+          1,
+          Math.min(50, Math.round(Number(params.extraTypesCount) || resolved.extraTypesPackSize))
+        );
+        addonPriceJod = Math.max(
+          0,
+          Math.min(10000, Number(params.addonPriceJod ?? resolved.extraTypesPackPriceJod) || 0)
+        );
+      }
+
+      const payload: Record<string, unknown> = {
         tenantId: user.uid,
         ownerUid: user.uid,
         email: sanitizeStr((user.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
@@ -688,16 +799,27 @@ export async function submitActivationRequest(
           sanitizeStr(params.workshopName || tenant.workshopName || "ورشتي", BLUEPRINT_LIMITS.nameMax) ||
           "ورشتي",
         phone: sanitizeStr(params.phone, BLUEPRINT_LIMITS.phoneMax),
-        planId: sanitizeStr(params.planId, BLUEPRINT_LIMITS.planIdMax) || "starter",
+        planId: effectivePlanId,
         billingCycle: params.billingCycle,
         cliqNote: sanitizeStr(params.cliqNote, BLUEPRINT_LIMITS.noteMax),
         status: "pending",
         reviewedBy: "",
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      });
+      };
 
-      if (tenant.subscriptionStatus === "trialing" || tenant.subscriptionStatus === "expired") {
+      if (reqType === "extra_types_addon") {
+        payload.requestType = "extra_types_addon";
+        payload.extraTypesCount = extraTypesCount;
+        payload.addonPriceJod = addonPriceJod;
+      }
+
+      tx.set(doc(db, "activation_requests", reqId), payload);
+
+      if (
+        reqType === "subscription" &&
+        (tenant.subscriptionStatus === "trialing" || tenant.subscriptionStatus === "expired")
+      ) {
         tx.update(tenantRef, {
           subscriptionStatus: "pending_payment",
           updatedAt: serverTimestamp(),
@@ -706,6 +828,9 @@ export async function submitActivationRequest(
     });
     return reqId;
   } catch (err) {
+    if (err instanceof Error && (err.message.includes("متاح فقط") || err.message.includes("توثيق"))) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.CREATE, path);
   }
 }
@@ -885,6 +1010,7 @@ export async function adminActivateTenant(
         subscriptionStatus: "active",
         planId: cleanPlan,
         activeUntil,
+        extraCustomTypesQuota: 0, // حزمة الأنواع الإضافية تُدفع مرة واحدة مع كل اشتراك جديد
         adminNote: note,
         updatedAt: serverTimestamp(),
       });
@@ -898,6 +1024,58 @@ export async function adminActivateTenant(
           `تفعيل ${prev.email} على باقة ${cleanPlan} لمدة ${
             opts.durationDays === null ? "دائمة" : `${opts.durationDays} يوم`
           }`,
+          BLUEPRINT_LIMITS.adminNoteMax
+        ),
+        beforeState,
+        afterState,
+        createdAt: serverTimestamp(),
+      });
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
+  }
+}
+
+/** منح حصة أنواع مخصصة إضافية لورشة مشتركه على الباقة الأخيرة (ضمن معاملة ذرية مؤرخة) */
+export async function adminGrantExtraTypesQuota(
+  adminUser: User,
+  target: TenantAccount,
+  deltaTypes: number
+): Promise<void> {
+  const path = `tenants/${target.ownerUid}`;
+  const logId = makeSafeDocId("log");
+  const safeDelta = Math.max(1, Math.min(50, Math.round(Number(deltaTypes) || DEFAULT_EXTRA_TYPES_PACK_SIZE)));
+
+  try {
+    await runTransaction(db, async (tx) => {
+      const tenantRef = doc(db, "tenants", target.ownerUid);
+      const snap = await tx.get(tenantRef);
+      if (!snap.exists()) {
+        throw new Error("لم يتم العثور على حساب الورشة.");
+      }
+      const prev = snap.data() as TenantAccount;
+      const curQuota = typeof prev.extraCustomTypesQuota === "number" ? prev.extraCustomTypesQuota : 0;
+      const nextQuota = Math.min(200, curQuota + safeDelta);
+
+      const beforeState = `${summarizeTenantState(prev)} | extraTypes=${curQuota}`;
+      const afterState = `${summarizeTenantState(prev)} | extraTypes=${nextQuota}`;
+
+      tx.update(tenantRef, {
+        extraCustomTypesQuota: nextQuota,
+        adminNote: sanitizeStr(
+          `إضافة حزمة +${safeDelta} أنواع مخصصة للاشتراك الحالي (الإجمالي الإضافي: ${nextQuota})`,
+          BLUEPRINT_LIMITS.adminNoteMax
+        ),
+        updatedAt: serverTimestamp(),
+      });
+
+      tx.set(doc(db, "audit_logs", logId), {
+        actorUid: adminUser.uid,
+        actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+        action: "grant_extra_types",
+        targetTenantId: target.ownerUid,
+        details: sanitizeStr(
+          `منح +${safeDelta} أنواع مخصصة للورشة ${prev.email} (الحصة الإضافية الآن ${nextQuota})`,
           BLUEPRINT_LIMITS.adminNoteMax
         ),
         beforeState,
@@ -1097,51 +1275,87 @@ export async function adminReviewActivationRequest(
         const beforeState = summarizeTenantState(prevTenant);
 
         if (decision === "approved") {
-          const activeUntil =
-            durationDays === null
-              ? null
-              : Timestamp.fromMillis(serverNowMs + durationDays * 86400000);
-          const cleanPlan = sanitizeStr(liveReq.planId, BLUEPRINT_LIMITS.planIdMax) || "starter";
+          const isExtraAddon = liveReq.requestType === "extra_types_addon";
 
-          tx.update(tenantRef, {
-            subscriptionStatus: "active",
-            planId: cleanPlan,
-            activeUntil,
-            adminNote: sanitizeStr(
-              `تأكيد دفع كليك #${req.id.slice(-6)} (${
-                durationDays === null ? "دائم" : `${durationDays} يوم`
-              })`,
-              BLUEPRINT_LIMITS.adminNoteMax
-            ),
-            updatedAt: serverTimestamp(),
-          });
+          if (isExtraAddon) {
+            const addedCount = Math.max(
+              1,
+              Math.min(50, Math.round(Number(liveReq.extraTypesCount) || DEFAULT_EXTRA_TYPES_PACK_SIZE))
+            );
+            const curQuota =
+              typeof prevTenant.extraCustomTypesQuota === "number" ? prevTenant.extraCustomTypesQuota : 0;
+            const nextQuota = Math.min(200, curQuota + addedCount);
 
-          const afterState = summarizeTenantState({
-            ...prevTenant,
-            subscriptionStatus: "active",
-            planId: cleanPlan,
-            activeUntil,
-          });
+            tx.update(tenantRef, {
+              extraCustomTypesQuota: nextQuota,
+              adminNote: sanitizeStr(
+                `تأكيد دفع حزمة +${addedCount} أنواع مخصصة #${req.id.slice(-6)}`,
+                BLUEPRINT_LIMITS.adminNoteMax
+              ),
+              updatedAt: serverTimestamp(),
+            });
 
-          tx.set(doc(db, "audit_logs", logId), {
-            actorUid: adminUser.uid,
-            actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
-            action: "approve_payment_request",
-            targetTenantId: req.tenantId,
-            details: sanitizeStr(
-              `تأكيد دفع كليك للورشة ${liveReq.email} على باقة ${cleanPlan} لمدة ${
-                durationDays === null ? "دائمة" : `${durationDays} يوم`
-              }`,
-              BLUEPRINT_LIMITS.adminNoteMax
-            ),
-            beforeState,
-            afterState,
-            createdAt: serverTimestamp(),
-          });
+            tx.set(doc(db, "audit_logs", logId), {
+              actorUid: adminUser.uid,
+              actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+              action: "approve_extra_types_addon",
+              targetTenantId: req.tenantId,
+              details: sanitizeStr(
+                `تأكيد دفع كليك لحزمة +${addedCount} أنواع مخصصة للورشة ${liveReq.email} (الإجمالي الإضافي ${nextQuota})`,
+                BLUEPRINT_LIMITS.adminNoteMax
+              ),
+              beforeState: `${beforeState} | extraTypes=${curQuota}`,
+              afterState: `${beforeState} | extraTypes=${nextQuota}`,
+              createdAt: serverTimestamp(),
+            });
+          } else {
+            const activeUntil =
+              durationDays === null
+                ? null
+                : Timestamp.fromMillis(serverNowMs + durationDays * 86400000);
+            const cleanPlan = sanitizeStr(liveReq.planId, BLUEPRINT_LIMITS.planIdMax) || "starter";
+
+            tx.update(tenantRef, {
+              subscriptionStatus: "active",
+              planId: cleanPlan,
+              activeUntil,
+              extraCustomTypesQuota: 0, // حزمة الأنواع الإضافية تُدفع مرة واحدة مع كل اشتراك
+              adminNote: sanitizeStr(
+                `تأكيد دفع كليك #${req.id.slice(-6)} (${
+                  durationDays === null ? "دائم" : `${durationDays} يوم`
+                })`,
+                BLUEPRINT_LIMITS.adminNoteMax
+              ),
+              updatedAt: serverTimestamp(),
+            });
+
+            const afterState = summarizeTenantState({
+              ...prevTenant,
+              subscriptionStatus: "active",
+              planId: cleanPlan,
+              activeUntil,
+            });
+
+            tx.set(doc(db, "audit_logs", logId), {
+              actorUid: adminUser.uid,
+              actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+              action: "approve_payment_request",
+              targetTenantId: req.tenantId,
+              details: sanitizeStr(
+                `تأكيد دفع كليك للورشة ${liveReq.email} على باقة ${cleanPlan} لمدة ${
+                  durationDays === null ? "دائمة" : `${durationDays} يوم`
+                }`,
+                BLUEPRINT_LIMITS.adminNoteMax
+              ),
+              beforeState,
+              afterState,
+              createdAt: serverTimestamp(),
+            });
+          }
         } else {
           // عند رفض الطلب: إذا كانت الحالة pending_payment نعيدها لحالتها الحقيقية (trialing أو expired)
           let nextStatus = prevTenant.subscriptionStatus;
-          if (prevTenant.subscriptionStatus === "pending_payment") {
+          if (liveReq.requestType !== "extra_types_addon" && prevTenant.subscriptionStatus === "pending_payment") {
             const createdMs = tsToMs(prevTenant.createdAt) || serverNowMs;
             const trialEndMs = createdMs + (prevTenant.trialDays || 0) * 86400000;
             nextStatus = trialEndMs > serverNowMs ? "trialing" : "expired";
@@ -1289,6 +1503,17 @@ export async function adminSavePlan(
     .filter(Boolean)
     .slice(0, 12);
 
+  const defaults = getPlanDefaultsById(plan);
+  const maxCustomTypes = Math.max(-1, Math.min(500, Math.round(defaults.maxCustomTypes)));
+  const maxCustomFieldsPerType = Math.max(-1, Math.min(500, Math.round(defaults.maxCustomFieldsPerType)));
+  const allowExtraTypesAddon = Boolean(defaults.allowExtraTypesAddon);
+  const extraTypesPackSize = allowExtraTypesAddon
+    ? Math.max(1, Math.min(50, Math.round(defaults.extraTypesPackSize || DEFAULT_EXTRA_TYPES_PACK_SIZE)))
+    : 0;
+  const extraTypesPackPriceJod = allowExtraTypesAddon
+    ? Math.max(0, Math.min(10000, Number(defaults.extraTypesPackPriceJod ?? DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD) || 0))
+    : 0;
+
   try {
     await setDoc(doc(db, "plans", safeId), {
       id: safeId,
@@ -1297,7 +1522,12 @@ export async function adminSavePlan(
       priceMonthlyJod: Math.max(0, Math.min(10000, Number(plan.priceMonthlyJod) || 0)),
       maxProjects: Math.max(-1, Math.min(100000, Math.round(Number(plan.maxProjects) || 0))),
       allowExport: Boolean(plan.allowExport),
-      allowCustomTypes: Boolean(plan.allowCustomTypes),
+      allowCustomTypes: maxCustomTypes !== 0,
+      maxCustomTypes,
+      maxCustomFieldsPerType,
+      allowExtraTypesAddon,
+      extraTypesPackSize,
+      extraTypesPackPriceJod,
       active: Boolean(plan.active),
       sortOrder: Math.max(0, Math.min(100, Math.round(Number(plan.sortOrder) || 0))),
       features: cleanFeatures,
@@ -1306,7 +1536,12 @@ export async function adminSavePlan(
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
   }
-  await writeAuditLog(adminUser, "save_plan", safeId, `تحديث باقة ${plan.name} (${plan.priceLabel})`);
+  await writeAuditLog(
+    adminUser,
+    "save_plan",
+    safeId,
+    `تحديث باقة ${plan.name} (أنواع مخصصة: ${maxCustomTypes}، علاقات/نوع: ${maxCustomFieldsPerType})`
+  );
 }
 
 /** حفظ الإعدادات العامة (كليك وواتساب فقط — لا تخزن أي أسرار أو روابط Webhook) */
