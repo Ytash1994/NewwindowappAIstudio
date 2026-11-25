@@ -242,6 +242,14 @@ runTest("حدود الباقات الثلاث والتجربة المجانية 
     false
   );
   assert.equal(bizWithAddon.maxCustomTypes, 10);
+  assert.equal(bizWithAddon.canRequestExtraTypesAddon, false, "عند بلوغ 10 أنواع تُغلق الحزم الإضافية");
+
+  const bizOverCapped = resolvePlanLimits(
+    makeTenant({ planId: "business", subscriptionStatus: "active", extraCustomTypesQuota: 50 }),
+    businessPlan,
+    false
+  );
+  assert.equal(bizOverCapped.maxCustomTypes, 10, "سقف الإطلاق التجريبي 10 أنواع لا يُتجاوز");
 });
 
 runTest("فرض حدود الأنواع والعلاقات فعلياً عند حفظ لقطة المشروع عبر assertSnapshotWithinPlanLimits", () => {
@@ -400,12 +408,59 @@ runTest("رفض البنى غير الصالحة في snapshot (utypes ليست 
     )
   );
 
-  // عنصر غير صالح داخل قائمة utypes
+  // 10 أنواع صالحة تُقبل و 11 نوعاً تُرفض حتى مع حصة قديمة مرتفعة
+  const bizOverQuota = makeTenant({
+    planId: "business",
+    subscriptionStatus: "active",
+    extraCustomTypesQuota: 20,
+  });
+  assert.doesNotThrow(() =>
+    assertSnapshotWithinPlanLimits(
+      bizOverQuota,
+      businessPlan,
+      makeSnapshot({
+        utypes: Array.from({ length: 10 }, (_, i) => ({ name: `نوع_${i + 1}` })),
+        custom: { "نوع_10": [{ id: "c1", name: "ع1", group: "frame" }] },
+      })
+    )
+  );
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      bizOverQuota,
+      businessPlan,
+      makeSnapshot({
+        utypes: Array.from({ length: 11 }, (_, i) => ({ name: `نوع_${i + 1}` })),
+      })
+    )
+  );
+
+  // النوع العاشر ببنية غير صالحة أو بدون name يُرفض
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      bizOverQuota,
+      businessPlan,
+      makeSnapshot({
+        utypes: [
+          ...Array.from({ length: 9 }, (_, i) => ({ name: `نوع_${i + 1}` })),
+          { label: "بدون اسم" } as unknown as { name: string },
+        ],
+      })
+    )
+  );
+
+  // عنصر غير صالح داخل قائمة utypes (اسم فارغ أو مسافات)
   assert.throws(() =>
     assertSnapshotWithinPlanLimits(
       bizTenant,
       businessPlan,
       makeSnapshot({ utypes: [{ name: "" }] as unknown as AppState["utypes"] })
+    )
+  );
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      bizTenant,
+      businessPlan,
+      makeSnapshot({ utypes: [{ name: "   " }] as unknown as AppState["utypes"] })
     )
   );
 
@@ -420,13 +475,34 @@ runTest("رفض البنى غير الصالحة في snapshot (utypes ليست 
     );
   }
 
-  // قيمة مفتاح داخل custom ليست قائمة
+  // مفتاح custom غير معروف يُرفض حتى على باقة Business
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      bizTenant,
+      businessPlan,
+      makeSnapshot({
+        utypes: [{ name: "نوع_1" }],
+        custom: { "مفتاح_غير_معروف": [{ id: "c1", name: "ع1", group: "frame" }] },
+      })
+    )
+  );
+
+  // قيمة مفتاح داخل custom ليست قائمة (string أو map)
   assert.throws(() =>
     assertSnapshotWithinPlanLimits(
       bizTenant,
       businessPlan,
       makeSnapshot({
         custom: { "شباك 3 مجاري نظامي": "bad-list" } as unknown as AppState["custom"],
+      })
+    )
+  );
+  assert.throws(() =>
+    assertSnapshotWithinPlanLimits(
+      bizTenant,
+      businessPlan,
+      makeSnapshot({
+        custom: { "شباك 3 مجاري نظامي": { a: 1 } } as unknown as AppState["custom"],
       })
     )
   );
@@ -497,11 +573,24 @@ runTest("التحقق من الالتزام التام بخطة Firebase Spark �
   assert.ok(rulesText.includes("request.auth.token.email.lower() == 'xtashtoush@gmail.com'"));
   assert.ok(rulesText.includes("function isAdmin() {\n      return isOwnerAdmin();\n    }"));
   assert.ok(rulesText.includes("hasValidUtypesShape"));
+  assert.ok(rulesText.includes("projectData.snapshot.utypes.size() <= 10"));
+  assert.equal(
+    rulesText.includes("projectData.snapshot.utypes.size() <= 210"),
+    false,
+    "ممنوع السماح بأكثر من 10 أنواع مخصصة في قواعد Firestore"
+  );
   assert.ok(rulesText.includes("hasValidCustomMapShape"));
+  assert.ok(rulesText.includes("allowedCustomKeys"));
+  assert.ok(rulesText.includes("adminExtraQuotaWithinCap"));
   assert.equal(
     rulesText.includes("!(projectData.snapshot.utypes is list)"),
     false,
     "ممنوع السماح بتمرير utypes غير القائمة"
+  );
+  assert.equal(
+    rulesText.includes(": true\n              )"),
+    false,
+    "ممنوع وجود مسار تجاوز في customFieldsWithinLimit"
   );
   assert.ok(rulesText.includes("data.trialDaysDefault is int && data.trialDaysDefault == 7"));
   assert.ok(rulesText.includes("planAllowsNewProject"));

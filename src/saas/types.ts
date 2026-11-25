@@ -7,6 +7,7 @@ export const DEFAULT_TRIAL_DAYS = 7;
 export const TRIAL_MAX_PROJECTS = 25;
 export const TRIAL_MAX_CUSTOM_TYPES = 0;
 export const TRIAL_MAX_CUSTOM_FIELDS_PER_TYPE = 2;
+export const LAUNCH_MAX_CUSTOM_TYPES = 10;
 export const DEFAULT_EXTRA_TYPES_PACK_SIZE = 5;
 export const DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD = 10;
 
@@ -289,9 +290,9 @@ export function resolvePlanLimits(
 ): ResolvedPlanLimits {
   if (isAdmin || (tenant && isOwnerAdminEmail(tenant.email))) {
     return {
-      baseMaxCustomTypes: -1,
+      baseMaxCustomTypes: LAUNCH_MAX_CUSTOM_TYPES,
       extraTypesQuota: 0,
-      maxCustomTypes: -1,
+      maxCustomTypes: LAUNCH_MAX_CUSTOM_TYPES,
       maxCustomFieldsPerType: -1,
       allowReorder: true,
       canRequestExtraTypesAddon: false,
@@ -314,22 +315,35 @@ export function resolvePlanLimits(
   }
 
   const resolved = getPlanDefaultsById(plan || { id: tenant.planId });
-  const extraTypesQuota =
-    resolved.allowExtraTypesAddon && typeof tenant.extraCustomTypesQuota === "number" && tenant.extraCustomTypesQuota > 0
+  const baseMaxCustomTypes =
+    resolved.maxCustomTypes < 0
+      ? LAUNCH_MAX_CUSTOM_TYPES
+      : Math.min(LAUNCH_MAX_CUSTOM_TYPES, Math.max(0, resolved.maxCustomTypes));
+
+  const rawExtraQuota =
+    resolved.allowExtraTypesAddon &&
+    typeof tenant.extraCustomTypesQuota === "number" &&
+    tenant.extraCustomTypesQuota > 0
       ? Math.round(tenant.extraCustomTypesQuota)
       : 0;
 
-  const maxCustomTypes =
-    resolved.maxCustomTypes < 0 ? -1 : resolved.maxCustomTypes + extraTypesQuota;
+  const maxExtraAllowed = Math.max(0, LAUNCH_MAX_CUSTOM_TYPES - baseMaxCustomTypes);
+  const extraTypesQuota = Math.min(rawExtraQuota, maxExtraAllowed);
+  const maxCustomTypes = Math.min(LAUNCH_MAX_CUSTOM_TYPES, baseMaxCustomTypes + extraTypesQuota);
+  const remainingAddonSlots = Math.max(0, LAUNCH_MAX_CUSTOM_TYPES - maxCustomTypes);
+  const effectivePackSize =
+    remainingAddonSlots > 0
+      ? Math.min(resolved.extraTypesPackSize, remainingAddonSlots)
+      : 0;
 
   return {
-    baseMaxCustomTypes: resolved.maxCustomTypes,
+    baseMaxCustomTypes,
     extraTypesQuota,
     maxCustomTypes,
     maxCustomFieldsPerType: resolved.maxCustomFieldsPerType,
     allowReorder: true,
-    canRequestExtraTypesAddon: resolved.allowExtraTypesAddon,
-    extraTypesPackSize: resolved.extraTypesPackSize,
+    canRequestExtraTypesAddon: resolved.allowExtraTypesAddon && remainingAddonSlots > 0,
+    extraTypesPackSize: effectivePackSize || resolved.extraTypesPackSize,
     extraTypesPackPriceJod: resolved.extraTypesPackPriceJod,
   };
 }

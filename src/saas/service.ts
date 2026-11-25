@@ -31,6 +31,7 @@ import {
   where,
 } from "firebase/firestore";
 import firebaseConfig from "../../firebase-applet-config.json";
+import { BUILTIN_TYPE_NAMES } from "../engine/calc";
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from "../firebase";
 import type { AppState, SavedProject } from "../types";
 import {
@@ -40,6 +41,7 @@ import {
   DEFAULT_PLANS,
   DEFAULT_PLATFORM_CONFIG,
   DEFAULT_TRIAL_DAYS,
+  LAUNCH_MAX_CUSTOM_TYPES,
   TRIAL_MAX_PROJECTS,
   getPlanDefaultsById,
   isOwnerAdminEmail,
@@ -441,16 +443,22 @@ export async function fetchMyActivationRequests(uid: string): Promise<Activation
   }
 }
 
-/** التحقق الصارم من بنية وحدود الأنواع المخصصة والعلاقات الجديدة على لقطة المشروع قبل الحفظ السحابي */
+/** التحقق الصارم من بنية وحدود الأنواع المخصصة (الحد الأقصى 10) والعلاقات الجديدة على لقطة المشروع قبل الحفظ السحابي */
 export function assertSnapshotWithinPlanLimits(
   tenant: TenantAccount,
   plan: SubscriptionPlan | null,
   snapshot: Omit<AppState, "raw">
 ): void {
+  const allowedTypeNames = new Set<string>(BUILTIN_TYPE_NAMES);
   const rawUtypes = (snapshot as unknown as { utypes?: unknown }).utypes;
   if (rawUtypes !== undefined) {
     if (!Array.isArray(rawUtypes)) {
       throw new Error("بنية الأنواع المخصصة (utypes) غير صالحة ويجب أن تكون قائمة.");
+    }
+    if (rawUtypes.length > LAUNCH_MAX_CUSTOM_TYPES) {
+      throw new Error(
+        `الحد الأقصى للأنواع المخصصة في مرحلة الإطلاق التجريبي هو ${LAUNCH_MAX_CUSTOM_TYPES} أنواع فقط.`
+      );
     }
     for (const item of rawUtypes) {
       if (
@@ -463,6 +471,7 @@ export function assertSnapshotWithinPlanLimits(
       ) {
         throw new Error("أحد عناصر الأنواع المخصصة غير صالح.");
       }
+      allowedTypeNames.add((item as { name: string }).name);
     }
   }
 
@@ -471,7 +480,10 @@ export function assertSnapshotWithinPlanLimits(
     if (rawCustom === null || typeof rawCustom !== "object" || Array.isArray(rawCustom)) {
       throw new Error("بنية العلاقات المخصصة (custom) غير صالحة ويجب أن تكون خريطة (map).");
     }
-    for (const [, fieldsList] of Object.entries(rawCustom as Record<string, unknown>)) {
+    for (const [typeName, fieldsList] of Object.entries(rawCustom as Record<string, unknown>)) {
+      if (!allowedTypeNames.has(typeName)) {
+        throw new Error(`مفتاح علاقات مخصصة غير معروف: «${typeName}».`);
+      }
       if (!Array.isArray(fieldsList)) {
         throw new Error("بنية قائمة العلاقات المخصصة داخل أحد الأنواع غير صالحة.");
       }
@@ -491,7 +503,7 @@ export function assertSnapshotWithinPlanLimits(
     throw new Error(
       limits.canRequestExtraTypesAddon
         ? `تجاوزت الحد المسموح من الأنواع المخصصة (${limits.maxCustomTypes}). يمكنك طلب حزمة أنواع إضافية من نافذة الاشتراك.`
-        : `تجاوزت الحد الأقصى للأنواع المخصصة في باقتك (${limits.maxCustomTypes}). قم بترقية الباقة لحفظ المزيد.`
+        : `تجاوزت الحد الأقصى للأنواع المخصصة في باقتك (${limits.maxCustomTypes}).`
     );
   }
 
@@ -758,9 +770,20 @@ export async function submitActivationRequest(
           throw new Error("حزمة الأنواع الإضافية متاحة فقط للباقة الأخيرة (باقة الورش والمصانع).");
         }
         effectivePlanId = tenant.planId;
+        const baseMax = Math.max(0, Math.min(LAUNCH_MAX_CUSTOM_TYPES, resolved.maxCustomTypes));
+        const curExtra =
+          typeof tenant.extraCustomTypesQuota === "number" && tenant.extraCustomTypesQuota > 0
+            ? Math.round(tenant.extraCustomTypesQuota)
+            : 0;
+        const remainingSlots = Math.max(0, LAUNCH_MAX_CUSTOM_TYPES - (baseMax + curExtra));
+        if (remainingSlots <= 0) {
+          throw new Error(
+            `وصلت بالفعل إلى الحد الأقصى للأنواع المخصصة في الإطلاق التجريبي (${LAUNCH_MAX_CUSTOM_TYPES} أنواع).`
+          );
+        }
         extraTypesCount = Math.max(
           1,
-          Math.min(50, Math.round(Number(params.extraTypesCount) || resolved.extraTypesPackSize))
+          Math.min(remainingSlots, Math.round(Number(params.extraTypesCount) || resolved.extraTypesPackSize))
         );
         addonPriceJod = Math.max(
           0,
@@ -941,7 +964,7 @@ export async function adminActivateTenant(
   }
 }
 
-/** منح حصة أنواع مخصصة إضافية لورشة مشتركه على الباقة الأخيرة (ضمن معاملة ذرية مؤرخة) */
+/** منح حصة أنواع مخصصة إضافية لورشة مشتركة على الباقة الأخيرة بما لا يتجاوز الحد الأقصى 10 أنواع إجمالاً */
 export async function adminGrantExtraTypesQuota(
   adminUser: User,
   target: TenantAccount,
@@ -949,7 +972,10 @@ export async function adminGrantExtraTypesQuota(
 ): Promise<void> {
   const path = `tenants/${target.ownerUid}`;
   const logId = makeSafeDocId("log");
-  const safeDelta = Math.max(1, Math.min(50, Math.round(Number(deltaTypes) || DEFAULT_EXTRA_TYPES_PACK_SIZE)));
+  const safeDelta = Math.max(
+    1,
+    Math.min(LAUNCH_MAX_CUSTOM_TYPES, Math.round(Number(deltaTypes) || DEFAULT_EXTRA_TYPES_PACK_SIZE))
+  );
 
   try {
     await runTransaction(db, async (tx) => {
@@ -959,8 +985,26 @@ export async function adminGrantExtraTypesQuota(
         throw new Error("لم يتم العثور على حساب الورشة.");
       }
       const prev = snap.data() as TenantAccount;
+      const planSnap =
+        prev.planId && prev.planId !== "trial"
+          ? await tx.get(doc(db, "plans", prev.planId))
+          : null;
+      const livePlan = planSnap?.exists() ? (planSnap.data() as SubscriptionPlan) : null;
+      const resolved = getPlanDefaultsById(livePlan || { id: prev.planId });
+      if (!resolved.allowExtraTypesAddon) {
+        throw new Error("حزمة الأنواع الإضافية متاحة فقط للباقة الأخيرة (باقة الورش والمصانع).");
+      }
+      const baseMax = Math.max(0, Math.min(LAUNCH_MAX_CUSTOM_TYPES, resolved.maxCustomTypes));
       const curQuota = typeof prev.extraCustomTypesQuota === "number" ? prev.extraCustomTypesQuota : 0;
-      const nextQuota = Math.min(200, curQuota + safeDelta);
+      const maxExtraAllowed = Math.max(0, LAUNCH_MAX_CUSTOM_TYPES - baseMax);
+      if (curQuota >= maxExtraAllowed || baseMax + curQuota + safeDelta > LAUNCH_MAX_CUSTOM_TYPES) {
+        throw new Error(
+          `لا يمكن تجاوز الحد الأقصى الإجمالي للأنواع المخصصة (${LAUNCH_MAX_CUSTOM_TYPES} أنواع). الحصة الحالية: ${
+            baseMax + curQuota
+          }.`
+        );
+      }
+      const nextQuota = curQuota + safeDelta;
 
       const beforeState = `${summarizeTenantState(prev)} | extraTypes=${curQuota}`;
       const afterState = `${summarizeTenantState(prev)} | extraTypes=${nextQuota}`;
@@ -989,6 +1033,12 @@ export async function adminGrantExtraTypesQuota(
       });
     });
   } catch (err) {
+    if (
+      err instanceof Error &&
+      (err.message.includes("الحد الأقصى") || err.message.includes("متاحة فقط"))
+    ) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
@@ -1183,13 +1233,28 @@ export async function adminReviewActivationRequest(
           const isExtraAddon = liveReq.requestType === "extra_types_addon";
 
           if (isExtraAddon) {
-            const addedCount = Math.max(
-              1,
-              Math.min(50, Math.round(Number(liveReq.extraTypesCount) || DEFAULT_EXTRA_TYPES_PACK_SIZE))
-            );
+            const planSnap =
+              prevTenant.planId && prevTenant.planId !== "trial"
+                ? await tx.get(doc(db, "plans", prevTenant.planId))
+                : null;
+            const livePlan = planSnap?.exists() ? (planSnap.data() as SubscriptionPlan) : null;
+            const resolved = getPlanDefaultsById(livePlan || { id: prevTenant.planId });
+            const baseMax = Math.max(0, Math.min(LAUNCH_MAX_CUSTOM_TYPES, resolved.maxCustomTypes));
             const curQuota =
               typeof prevTenant.extraCustomTypesQuota === "number" ? prevTenant.extraCustomTypesQuota : 0;
-            const nextQuota = Math.min(200, curQuota + addedCount);
+            const addedCount = Math.max(
+              1,
+              Math.min(
+                LAUNCH_MAX_CUSTOM_TYPES,
+                Math.round(Number(liveReq.extraTypesCount) || DEFAULT_EXTRA_TYPES_PACK_SIZE)
+              )
+            );
+            if (!resolved.allowExtraTypesAddon || baseMax + curQuota + addedCount > LAUNCH_MAX_CUSTOM_TYPES) {
+              throw new Error(
+                `لا يمكن اعتماد الحزمة لأن الإجمالي سيتجاوز الحد الأقصى للأنواع المخصصة (${LAUNCH_MAX_CUSTOM_TYPES} أنواع).`
+              );
+            }
+            const nextQuota = curQuota + addedCount;
 
             tx.update(tenantRef, {
               extraCustomTypesQuota: nextQuota,
@@ -1326,11 +1391,20 @@ export async function adminSavePlan(
     .slice(0, 12);
 
   const defaults = getPlanDefaultsById(plan);
-  const maxCustomTypes = Math.max(-1, Math.min(500, Math.round(defaults.maxCustomTypes)));
+  const maxCustomTypes = Math.max(
+    -1,
+    Math.min(LAUNCH_MAX_CUSTOM_TYPES, Math.round(defaults.maxCustomTypes))
+  );
   const maxCustomFieldsPerType = Math.max(-1, Math.min(500, Math.round(defaults.maxCustomFieldsPerType)));
   const allowExtraTypesAddon = Boolean(defaults.allowExtraTypesAddon);
   const extraTypesPackSize = allowExtraTypesAddon
-    ? Math.max(1, Math.min(50, Math.round(defaults.extraTypesPackSize || DEFAULT_EXTRA_TYPES_PACK_SIZE)))
+    ? Math.max(
+        1,
+        Math.min(
+          LAUNCH_MAX_CUSTOM_TYPES,
+          Math.round(defaults.extraTypesPackSize || DEFAULT_EXTRA_TYPES_PACK_SIZE)
+        )
+      )
     : 0;
   const extraTypesPackPriceJod = allowExtraTypesAddon
     ? Math.max(0, Math.min(10000, Number(defaults.extraTypesPackPriceJod ?? DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD) || 0))

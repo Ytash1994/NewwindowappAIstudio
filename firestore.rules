@@ -127,16 +127,17 @@ service cloud.firestore {
         (
           utypes[idx] is map &&
           'name' in utypes[idx] &&
-          isValidString(utypes[idx].name, 1, 100)
+          isValidString(utypes[idx].name, 1, 100) &&
+          utypes[idx].name.trim().size() >= 1
         );
     }
 
-    // Strict structural check: omitted utypes == empty list; present non-list utypes MUST be rejected!
+    // Strict structural check: launch cap is strictly 10 custom types; ALL 10 elements (0..9) validated!
     function hasValidUtypesShape(projectData) {
       return !('utypes' in projectData.snapshot) ||
         (
           projectData.snapshot.utypes is list &&
-          projectData.snapshot.utypes.size() <= 210 &&
+          projectData.snapshot.utypes.size() <= 10 &&
           isValidUtypeItemAt(projectData.snapshot.utypes, 0) &&
           isValidUtypeItemAt(projectData.snapshot.utypes, 1) &&
           isValidUtypeItemAt(projectData.snapshot.utypes, 2) &&
@@ -150,7 +151,7 @@ service cloud.firestore {
         );
     }
 
-    // Server-side plan limit enforcement for maxCustomTypes (+ paid extraCustomTypesQuota on last plan only)
+    // Server-side plan limit enforcement for maxCustomTypes (hard cap <= 10 in free launch stage)
     function planAllowsCustomTypes(tenantData, projectData) {
       return hasValidUtypesShape(projectData) && (
         (tenantData.role == 'admin' && isOwnerAdmin()) ||
@@ -175,6 +176,21 @@ service cloud.firestore {
       );
     }
 
+    // Ensure any newly granted extraCustomTypesQuota can NEVER push base + extra above 10
+    function adminExtraQuotaWithinCap(tenantData) {
+      return tenantExtraTypesQuota(tenantData) == 0 ||
+        (
+          tenantData.planId != 'trial' &&
+          exists(/databases/$(database)/documents/plans/$(tenantData.planId)) &&
+          planAllowsExtraTypesAddon(get(/databases/$(database)/documents/plans/$(tenantData.planId)).data) &&
+          planBaseMaxCustomTypes(get(/databases/$(database)/documents/plans/$(tenantData.planId)).data) >= 0 &&
+          (
+            planBaseMaxCustomTypes(get(/databases/$(database)/documents/plans/$(tenantData.planId)).data) +
+            tenantExtraTypesQuota(tenantData)
+          ) <= 10
+        );
+    }
+
     function isValidCustomFieldList(customMap, keyName, maxAllowed) {
       return !(keyName in customMap) ||
         (
@@ -194,12 +210,33 @@ service cloud.firestore {
         : 'شباك 3 مجاري نظامي';
     }
 
-    // Strict structural check: omitted custom == empty map; present non-map custom MUST be rejected!
+    // Exact allowed custom map keys: ONLY the 4 built-in window types + existing utypes (0..9)
+    function allowedCustomKeys(projectData) {
+      return [
+        'شباك 3 مجاري نظامي',
+        'شباك 2.5 نظامي',
+        'واجهات 2.5 بدون صندوق',
+        'شباك 3 مجاري بدون صندوق',
+        utypeNameAt(projectData, 0),
+        utypeNameAt(projectData, 1),
+        utypeNameAt(projectData, 2),
+        utypeNameAt(projectData, 3),
+        utypeNameAt(projectData, 4),
+        utypeNameAt(projectData, 5),
+        utypeNameAt(projectData, 6),
+        utypeNameAt(projectData, 7),
+        utypeNameAt(projectData, 8),
+        utypeNameAt(projectData, 9)
+      ];
+    }
+
+    // Strict structural check: omitted custom == empty map; present non-map, unknown keys, or non-list values MUST be rejected!
     function hasValidCustomMapShape(projectData) {
       return !('custom' in projectData.snapshot) ||
         (
           projectData.snapshot.custom is map &&
-          projectData.snapshot.custom.keys().size() <= 215 &&
+          projectData.snapshot.custom.keys().size() <= 14 &&
+          projectData.snapshot.custom.keys().hasOnly(allowedCustomKeys(projectData)) &&
           isValidCustomFieldList(projectData.snapshot.custom, 'شباك 3 مجاري نظامي', -1) &&
           isValidCustomFieldList(projectData.snapshot.custom, 'شباك 2.5 نظامي', -1) &&
           isValidCustomFieldList(projectData.snapshot.custom, 'واجهات 2.5 بدون صندوق', -1) &&
@@ -217,85 +254,49 @@ service cloud.firestore {
         );
     }
 
-    // Zero-loop server-side enforcement of maxCustomFieldsPerType across all 4 built-in + custom types
+    // Zero-loop, zero-bypass server-side enforcement of maxCustomFieldsPerType across all 4 built-in + up to 10 custom types
     function customFieldsWithinLimit(projectData, maxFields) {
-      return hasValidCustomMapShape(projectData) && (
-        !('custom' in projectData.snapshot) ||
-        (
-          maxFields == -1
-            ? (
-                (!('utypes' in projectData.snapshot) || projectData.snapshot.utypes.size() <= 10)
-                  ? projectData.snapshot.custom.keys().hasOnly([
-                      'شباك 3 مجاري نظامي',
-                      'شباك 2.5 نظامي',
-                      'واجهات 2.5 بدون صندوق',
-                      'شباك 3 مجاري بدون صندوق',
-                      utypeNameAt(projectData, 0),
-                      utypeNameAt(projectData, 1),
-                      utypeNameAt(projectData, 2),
-                      utypeNameAt(projectData, 3),
-                      utypeNameAt(projectData, 4),
-                      utypeNameAt(projectData, 5),
-                      utypeNameAt(projectData, 6),
-                      utypeNameAt(projectData, 7),
-                      utypeNameAt(projectData, 8),
-                      utypeNameAt(projectData, 9)
-                    ])
-                  : true
-              )
-            : (
-                projectData.snapshot.custom.keys().hasOnly([
-                  'شباك 3 مجاري نظامي',
-                  'شباك 2.5 نظامي',
-                  'واجهات 2.5 بدون صندوق',
-                  'شباك 3 مجاري بدون صندوق',
-                  utypeNameAt(projectData, 0),
-                  utypeNameAt(projectData, 1),
-                  utypeNameAt(projectData, 2),
-                  utypeNameAt(projectData, 3),
-                  utypeNameAt(projectData, 4),
-                  utypeNameAt(projectData, 5),
-                  utypeNameAt(projectData, 6),
-                  utypeNameAt(projectData, 7),
-                  utypeNameAt(projectData, 8),
-                  utypeNameAt(projectData, 9)
-                ]) &&
-                isValidCustomFieldList(projectData.snapshot.custom, 'شباك 3 مجاري نظامي', maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, 'شباك 2.5 نظامي', maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, 'واجهات 2.5 بدون صندوق', maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, 'شباك 3 مجاري بدون صندوق', maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 0), maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 1), maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 2), maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 3), maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 4), maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 5), maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 6), maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 7), maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 8), maxFields) &&
-                isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 9), maxFields)
-              )
-        )
-      );
+      return hasValidUtypesShape(projectData) &&
+        hasValidCustomMapShape(projectData) && (
+          !('custom' in projectData.snapshot) ||
+          (
+            projectData.snapshot.custom.keys().hasOnly(allowedCustomKeys(projectData)) &&
+            isValidCustomFieldList(projectData.snapshot.custom, 'شباك 3 مجاري نظامي', maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, 'شباك 2.5 نظامي', maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, 'واجهات 2.5 بدون صندوق', maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, 'شباك 3 مجاري بدون صندوق', maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 0), maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 1), maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 2), maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 3), maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 4), maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 5), maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 6), maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 7), maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 8), maxFields) &&
+            isValidCustomFieldList(projectData.snapshot.custom, utypeNameAt(projectData, 9), maxFields)
+          )
+        );
     }
 
     function planAllowsCustomFields(tenantData, projectData) {
-      return hasValidCustomMapShape(projectData) && (
-        (tenantData.role == 'admin' && isOwnerAdmin()) ||
-        (
-          (tenantData.planId == 'trial' || tenantData.subscriptionStatus != 'active') &&
-          customFieldsWithinLimit(projectData, 2)
-        ) ||
-        (
-          tenantData.subscriptionStatus == 'active' &&
-          tenantData.planId != 'trial' &&
-          exists(/databases/$(database)/documents/plans/$(tenantData.planId)) &&
-          customFieldsWithinLimit(
-            projectData,
-            planMaxCustomFieldsPerType(get(/databases/$(database)/documents/plans/$(tenantData.planId)).data)
+      return hasValidUtypesShape(projectData) &&
+        hasValidCustomMapShape(projectData) && (
+          (tenantData.role == 'admin' && isOwnerAdmin()) ||
+          (
+            (tenantData.planId == 'trial' || tenantData.subscriptionStatus != 'active') &&
+            customFieldsWithinLimit(projectData, 2)
+          ) ||
+          (
+            tenantData.subscriptionStatus == 'active' &&
+            tenantData.planId != 'trial' &&
+            exists(/databases/$(database)/documents/plans/$(tenantData.planId)) &&
+            customFieldsWithinLimit(
+              projectData,
+              planMaxCustomFieldsPerType(get(/databases/$(database)/documents/plans/$(tenantData.planId)).data)
+            )
           )
-        )
-      );
+        );
     }
 
     // ==================== VALIDATION BLUEPRINTS ====================
@@ -339,10 +340,10 @@ service cloud.firestore {
         data.maxProjects is int && data.maxProjects >= -1 && data.maxProjects <= 100000 &&
         data.allowExport is bool &&
         data.allowCustomTypes is bool &&
-        (!('maxCustomTypes' in data) || (data.maxCustomTypes is int && data.maxCustomTypes >= -1 && data.maxCustomTypes <= 500)) &&
+        (!('maxCustomTypes' in data) || (data.maxCustomTypes is int && data.maxCustomTypes >= -1 && data.maxCustomTypes <= 10)) &&
         (!('maxCustomFieldsPerType' in data) || (data.maxCustomFieldsPerType is int && data.maxCustomFieldsPerType >= -1 && data.maxCustomFieldsPerType <= 500)) &&
         (!('allowExtraTypesAddon' in data) || data.allowExtraTypesAddon is bool) &&
-        (!('extraTypesPackSize' in data) || (data.extraTypesPackSize is int && data.extraTypesPackSize >= 0 && data.extraTypesPackSize <= 50)) &&
+        (!('extraTypesPackSize' in data) || (data.extraTypesPackSize is int && data.extraTypesPackSize >= 0 && data.extraTypesPackSize <= 10)) &&
         (!('extraTypesPackPriceJod' in data) || ((data.extraTypesPackPriceJod is int || data.extraTypesPackPriceJod is float) && data.extraTypesPackPriceJod >= 0 && data.extraTypesPackPriceJod <= 10000)) &&
         data.active is bool &&
         data.sortOrder is int && data.sortOrder >= 0 && data.sortOrder <= 100 &&
@@ -428,7 +429,7 @@ service cloud.firestore {
         data.status in ['pending', 'approved', 'rejected'] &&
         isValidString(data.reviewedBy, 0, 128) &&
         (!('requestType' in data) || data.requestType in ['subscription', 'extra_types_addon']) &&
-        (!('extraTypesCount' in data) || (data.extraTypesCount is int && data.extraTypesCount >= 0 && data.extraTypesCount <= 50)) &&
+        (!('extraTypesCount' in data) || (data.extraTypesCount is int && data.extraTypesCount >= 0 && data.extraTypesCount <= 10)) &&
         (!('addonPriceJod' in data) || ((data.addonPriceJod is int || data.addonPriceJod is float) && data.addonPriceJod >= 0 && data.addonPriceJod <= 10000)) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
@@ -557,6 +558,10 @@ service cloud.firestore {
           (
             isOwnerAdmin() &&
             incoming().role == existing().role &&
+            (
+              tenantExtraTypesQuota(incoming()) == tenantExtraTypesQuota(existing()) ||
+              adminExtraQuotaWithinCap(incoming())
+            ) &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'workshopName', 'phone', 'displayName', 'subscriptionStatus',
               'planId', 'trialDays', 'activeUntil', 'adminNote',
@@ -743,7 +748,14 @@ service cloud.firestore {
             incoming().requestType == 'extra_types_addon' &&
             get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.subscriptionStatus == 'active' &&
             exists(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)) &&
-            planAllowsExtraTypesAddon(get(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)).data)
+            planAllowsExtraTypesAddon(get(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)).data) &&
+            planBaseMaxCustomTypes(get(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)).data) >= 0 &&
+            ('extraTypesCount' in incoming() && incoming().extraTypesCount is int && incoming().extraTypesCount >= 1) &&
+            (
+              planBaseMaxCustomTypes(get(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)).data) +
+              tenantExtraTypesQuota(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data) +
+              incoming().extraTypesCount
+            ) <= 10
           )
         );
 

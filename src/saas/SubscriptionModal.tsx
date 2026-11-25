@@ -514,8 +514,8 @@ export function SubscriptionModal({
             {currentLimits.extraTypesQuota > 0
               ? ` + ${currentLimits.extraTypesQuota} أنواع إضافية = ${currentLimits.maxCustomTypes} أنواع`
               : ""}.
-            {" "}إذا احتجت لأكثر من ذلك، يمكنك طلب حزمة{" "}
-            <b>+{currentLimits.extraTypesPackSize} أنواع إضافية</b> مقابل{" "}
+            {" "}يمكنك طلب حزمة{" "}
+            <b>+{currentLimits.extraTypesPackSize} أنواع إضافية</b> (حتى الحد الأقصى 10 أنواع في الإطلاق التجريبي) مقابل{" "}
             <b>{currentLimits.extraTypesPackPriceJod} دنانير</b> تُدفع مرة واحدة مع اشتراكك الحالي عبر كليك (CliQ).
           </p>
 

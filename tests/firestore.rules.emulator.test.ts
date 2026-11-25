@@ -268,6 +268,16 @@ async function seedBaseFixtures(testEnv: RulesTestEnvironment): Promise<void> {
         projectCount: 1,
       })
     );
+    await setDoc(
+      doc(db, "tenants", "biz_legacy_high_quota"),
+      makeSeedTenant("biz_legacy_high_quota", "biz_legacy@workshop.jo", {
+        subscriptionStatus: "active",
+        planId: "business",
+        activeUntil: future30d,
+        extraCustomTypesQuota: 20, // محاكاة حساب قديم بحصة مرتفعة للتحقق من سقف الـ 10 أنواع
+        projectCount: 1,
+      })
+    );
 
     // مشاريع أولية للتحديث واختبارات العزل
     for (const uid of [
@@ -277,6 +287,7 @@ async function seedBaseFixtures(testEnv: RulesTestEnvironment): Promise<void> {
       "pro_user",
       "biz_user",
       "biz_plus_user",
+      "biz_legacy_high_quota",
     ]) {
       await setDoc(
         doc(db, "tenants", uid, "projects", "proj_existing"),
@@ -611,8 +622,105 @@ async function main() {
       );
     });
 
-    // 6. إصلاح تجاوز حدود الأنواع المخصصة (utypes) — رفض كل البنى غير الصالحة وتجاوز الحد
-    await runCase("رفض utypes كـ string أو map أو null أو قائمة أكبر من الحد والسماح بالحالات الصالحة", async () => {
+    // 6. إصلاح تجاوز حدود الأنواع المخصصة (سقف 10 أنواع وفحص جميع العناصر 0..9)
+    await runCase("سقف 10 أنواع مخصصة: 10 صالحة قبول، 11 رفض، النوع العاشر غير صالح رفض، وبدون name رفض", async () => {
+      const starterDb = asDb(
+        testEnv.authenticatedContext("starter_user", {
+          email: "starter@workshop.jo",
+          email_verified: true,
+        })
+      );
+      const proDb = asDb(
+        testEnv.authenticatedContext("pro_user", {
+          email: "pro@workshop.jo",
+          email_verified: true,
+        })
+      );
+      const bizDb = asDb(
+        testEnv.authenticatedContext("biz_user", {
+          email: "biz@workshop.jo",
+          email_verified: true,
+        })
+      );
+      const bizPlusDb = asDb(
+        testEnv.authenticatedContext("biz_plus_user", {
+          email: "biz_plus@workshop.jo",
+          email_verified: true,
+        })
+      );
+      const bizLegacyHighDb = asDb(
+        testEnv.authenticatedContext("biz_legacy_high_quota", {
+          email: "biz_legacy@workshop.jo",
+          email_verified: true,
+        })
+      );
+
+      const updateSnap = (db: Firestore, uid: string, snapshot: Record<string, unknown>) =>
+        updateDoc(doc(db, "tenants", uid, "projects", "proj_existing"), {
+          snapshot,
+          updatedAt: serverTimestamp(),
+        });
+
+      // utypes غير موجودة -> تُعامل كقائمة فارغة وتنجح على starter
+      await assertSucceeds(updateSnap(starterDb, "starter_user", { custom: {} }));
+
+      // utypes كـ string / map / null -> مرفوضة دائماً (بما فيها باقة Business)
+      await assertFails(updateSnap(starterDb, "starter_user", { utypes: "bypass" }));
+      await assertFails(updateSnap(bizDb, "biz_user", { utypes: "bypass" }));
+      await assertFails(
+        updateSnap(starterDb, "starter_user", { utypes: { "0": { name: "نوع" } } })
+      );
+      await assertFails(updateSnap(starterDb, "starter_user", { utypes: null }));
+
+      // نوع إضافي لا يملك name -> رفض
+      await assertFails(updateSnap(proDb, "pro_user", { utypes: [{ title: "بدون اسم" }] }));
+      await assertFails(updateSnap(bizDb, "biz_user", { utypes: [{}] }));
+
+      // اسم فارغ أو مسافات فقط أو عنصر ليس map -> رفض
+      await assertFails(updateSnap(proDb, "pro_user", { utypes: [123] }));
+      await assertFails(updateSnap(proDb, "pro_user", { utypes: [{ name: "" }] }));
+      await assertFails(updateSnap(proDb, "pro_user", { utypes: [{ name: "   " }] }));
+
+      // starter (حد 0) يرفض نوعاً واحداً
+      await assertFails(updateSnap(starterDb, "starter_user", { utypes: makeUtypes(1) }));
+
+      // pro (حد 2 حتى لو وُجد extraCustomTypesQuota) يقبل 2 ويرفض 3
+      await assertSucceeds(updateSnap(proDb, "pro_user", { utypes: makeUtypes(2) }));
+      await assertFails(updateSnap(proDb, "pro_user", { utypes: makeUtypes(3) }));
+
+      // business (حد 5 بدون حزمة إضافية) يقبل 5 ويرفض 6
+      await assertSucceeds(updateSnap(bizDb, "biz_user", { utypes: makeUtypes(5) }));
+      await assertFails(updateSnap(bizDb, "biz_user", { utypes: makeUtypes(6) }));
+
+      // 10 أنواع صالحة على business مع حزمة +5: قبول
+      await assertSucceeds(updateSnap(bizPlusDb, "biz_plus_user", { utypes: makeUtypes(10) }));
+
+      // 11 نوعاً: رفض على biz_plus_user وحتى على biz_legacy_high_quota (حصة قديمة 20)
+      await assertFails(updateSnap(bizPlusDb, "biz_plus_user", { utypes: makeUtypes(11) }));
+      await assertFails(
+        updateSnap(bizLegacyHighDb, "biz_legacy_high_quota", { utypes: makeUtypes(11) })
+      );
+
+      // النوع العاشر (الفهرس 9) ببنية غير صالحة أو بدون name: رفض
+      await assertFails(
+        updateSnap(bizPlusDb, "biz_plus_user", {
+          utypes: [...makeUtypes(9), "invalid_10th_item"],
+        })
+      );
+      await assertFails(
+        updateSnap(bizPlusDb, "biz_plus_user", {
+          utypes: [...makeUtypes(9), { label: "بدون حقل name" }],
+        })
+      );
+      await assertFails(
+        updateSnap(bizPlusDb, "biz_plus_user", {
+          utypes: [...makeUtypes(9), { name: "   " }],
+        })
+      );
+    });
+
+    // 7. إصلاح customFieldsWithinLimit ومحاولة تجاوز الحماية باستخدام باقة Business
+    await runCase("رفض مفاتيح custom غير المعروفة والقيم غير list (string/map) وتجاوز العلاقات ومحاولات تجاوز Business", async () => {
       const starterDb = asDb(
         testEnv.authenticatedContext("starter_user", {
           email: "starter@workshop.jo",
@@ -644,75 +752,13 @@ async function main() {
           updatedAt: serverTimestamp(),
         });
 
-      // utypes غير موجودة -> تُعامل كقائمة فارغة وتنجح على starter
-      await assertSucceeds(updateSnap(starterDb, "starter_user", { custom: {} }));
-
-      // utypes كـ string -> مرفوضة على starter و business
-      await assertFails(updateSnap(starterDb, "starter_user", { utypes: "bypass" }));
-      await assertFails(updateSnap(bizDb, "biz_user", { utypes: "bypass" }));
-
-      // utypes كـ map -> مرفوضة
-      await assertFails(
-        updateSnap(starterDb, "starter_user", { utypes: { "0": { name: "نوع" } } })
-      );
-
-      // utypes كـ null -> مرفوضة
-      await assertFails(updateSnap(starterDb, "starter_user", { utypes: null }));
-
-      // عنصر غير صالح داخل utypes -> مرفوض
-      await assertFails(updateSnap(proDb, "pro_user", { utypes: [123] }));
-      await assertFails(updateSnap(proDb, "pro_user", { utypes: [{ name: "" }] }));
-
-      // starter (حد 0) يرفض نوعاً واحداً
-      await assertFails(updateSnap(starterDb, "starter_user", { utypes: makeUtypes(1) }));
-
-      // pro (حد 2 حتى لو وُجد extraCustomTypesQuota) يقبل 2 ويرفض 3
-      await assertSucceeds(updateSnap(proDb, "pro_user", { utypes: makeUtypes(2) }));
-      await assertFails(updateSnap(proDb, "pro_user", { utypes: makeUtypes(3) }));
-
-      // business (حد 5 بدون حزمة إضافية) يقبل 5 ويرفض 6
-      await assertSucceeds(updateSnap(bizDb, "biz_user", { utypes: makeUtypes(5) }));
-      await assertFails(updateSnap(bizDb, "biz_user", { utypes: makeUtypes(6) }));
-
-      // business مع حزمة +5 (المجموع 10) يقبل 10 ويرفض 11
-      await assertSucceeds(updateSnap(bizPlusDb, "biz_plus_user", { utypes: makeUtypes(10) }));
-      await assertFails(updateSnap(bizPlusDb, "biz_plus_user", { utypes: makeUtypes(11) }));
-    });
-
-    // 7. إصلاح تجاوز حدود العلاقات المخصصة (custom) — رفض البنى غير الصالحة والعلاقات فوق الحد
-    await runCase("رفض custom غير الخريطة والقوائم غير الصالحة والمفاتيح المهربة والعلاقات فوق الحد", async () => {
-      const starterDb = asDb(
-        testEnv.authenticatedContext("starter_user", {
-          email: "starter@workshop.jo",
-          email_verified: true,
-        })
-      );
-      const proDb = asDb(
-        testEnv.authenticatedContext("pro_user", {
-          email: "pro@workshop.jo",
-          email_verified: true,
-        })
-      );
-      const bizDb = asDb(
-        testEnv.authenticatedContext("biz_user", {
-          email: "biz@workshop.jo",
-          email_verified: true,
-        })
-      );
-
-      const updateSnap = (db: Firestore, uid: string, snapshot: Record<string, unknown>) =>
-        updateDoc(doc(db, "tenants", uid, "projects", "proj_existing"), {
-          snapshot,
-          updatedAt: serverTimestamp(),
-        });
-
-      // custom ليست map (string / list / null) -> مرفوضة على starter وحتى على business (maxFields == -1)!
+      // custom ليست map (string / list / null / int) -> رفض حتى على باقة Business
       for (const badCustom of ["not-a-map", ["bad"], null, 42]) {
         await assertFails(updateSnap(starterDb, "starter_user", { custom: badCustom }));
         await assertFails(updateSnap(bizDb, "biz_user", { custom: badCustom }));
       }
 
-      // custom[key] ليست list -> مرفوضة على starter و business
+      // مفتاح custom بقيمة string -> رفض (على starter و pro و business)
       await assertFails(
         updateSnap(starterDb, "starter_user", {
           custom: { [BUILTIN_TYPE]: "not-a-list" },
@@ -720,18 +766,36 @@ async function main() {
       );
       await assertFails(
         updateSnap(bizDb, "biz_user", {
+          custom: { [BUILTIN_TYPE]: "string-bypass-on-business" },
+        })
+      );
+
+      // مفتاح custom بقيمة map -> رفض (على starter و pro و business)
+      await assertFails(
+        updateSnap(proDb, "pro_user", {
           custom: { [BUILTIN_TYPE]: { count: 99 } },
         })
       );
-
-      // مفتاح مجهول مهرب داخل custom -> مرفوض
       await assertFails(
-        updateSnap(starterDb, "starter_user", {
-          custom: { "مفتاح_مجهول_مهرب": makeFields(1) },
+        updateSnap(bizDb, "biz_user", {
+          custom: { [BUILTIN_TYPE]: { hacked: true } },
         })
       );
 
-      // starter (حد 2): يقبل 2 ويرفض 3
+      // مفتاح custom غير معروف -> رفض على starter و pro وحتى على business مع 10 أنواع
+      await assertFails(
+        updateSnap(starterDb, "starter_user", {
+          custom: { "مفتاح_غير_معروف": makeFields(1) },
+        })
+      );
+      await assertFails(
+        updateSnap(bizPlusDb, "biz_plus_user", {
+          utypes: makeUtypes(10),
+          custom: { "مفتاح_مجهول_على_بزنس": makeFields(1) },
+        })
+      );
+
+      // تجاوز عدد العلاقات المسموح: starter (حد 2) يقبل 2 ويرفض 3
       await assertSucceeds(
         updateSnap(starterDb, "starter_user", {
           custom: { [BUILTIN_TYPE]: makeFields(2) },
@@ -743,7 +807,7 @@ async function main() {
         })
       );
 
-      // pro (حد 5): يقبل 5 ويرفض 6
+      // تجاوز عدد العلاقات المسموح: pro (حد 5) يقبل 5 ويرفض 6 على الأساسي والمخصص
       await assertSucceeds(
         updateSnap(proDb, "pro_user", {
           utypes: makeUtypes(2),
@@ -758,12 +822,119 @@ async function main() {
           custom: { [BUILTIN_TYPE]: makeFields(6) },
         })
       );
+      await assertFails(
+        updateSnap(proDb, "pro_user", {
+          utypes: makeUtypes(2),
+          custom: { "نوع_مخصص_1": makeFields(6) },
+        })
+      );
 
-      // business (مفتوح مع بنية map/list سليمة): يقبل 12 علاقة
+      // باقة Business صالحة: 10 أنواع صالحة + علاقات على النوع العاشر والأساسي -> قبول
       await assertSucceeds(
-        updateSnap(bizDb, "biz_user", {
-          utypes: makeUtypes(5),
-          custom: { [BUILTIN_TYPE]: makeFields(12) },
+        updateSnap(bizPlusDb, "biz_plus_user", {
+          utypes: makeUtypes(10),
+          custom: {
+            [BUILTIN_TYPE]: makeFields(12),
+            "نوع_مخصص_10": makeFields(8),
+          },
+        })
+      );
+
+      // محاولة تجاوز الحماية على Business بوضع قيمة غير list داخل النوع العاشر -> رفض
+      await assertFails(
+        updateSnap(bizPlusDb, "biz_plus_user", {
+          utypes: makeUtypes(10),
+          custom: {
+            "نوع_مخصص_10": "not-a-list",
+          },
+        })
+      );
+    });
+
+    // 7ب. مراجعة سقف extraCustomTypesQuota (لا يتجاوز المجموع 10 أبداً)
+    await runCase("منع منح أو طلب حصة extraCustomTypesQuota تجعل إجمالي الأنواع المخصصة يتجاوز 10", async () => {
+      const adminDb = asDb(
+        testEnv.authenticatedContext(OWNER_UID, {
+          email: OWNER_EMAIL,
+          email_verified: true,
+        })
+      );
+      const bizDb = asDb(
+        testEnv.authenticatedContext("biz_user", {
+          email: "biz@workshop.jo",
+          email_verified: true,
+        })
+      );
+      const bizPlusDb = asDb(
+        testEnv.authenticatedContext("biz_plus_user", {
+          email: "biz_plus@workshop.jo",
+          email_verified: true,
+        })
+      );
+
+      // Business (base=5, extra=0) يطلب +5 (المجموع 10) -> قبول
+      await assertSucceeds(
+        setDoc(doc(bizDb, "activation_requests", "req_addon_ok"), {
+          tenantId: "biz_user",
+          ownerUid: "biz_user",
+          email: "biz@workshop.jo",
+          workshopName: "ورشة اختبار",
+          phone: "0790000001",
+          planId: "business",
+          billingCycle: "monthly",
+          cliqNote: "حزمة إضافية",
+          status: "pending",
+          reviewedBy: "",
+          requestType: "extra_types_addon",
+          extraTypesCount: 5,
+          addonPriceJod: 10,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // Business Plus (base=5, extra=5 = 10 بالفعل) يطلب +5 إضافية (المجموع 15 > 10) -> رفض
+      await assertFails(
+        setDoc(doc(bizPlusDb, "activation_requests", "req_addon_over10"), {
+          tenantId: "biz_plus_user",
+          ownerUid: "biz_plus_user",
+          email: "biz_plus@workshop.jo",
+          workshopName: "ورشة اختبار",
+          phone: "0790000001",
+          planId: "business",
+          billingCycle: "monthly",
+          cliqNote: "محاولة تجاوز 10",
+          status: "pending",
+          reviewedBy: "",
+          requestType: "extra_types_addon",
+          extraTypesCount: 5,
+          addonPriceJod: 10,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // المدير يمنح biz_user (base=5, extra=0 -> 5) المجموع 10 -> قبول
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "biz_user"), {
+          extraCustomTypesQuota: 5,
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // المدير يحاول منح biz_plus_user (base=5, extra=5 -> 10) المجموع 15 > 10 -> رفض
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "biz_plus_user"), {
+          extraCustomTypesQuota: 10,
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // المدير يحاول منح pro_user (لا تسمح بحزمة إضافية) حصة إضافية -> رفض
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "pro_user"), {
+          extraCustomTypesQuota: 3,
+          updatedAt: serverTimestamp(),
         })
       );
     });

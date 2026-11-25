@@ -316,6 +316,61 @@ export const ADVERSARIAL_SECURITY_CASES: AdversarialTestCase[] = [
     payload: { trialDaysDefault: 30, updatedBy: "adminUid", updatedAt: "REQUEST_TIME" },
     expected: "PERMISSION_DENIED",
   },
+  {
+    id: 22,
+    name: "Business Plan Exceeding 10 Custom Types Launch Cap (11 utypes)",
+    actor: { uid: "businessUser", email: "b@workshop.jo", email_verified: true },
+    operation: "update",
+    path: "/tenants/businessUser/projects/proj_1",
+    payload: {
+      snapshot: {
+        utypes: Array.from({ length: 11 }, (_, i) => ({ name: `نوع_${i + 1}` })),
+      },
+      updatedAt: "REQUEST_TIME",
+    },
+    expected: "PERMISSION_DENIED",
+  },
+  {
+    id: 23,
+    name: "10th Custom Type Missing name Field",
+    actor: { uid: "businessUser", email: "b@workshop.jo", email_verified: true },
+    operation: "update",
+    path: "/tenants/businessUser/projects/proj_1",
+    payload: {
+      snapshot: {
+        utypes: [
+          ...Array.from({ length: 9 }, (_, i) => ({ name: `نوع_${i + 1}` })),
+          { label: "بدون اسم" },
+        ],
+      },
+      updatedAt: "REQUEST_TIME",
+    },
+    expected: "PERMISSION_DENIED",
+  },
+  {
+    id: 24,
+    name: "Unknown Custom Key Smuggled on Business Plan",
+    actor: { uid: "businessUser", email: "b@workshop.jo", email_verified: true },
+    operation: "update",
+    path: "/tenants/businessUser/projects/proj_1",
+    payload: {
+      snapshot: {
+        utypes: [{ name: "نوع_1" }],
+        custom: { "مفتاح_غير_معروف": [] },
+      },
+      updatedAt: "REQUEST_TIME",
+    },
+    expected: "PERMISSION_DENIED",
+  },
+  {
+    id: 25,
+    name: "Granting extraCustomTypesQuota Beyond Total Cap of 10",
+    actor: { uid: "adminUid", email: "xtashtoush@gmail.com", email_verified: true },
+    operation: "update",
+    path: "/tenants/businessUser",
+    payload: { extraCustomTypesQuota: 10, updatedAt: "REQUEST_TIME" },
+    expected: "PERMISSION_DENIED",
+  },
 ];
 
 export const DIRTY_DOZEN_CASES = ADVERSARIAL_SECURITY_CASES;

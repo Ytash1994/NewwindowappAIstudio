@@ -28,6 +28,7 @@ import {
   DEFAULT_EXTRA_TYPES_PACK_SIZE,
   DEFAULT_TRIAL_DAYS,
   DEFAULT_WHATSAPP_PHONE,
+  LAUNCH_MAX_CUSTOM_TYPES,
   OWNER_ADMIN_EMAIL,
   buildExpiryReminderEmailContent,
   evaluateTenantAccess,
@@ -313,8 +314,9 @@ export function AdminPanel({
       auditLoadedRef.current = false;
       await loadCoreData();
       onToast(`تمت إضافة +${delta} أنواع مخصصة للورشة ${t.workshopName || t.email} ✓`);
-    } catch {
-      onToast("تعذر إضافة حصة الأنواع المخصصة");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      onToast(msg || "تعذر إضافة حصة الأنواع المخصصة", 3800);
     } finally {
       setBusyId(null);
     }
@@ -766,27 +768,34 @@ export function AdminPanel({
                             +7 أيام تجربة
                           </button>
                           {ev.state === "active" &&
-                            getPlanDefaultsById(plans.find((p) => p.id === t.planId) || { id: t.planId })
-                              .allowExtraTypesAddon && (
-                              <button
-                                type="button"
-                                className="btn sm p"
-                                disabled={isBusy}
-                                onClick={() =>
-                                  void handleGrantExtraTypes(
-                                    t,
-                                    getPlanDefaultsById(plans.find((p) => p.id === t.planId) || { id: t.planId })
-                                      .extraTypesPackSize
-                                  )
-                                }
-                              >
-                                +{
-                                  getPlanDefaultsById(plans.find((p) => p.id === t.planId) || { id: t.planId })
-                                    .extraTypesPackSize
-                                }{" "}
-                                أنواع إضافية
-                              </button>
-                            )}
+                            (() => {
+                              const pDef = getPlanDefaultsById(
+                                plans.find((p) => p.id === t.planId) || { id: t.planId }
+                              );
+                              if (!pDef.allowExtraTypesAddon) return null;
+                              const baseMax = Math.max(
+                                0,
+                                Math.min(LAUNCH_MAX_CUSTOM_TYPES, pDef.maxCustomTypes)
+                              );
+                              const curExtra = t.extraCustomTypesQuota || 0;
+                              const remaining = Math.max(
+                                0,
+                                LAUNCH_MAX_CUSTOM_TYPES - (baseMax + curExtra)
+                              );
+                              const grantDelta = Math.min(pDef.extraTypesPackSize, remaining);
+                              return (
+                                <button
+                                  type="button"
+                                  className="btn sm p"
+                                  disabled={isBusy || remaining <= 0}
+                                  onClick={() => void handleGrantExtraTypes(t, grantDelta)}
+                                >
+                                  {remaining > 0
+                                    ? `+${grantDelta} أنواع إضافية`
+                                    : `الحد الأقصى (${LAUNCH_MAX_CUSTOM_TYPES})`}
+                                </button>
+                              );
+                            })()}
                           <button
                             type="button"
                             className="btn sm"
@@ -1180,13 +1189,18 @@ export function AdminPanel({
                         <>
                           <div className="saas-form-row">
                             <label>
-                              <span>حد الأنواع الجديدة (0 ممنوع، -1 مفتوح)</span>
+                              <span>حد الأنواع الجديدة (0 ممنوع، الحد الأقصى {LAUNCH_MAX_CUSTOM_TYPES})</span>
                               <input
                                 type="number"
                                 dir="ltr"
+                                min={0}
+                                max={LAUNCH_MAX_CUSTOM_TYPES}
                                 value={pl.maxCustomTypes ?? def.maxCustomTypes}
                                 onChange={(e) => {
-                                  const val = Number(e.target.value);
+                                  const val = Math.max(
+                                    0,
+                                    Math.min(LAUNCH_MAX_CUSTOM_TYPES, Number(e.target.value) || 0)
+                                  );
                                   const next = plansDraft.slice();
                                   next[idx] = {
                                     ...pl,
