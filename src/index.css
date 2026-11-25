@@ -4222,11 +4222,15 @@ html[data-pal="flame"][data-theme] {
   align-items: center;
 }
 .saas-pass-wrap input {
-  padding-inline-end: 42px;
+  padding-left: 12px;
+  padding-right: 44px;
 }
 .saas-pass-eye {
   position: absolute;
-  inset-inline-end: 6px;
+  right: 6px;
+  left: auto;
+  top: 50%;
+  transform: translateY(-50%);
   width: 34px;
   height: 34px;
   border-radius: 10px;
