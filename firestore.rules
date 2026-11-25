@@ -1,0 +1,454 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ==================== PRIMITIVES ====================
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAuthenticatedUser() {
+      return request.auth != null &&
+        request.auth.token.email is string &&
+        request.auth.token.email.size() >= 3;
+    }
+
+    function isVerified() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    // Zero-lookup primary owner admin check (strictly requires verified email, safe for allow list)
+    function isOwnerAdmin() {
+      return isVerified() && request.auth.token.email == 'xtashtoush@gmail.com';
+    }
+
+    // Full admin check for single-document operations (strictly requires verified email)
+    function isAdmin() {
+      return isOwnerAdmin() || (
+        isVerified() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isTenantOwner(tenantId) {
+      return isAuthenticatedUser() && request.auth.uid == tenantId;
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function hasActiveTenantAccess(tenantData) {
+      return tenantData.role == 'admin' ||
+        (
+          tenantData.subscriptionStatus == 'active' &&
+          (tenantData.activeUntil == null || request.time <= tenantData.activeUntil)
+        ) ||
+        (
+          tenantData.subscriptionStatus == 'trialing' &&
+          tenantData.trialDays is int &&
+          tenantData.trialDays >= 0 &&
+          tenantData.trialDays <= 3650 &&
+          request.time <= tenantData.createdAt + duration.value(tenantData.trialDays, 'd')
+        );
+    }
+
+    // ==================== VALIDATION BLUEPRINTS ====================
+    function isValidAdminRecord(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'createdAt']) &&
+        isValidId(data.uid) &&
+        isValidString(data.email, 3, 200) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidPlatformConfig(data) {
+      return data.keys().hasAll([
+          'whatsappPhone', 'cliqAlias', 'cliqBankName', 'cliqHolderName',
+          'trialDaysDefault', 'supportNote', 'updatedBy', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'whatsappPhone', 'cliqAlias', 'cliqBankName', 'cliqHolderName',
+          'trialDaysDefault', 'supportNote', 'updatedBy', 'updatedAt'
+        ]) &&
+        isValidString(data.whatsappPhone, 5, 30) &&
+        isValidString(data.cliqAlias, 0, 100) &&
+        isValidString(data.cliqBankName, 0, 100) &&
+        isValidString(data.cliqHolderName, 0, 120) &&
+        data.trialDaysDefault is int && data.trialDaysDefault >= 0 && data.trialDaysDefault <= 90 &&
+        isValidString(data.supportNote, 0, 500) &&
+        isValidId(data.updatedBy) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPlan(data) {
+      return data.keys().hasAll([
+          'id', 'name', 'priceLabel', 'priceMonthlyJod', 'maxProjects',
+          'allowExport', 'allowCustomTypes', 'active', 'sortOrder', 'features', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'name', 'priceLabel', 'priceMonthlyJod', 'maxProjects',
+          'allowExport', 'allowCustomTypes', 'active', 'sortOrder', 'features', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.id.size() <= 40 &&
+        isValidString(data.name, 1, 80) &&
+        isValidString(data.priceLabel, 1, 60) &&
+        (data.priceMonthlyJod is int || data.priceMonthlyJod is float) &&
+        data.priceMonthlyJod >= 0 && data.priceMonthlyJod <= 10000 &&
+        data.maxProjects is int && data.maxProjects >= -1 && data.maxProjects <= 100000 &&
+        data.allowExport is bool &&
+        data.allowCustomTypes is bool &&
+        data.active is bool &&
+        data.sortOrder is int && data.sortOrder >= 0 && data.sortOrder <= 100 &&
+        data.features is list && data.features.size() <= 12 &&
+        (data.features.size() == 0 || (data.features[0] is string && data.features[0].size() <= 140)) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTenant(data, expectedUid) {
+      return data.keys().hasAll([
+          'ownerUid', 'email', 'displayName', 'workshopName', 'phone',
+          'role', 'subscriptionStatus', 'planId', 'trialDays',
+          'activeUntil', 'adminNote', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid', 'email', 'displayName', 'workshopName', 'phone',
+          'role', 'subscriptionStatus', 'planId', 'trialDays',
+          'activeUntil', 'adminNote', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == expectedUid &&
+        isValidString(data.email, 3, 200) &&
+        isValidString(data.displayName, 0, 120) &&
+        isValidString(data.workshopName, 0, 120) &&
+        isValidString(data.phone, 0, 30) &&
+        data.role in ['owner', 'admin'] &&
+        data.subscriptionStatus in ['trialing', 'active', 'expired', 'suspended'] &&
+        isValidId(data.planId) && data.planId.size() <= 40 &&
+        data.trialDays is int && data.trialDays >= 0 && data.trialDays <= 3650 &&
+        (data.activeUntil == null || data.activeUntil is timestamp) &&
+        isValidString(data.adminNote, 0, 500) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidProject(data, tenantId) {
+      return data.keys().hasAll([
+          'ownerUid', 'name', 'windowType', 'unit', 'windowCount',
+          'snapshot', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid', 'name', 'windowType', 'unit', 'windowCount',
+          'snapshot', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == tenantId &&
+        isValidString(data.name, 1, 120) &&
+        isValidString(data.windowType, 1, 100) &&
+        data.unit in ['m', 'cm', 'mm'] &&
+        data.windowCount is int && data.windowCount >= 0 && data.windowCount <= 1000 &&
+        data.snapshot is map && data.snapshot.keys().size() <= 30 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidActivationRequest(data) {
+      return data.keys().hasAll([
+          'tenantId', 'ownerUid', 'email', 'workshopName', 'phone',
+          'planId', 'billingCycle', 'cliqNote', 'status', 'reviewedBy',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'tenantId', 'ownerUid', 'email', 'workshopName', 'phone',
+          'planId', 'billingCycle', 'cliqNote', 'status', 'reviewedBy',
+          'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.tenantId) &&
+        isValidId(data.ownerUid) &&
+        data.tenantId == data.ownerUid &&
+        isValidString(data.email, 3, 200) &&
+        isValidString(data.workshopName, 1, 120) &&
+        isValidString(data.phone, 0, 30) &&
+        isValidId(data.planId) && data.planId.size() <= 40 &&
+        data.billingCycle in ['monthly', 'quarterly', 'yearly'] &&
+        isValidString(data.cliqNote, 0, 300) &&
+        data.status in ['pending', 'approved', 'rejected'] &&
+        isValidString(data.reviewedBy, 0, 128) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll([
+          'actorUid', 'actorEmail', 'action', 'targetTenantId', 'details', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'actorUid', 'actorEmail', 'action', 'targetTenantId', 'details', 'createdAt'
+        ]) &&
+        isValidId(data.actorUid) &&
+        data.actorUid == request.auth.uid &&
+        isValidString(data.actorEmail, 3, 200) &&
+        isValidString(data.action, 1, 80) &&
+        isValidString(data.targetTenantId, 0, 128) &&
+        isValidString(data.details, 0, 500) &&
+        data.createdAt is timestamp;
+    }
+
+    // ==================== CONNECTION PROBE ====================
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+
+    // ==================== ADMINS ====================
+    match /admins/{adminUid} {
+      allow get: if isVerified() && isValidId(adminUid) && (request.auth.uid == adminUid || isAdmin());
+      allow list: if isOwnerAdmin();
+      allow create: if isVerified() && isValidId(adminUid) && isValidAdminRecord(incoming()) &&
+        incoming().uid == adminUid &&
+        incoming().createdAt == request.time &&
+        isAdmin();
+      allow update: if false;
+      allow delete: if isVerified() && isValidId(adminUid) && isAdmin();
+    }
+
+    // ==================== PLATFORM CONFIG (CliQ & WhatsApp) ====================
+    match /config/{configId} {
+      allow get: if isSignedIn() && isValidId(configId);
+      allow list: if false;
+      allow create: if isVerified() && isValidId(configId) &&
+        isValidPlatformConfig(incoming()) &&
+        incoming().updatedBy == request.auth.uid &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+      allow update: if isVerified() && isValidId(configId) &&
+        isValidPlatformConfig(incoming()) &&
+        incoming().updatedBy == request.auth.uid &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'whatsappPhone', 'cliqAlias', 'cliqBankName', 'cliqHolderName',
+          'trialDaysDefault', 'supportNote', 'updatedBy', 'updatedAt'
+        ]) &&
+        isAdmin();
+      allow delete: if false;
+    }
+
+    // ==================== SUBSCRIPTION PLANS ====================
+    match /plans/{planId} {
+      allow get: if isSignedIn() && isValidId(planId);
+      allow list: if isSignedIn() && (resource.data.active == true || isOwnerAdmin());
+      allow create: if isVerified() && isValidId(planId) &&
+        isValidPlan(incoming()) &&
+        incoming().id == planId &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+      allow update: if isVerified() && isValidId(planId) &&
+        isValidPlan(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'priceLabel', 'priceMonthlyJod', 'maxProjects',
+          'allowExport', 'allowCustomTypes', 'active', 'sortOrder', 'features', 'updatedAt'
+        ]) &&
+        isAdmin();
+      allow delete: if isVerified() && isValidId(planId) && isAdmin();
+    }
+
+    // ==================== TENANTS (PII ISOLATED) ====================
+    match /tenants/{tenantId} {
+      allow get: if isAuthenticatedUser() && isValidId(tenantId) && (isTenantOwner(tenantId) || isAdmin());
+      allow list: if isOwnerAdmin();
+
+      // Self-registration: strictly enforced 7-day trial for standard users; free lifetime admin for verified owner
+      allow create: if isAuthenticatedUser() && isValidId(tenantId) &&
+        isValidTenant(incoming(), tenantId) &&
+        incoming().email == request.auth.token.email &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            isAdmin() &&
+            incoming().ownerUid == request.auth.uid &&
+            incoming().role == 'admin' &&
+            incoming().subscriptionStatus == 'active' &&
+            incoming().planId == 'owner_free' &&
+            incoming().activeUntil == null
+          ) ||
+          (
+            isTenantOwner(tenantId) &&
+            incoming().role == 'owner' &&
+            incoming().subscriptionStatus == 'trialing' &&
+            incoming().planId == 'trial' &&
+            incoming().trialDays == 7 &&
+            incoming().activeUntil == null &&
+            incoming().adminNote == ''
+          )
+        );
+
+      // Action-Based Update: Tier 1 (Admin subscription management) vs Tier 2 (Tenant profile update only)
+      allow update: if isAuthenticatedUser() && isValidId(tenantId) &&
+        isValidTenant(incoming(), existing().ownerUid) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'workshopName', 'phone', 'displayName', 'subscriptionStatus',
+              'planId', 'trialDays', 'activeUntil', 'adminNote', 'role', 'updatedAt'
+            ])
+          ) ||
+          (
+            isTenantOwner(tenantId) &&
+            incoming().role == existing().role &&
+            incoming().subscriptionStatus == existing().subscriptionStatus &&
+            incoming().planId == existing().planId &&
+            incoming().trialDays == existing().trialDays &&
+            incoming().activeUntil == existing().activeUntil &&
+            incoming().adminNote == existing().adminNote &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'workshopName', 'phone', 'displayName', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerified() && isValidId(tenantId) && isAdmin();
+
+      // ==================== TENANT PROJECTS (MASTER GATE) ====================
+      match /projects/{projectId} {
+        allow get: if isAuthenticatedUser() && isValidId(tenantId) && isValidId(projectId) &&
+          (
+            isAdmin() ||
+            (
+              isTenantOwner(tenantId) &&
+              exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
+              hasActiveTenantAccess(get(/databases/$(database)/documents/tenants/$(tenantId)).data)
+            )
+          );
+
+        allow list: if isAuthenticatedUser() && (
+          (request.auth.uid == tenantId && resource.data.ownerUid == request.auth.uid) ||
+          isOwnerAdmin()
+        );
+
+        // Master Gate: parent tenant must exist AND have active subscription or active 7-day trial
+        allow create: if isAuthenticatedUser() && isValidId(tenantId) && isValidId(projectId) &&
+          isValidProject(incoming(), tenantId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          (
+            isAdmin() ||
+            (
+              isTenantOwner(tenantId) &&
+              exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
+              hasActiveTenantAccess(get(/databases/$(database)/documents/tenants/$(tenantId)).data)
+            )
+          );
+
+        allow update: if isAuthenticatedUser() && isValidId(tenantId) && isValidId(projectId) &&
+          isValidProject(incoming(), existing().ownerUid) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'windowType', 'unit', 'windowCount', 'snapshot', 'updatedAt'
+          ]) &&
+          (
+            isAdmin() ||
+            (
+              isTenantOwner(tenantId) &&
+              exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
+              hasActiveTenantAccess(get(/databases/$(database)/documents/tenants/$(tenantId)).data)
+            )
+          );
+
+        allow delete: if isAuthenticatedUser() && isValidId(tenantId) && isValidId(projectId) &&
+          (
+            isAdmin() ||
+            (
+              isTenantOwner(tenantId) &&
+              exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
+              hasActiveTenantAccess(get(/databases/$(database)/documents/tenants/$(tenantId)).data)
+            )
+          );
+      }
+    }
+
+    // ==================== ACTIVATION REQUESTS (CliQ / WhatsApp) ====================
+    match /activation_requests/{requestId} {
+      allow get: if isAuthenticatedUser() && isValidId(requestId) &&
+        (resource.data.ownerUid == request.auth.uid || isAdmin());
+
+      allow list: if isAuthenticatedUser() && (
+        resource.data.ownerUid == request.auth.uid || isOwnerAdmin()
+      );
+
+      allow create: if isAuthenticatedUser() && isValidId(requestId) &&
+        isValidActivationRequest(incoming()) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().tenantId == request.auth.uid &&
+        incoming().email == request.auth.token.email &&
+        incoming().status == 'pending' &&
+        incoming().reviewedBy == '' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/tenants/$(request.auth.uid));
+
+      // Terminal State Locking: only Admin can approve/reject; users cannot mutate after terminal state
+      allow update: if isAuthenticatedUser() && isValidId(requestId) &&
+        isValidActivationRequest(incoming()) &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().tenantId == existing().tenantId &&
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            isAdmin() &&
+            incoming().reviewedBy == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reviewedBy', 'updatedAt'])
+          ) ||
+          (
+            existing().ownerUid == request.auth.uid &&
+            existing().status == 'pending' &&
+            incoming().status == 'pending' &&
+            incoming().reviewedBy == existing().reviewedBy &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['cliqNote', 'phone', 'planId', 'billingCycle', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isVerified() && isValidId(requestId) && isAdmin();
+    }
+
+    // ==================== IMMUTABLE AUDIT LOGS ====================
+    match /audit_logs/{logId} {
+      allow get: if isVerified() && isValidId(logId) && isAdmin();
+      allow list: if isOwnerAdmin();
+      allow create: if isVerified() && isValidId(logId) &&
+        isValidAuditLog(incoming()) &&
+        incoming().createdAt == request.time &&
+        isAdmin();
+      allow update: if false;
+      allow delete: if false;
+    }
+  }
+}

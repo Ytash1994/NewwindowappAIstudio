@@ -1,4 +1,81 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  ArrowRight,
+  ClipboardCopy,
+  ClipboardList,
+  Copy,
+  CreditCard,
+  Download,
+  Eye,
+  FilePlus2,
+  FileSpreadsheet,
+  FileText,
+  FolderOpen,
+  GripVertical,
+  Hash,
+  HelpCircle,
+  Layers,
+  LifeBuoy,
+  Lock,
+  LogOut,
+  MessageSquare,
+  Moon,
+  Palette,
+  Plus,
+  RotateCcw,
+  Ruler,
+  Save,
+  Search,
+  Settings,
+  Share2,
+  Shield,
+  SlidersHorizontal,
+  Sun,
+  Trash2,
+  Upload,
+  Wrench,
+} from "lucide-react";
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+  updateProfile,
+} from "firebase/auth";
+import type { User } from "firebase/auth";
+import { auth, googleProvider } from "./firebase";
+import { AuthGateScreen } from "./saas/AuthGateScreen";
+import type { EmailSignUpPayload } from "./saas/AuthGateScreen";
+import { SubscriptionModal } from "./saas/SubscriptionModal";
+import { AdminPanel } from "./saas/AdminPanel";
+import {
+  DEFAULT_PLANS,
+  DEFAULT_PLATFORM_CONFIG,
+  evaluateTenantAccess,
+  isOwnerAdminEmail,
+} from "./saas/types";
+import type {
+  ActivationRequestDoc,
+  PlatformConfig,
+  SubscriptionPlan,
+  TenantAccount,
+} from "./saas/types";
+import {
+  deleteCloudProject,
+  ensureTenantAndDefaults,
+  renameCloudProject,
+  saveCloudProject,
+  subscribeAllActivationRequests,
+  subscribeMyActivationRequests,
+  subscribePlans,
+  subscribePlatformConfig,
+  subscribeTenant,
+  subscribeTenantProjects,
+} from "./saas/service";
 import appIconUrl from "./assets/app-icon.png";
 import Splash from "./components/Splash";
 import {
@@ -87,6 +164,8 @@ const PALS: [string, string, string][] = [
 ];
 
 const LEGACY_PAL_MAP: Record<string, string> = {
+  promax: "mouse",
+  industrial: "mouse",
   bolt: "blue",
   teal: "emerald",
   forest: "emerald",
@@ -397,6 +476,19 @@ function ScaledDecimalInput({
 
 export default function App() {
   const [showSplash, setShowSplash] = useState(true);
+  const [authReady, setAuthReady] = useState(false);
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authError, setAuthError] = useState("");
+  const [tenant, setTenant] = useState<TenantAccount | null>(null);
+  const [tenantLoaded, setTenantLoaded] = useState(false);
+  const [plans, setPlans] = useState<SubscriptionPlan[]>(DEFAULT_PLANS);
+  const [platformConfig, setPlatformConfig] = useState<PlatformConfig>(DEFAULT_PLATFORM_CONFIG);
+  const [myRequests, setMyRequests] = useState<ActivationRequestDoc[]>([]);
+  const [adminPendingCount, setAdminPendingCount] = useState(0);
+  const [subModalOpen, setSubModalOpen] = useState(false);
+  const [adminPanelOpen, setAdminPanelOpen] = useState(false);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+
   const [state, setState] = useState<AppState>(() => loadInitialState());
   const [projects, setProjects] = useState<SavedProject[]>(() => loadSavedProjects());
   const [pjName, setPjName] = useState<string>("");
@@ -469,12 +561,25 @@ export default function App() {
   const [snap3, setSnap3] = useState<string | null>(null);
   const [relUndo, setRelUndo] = useState<string[]>([]);
   const undoTimerRef = useRef(0);
-  const [dragUnit, setDragUnit] = useState<{ id: string; targetId: string | null; pos: "before" | "after" } | null>(null);
+  const [dragUnit, setDragUnit] = useState<{
+    id: string;
+    targetId: string | null;
+    pos: "before" | "after";
+    dy: number;
+  } | null>(null);
   const [dragKid, setDragKid] = useState<{
     unitId: string;
     fieldId: string;
     targetFieldId: string | null;
     pos: "before" | "after";
+    dy: number;
+  } | null>(null);
+  const [dragRow, setDragRow] = useState<{
+    idx: number;
+    targetIdx: number | null;
+    pos: "before" | "after";
+    dx: number;
+    dy: number;
   } | null>(null);
   const dragCleanupRef = useRef<(() => void) | null>(null);
 
@@ -515,9 +620,231 @@ export default function App() {
     toastTimerRef.current = window.setTimeout(() => setToastOn(false), ms);
   }, []);
 
+  const pendingSignupProfileRef = useRef<{ workshopName?: string; phone?: string } | undefined>(
+    undefined
+  );
+
   // Derived Runtime Catalog & Results
   const cat: RuntimeCatalog = useMemo(() => createRuntimeCatalog(state), [state]);
   const res = useMemo(() => buildResults(state, negHighlightedRows), [state, negHighlightedRows]);
+
+  const isAdminUser = useMemo(
+    () =>
+      Boolean(
+        tenant?.role === "admin" ||
+          (isOwnerAdminEmail(authUser?.email) && Boolean(authUser?.emailVerified))
+      ),
+    [tenant?.role, authUser?.email, authUser?.emailVerified]
+  );
+
+  const tenantAccess = useMemo(
+    () => evaluateTenantAccess(tenant, nowTick),
+    [tenant, nowTick]
+  );
+
+  const activePlan = useMemo(() => {
+    if (isAdminUser) return null;
+    if (!tenant || tenant.planId === "trial") return null;
+    return plans.find((p) => p.id === tenant.planId) || null;
+  }, [isAdminUser, tenant, plans]);
+
+  // PDF & Excel saving/sharing is disallowed during the free trial and on the cheapest (starter) plan
+  const canExportFiles = useMemo(() => {
+    if (isAdminUser) return true;
+    if (!tenant || tenantAccess.state !== "active") return false;
+    return Boolean(activePlan?.allowExport);
+  }, [isAdminUser, tenant, tenantAccess.state, activePlan]);
+
+  // Periodic tick so expired trials lock automatically without requiring page reload
+  useEffect(() => {
+    const id = window.setInterval(() => setNowTick(Date.now()), 60000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Firebase Auth listener
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setAuthUser(u);
+      setAuthReady(true);
+      if (!u) {
+        setTenant(null);
+        setTenantLoaded(false);
+        setMyRequests([]);
+        setAdminPendingCount(0);
+        setAdminPanelOpen(false);
+        setSubModalOpen(false);
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // Bootstrap tenant record + live Firestore subscriptions
+  useEffect(() => {
+    if (!authUser) return;
+    let active = true;
+    let unsubTenant: (() => void) | null = null;
+    let unsubConfig: (() => void) | null = null;
+    let unsubPlans: (() => void) | null = null;
+    let unsubReqs: (() => void) | null = null;
+    let unsubAdminReqs: (() => void) | null = null;
+
+    const pendingProfile = pendingSignupProfileRef.current;
+    pendingSignupProfileRef.current = undefined;
+
+    setTenantLoaded(false);
+    ensureTenantAndDefaults(authUser, pendingProfile)
+      .then((initialTenant) => {
+        if (!active) return;
+        setTenant(initialTenant);
+        setTenantLoaded(true);
+        const ownerAdmin =
+          initialTenant.role === "admin" ||
+          (isOwnerAdminEmail(authUser.email) && Boolean(authUser.emailVerified));
+
+        unsubTenant = subscribeTenant(authUser.uid, (t) => {
+          if (active && t) setTenant(t);
+        });
+        unsubConfig = subscribePlatformConfig((cfg) => {
+          if (active) setPlatformConfig(cfg);
+        });
+        unsubPlans = subscribePlans(ownerAdmin, (pls) => {
+          if (active) setPlans(pls);
+        });
+        unsubReqs = subscribeMyActivationRequests(authUser.uid, (reqs) => {
+          if (active) setMyRequests(reqs);
+        });
+        if (ownerAdmin) {
+          unsubAdminReqs = subscribeAllActivationRequests((allReqs) => {
+            if (active) setAdminPendingCount(allReqs.filter((r) => r.status === "pending").length);
+          });
+        }
+      })
+      .catch((err) => {
+        if (!active) return;
+        setAuthError(err instanceof Error ? err.message : "تعذر تحميل بيانات الحساب");
+        setTenantLoaded(true);
+      });
+
+    return () => {
+      active = false;
+      unsubTenant?.();
+      unsubConfig?.();
+      unsubPlans?.();
+      unsubReqs?.();
+      unsubAdminReqs?.();
+    };
+  }, [authUser]);
+
+  // Real-time cloud projects sync for active tenants
+  useEffect(() => {
+    if (!authUser || !tenantLoaded || !tenantAccess.allowed) return;
+    const unsub = subscribeTenantProjects(
+      authUser.uid,
+      (cloudProjects) => {
+        setProjects(cloudProjects);
+      },
+      () => {
+        toast("تعذر مزامنة المشاريع السحابية، تحقق من حالة الاشتراك", 3200);
+      }
+    );
+    return () => unsub();
+  }, [authUser, tenantLoaded, tenantAccess.allowed, toast]);
+
+  const mapAuthError = useCallback((err: unknown): string => {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("popup-closed-by-user")) {
+      return "تم إغلاق نافذة تسجيل الدخول قبل إتمام العملية.";
+    }
+    if (msg.includes("email-already-in-use")) {
+      return "هذا البريد الإلكتروني مسجل مسبقاً. اختر «تسجيل الدخول» أو استخدم استعادة كلمة المرور.";
+    }
+    if (
+      msg.includes("invalid-credential") ||
+      msg.includes("wrong-password") ||
+      msg.includes("user-not-found")
+    ) {
+      return "البريد الإلكتروني أو كلمة المرور غير صحيحة.";
+    }
+    if (msg.includes("invalid-email")) {
+      return "صيغة البريد الإلكتروني غير صحيحة.";
+    }
+    if (msg.includes("weak-password")) {
+      return "كلمة المرور ضعيفة، يرجى استخدام 6 أحرف على الأقل.";
+    }
+    if (msg.includes("too-many-requests")) {
+      return "محاولات كثيرة جداً، يرجى الانتظار قليلاً ثم المحاولة مرة أخرى.";
+    }
+    if (msg.includes("operation-not-allowed")) {
+      return "تسجيل الدخول بالبريد وكلمة المرور غير مفعّل بعد في Firebase Console (Authentication → Sign-in method → Email/Password).";
+    }
+    return "تعذر إتمام العملية، يرجى المحاولة مرة أخرى.";
+  }, []);
+
+  const handleGoogleSignIn = useCallback(async () => {
+    setAuthError("");
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (err) {
+      setAuthError(mapAuthError(err));
+    }
+  }, [mapAuthError]);
+
+  const handleEmailSignIn = useCallback(
+    async (email: string, password: string) => {
+      setAuthError("");
+      try {
+        await signInWithEmailAndPassword(auth, email.trim(), password);
+      } catch (err) {
+        setAuthError(mapAuthError(err));
+      }
+    },
+    [mapAuthError]
+  );
+
+  const handleEmailSignUp = useCallback(
+    async (payload: EmailSignUpPayload) => {
+      setAuthError("");
+      pendingSignupProfileRef.current = {
+        workshopName: payload.workshopName,
+        phone: payload.phone,
+      };
+      try {
+        const cred = await createUserWithEmailAndPassword(
+          auth,
+          payload.email.trim(),
+          payload.password
+        );
+        if (payload.workshopName.trim()) {
+          await updateProfile(cred.user, { displayName: payload.workshopName.trim() });
+        }
+      } catch (err) {
+        pendingSignupProfileRef.current = undefined;
+        setAuthError(mapAuthError(err));
+      }
+    },
+    [mapAuthError]
+  );
+
+  const handleForgotPassword = useCallback(
+    async (email: string): Promise<boolean> => {
+      setAuthError("");
+      try {
+        await sendPasswordResetEmail(auth, email.trim());
+        return true;
+      } catch (err) {
+        setAuthError(mapAuthError(err));
+        return false;
+      }
+    },
+    [mapAuthError]
+  );
+
+  const handleSignOut = useCallback(async () => {
+    await signOut(auth);
+    setProjects([]);
+    setPjName("");
+    toast("تم تسجيل الخروج");
+  }, [toast]);
 
   // Apply Theme, Palette & Font Scale to <html>
   useEffect(() => {
@@ -611,6 +938,52 @@ export default function App() {
       // ignore
     }
   }, [projects]);
+
+  // Escape-key dismissal for all open dialogs (WCAG / Pro Max escape-routes)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (exitPromptOpen) {
+        setExitPromptOpen(false);
+        window.history.pushState({ step: state.step }, "");
+      } else if (confirmDlg) {
+        setConfirmDlg(null);
+      } else if (badgeModalIdx !== null) {
+        setBadgeModalIdx(null);
+      } else if (copyByNumOpen) {
+        setCopyByNumOpen(false);
+      } else if (xlImportState) {
+        setXlImportState(null);
+      } else if (altOpen) {
+        setAltOpen(false);
+      } else if (saveOpen) {
+        setSaveOpen(false);
+      } else if (pendChoices) {
+        setPendChoices(null);
+        pendAfterRef.current = null;
+      } else if (welOpen) {
+        setWelOpen(false);
+        try {
+          localStorage.setItem(WELCOME_KEY, "1");
+        } catch {
+          // ignore
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    exitPromptOpen,
+    confirmDlg,
+    badgeModalIdx,
+    copyByNumOpen,
+    xlImportState,
+    altOpen,
+    saveOpen,
+    pendChoices,
+    welOpen,
+    state.step,
+  ]);
 
   // Show welcome modal on first visit after Splash closes
   useEffect(() => {
@@ -1153,7 +1526,7 @@ export default function App() {
     setOpenPendingBarIdx(null);
     setEditingNameIdx(null);
     setState((prev) => ({ ...prev, rows: withTrailingEmpty(kept) }));
-    toast(`تم حذف ${removed} ${removed === 1 ? "صف فارغ" : "صفوف فارغة"} 🗑`);
+    toast(`تم حذف ${removed} ${removed === 1 ? "صف فارغ" : "صفوف فارغة"}`);
   };
 
   const handleRemovePendingRows = (indices: Set<number>) => {
@@ -1166,7 +1539,7 @@ export default function App() {
     const rem = findNeedChoice(updatedRows, pendChoices);
     if (rem.length) {
       setPendChoices(rem);
-      toast(`تم حذف ${indices.size === 1 ? "الصف" : `${indices.size} صفوف`} 🗑`);
+      toast(`تم حذف ${indices.size === 1 ? "الصف" : `${indices.size} صفوف`}`);
     } else {
       const cb = pendAfterRef.current;
       pendAfterRef.current = null;
@@ -1261,7 +1634,7 @@ export default function App() {
   };
 
   // ---------- Projects Management ----------
-  const handleSaveCurrentProject = () => {
+  const handleSaveCurrentProject = async () => {
     const name = clean(newProjName).trim();
     if (!name) {
       toast("اكتب اسم المشروع أولاً");
@@ -1269,9 +1642,34 @@ export default function App() {
     }
     const { raw: _ignored, ...rest } = state;
     void _ignored;
+
+    const existing = projects.find((p) => p.name === name);
+    if (
+      !existing &&
+      !isAdminUser &&
+      activePlan &&
+      activePlan.maxProjects >= 0 &&
+      projects.length >= activePlan.maxProjects
+    ) {
+      toast(`وصلت للحد الأقصى للمشاريع في باقتك (${activePlan.maxProjects} مشروع). قم بترقية الباقة.`, 4000);
+      setSubModalOpen(true);
+      return;
+    }
+
+    if (authUser && tenantAccess.allowed) {
+      try {
+        await saveCloudProject(authUser.uid, existing?.id || null, name, rest);
+        setPjName(name);
+        setNewProjName(name);
+        toast(`تم حفظ مشروع «${name}» سحابياً ✓`);
+      } catch {
+        toast("تعذر حفظ المشروع — تحقق من صلاحية الاشتراك", 3500);
+      }
+      return;
+    }
+
     const nowIso = new Date().toISOString();
     setProjects((prev) => {
-      const existing = prev.find((p) => p.name === name);
       if (existing) {
         return prev.map((p) => (p.id === existing.id ? { ...p, updatedAt: nowIso, data: rest } : p));
       }
@@ -1554,26 +1952,72 @@ export default function App() {
     });
   };
 
+  const reorderRow = (fromIdx: number, targetIdx: number, pos: "before" | "after") => {
+    if (fromIdx === targetIdx) return;
+    setDeletedUndo(null);
+    setState((prev) => {
+      const lastIdx = prev.rows.length - 1;
+      const hasTrailingBlank = lastIdx >= 0 && isRowBlank(prev.rows[lastIdx]);
+      const active = hasTrailingBlank ? prev.rows.slice(0, lastIdx) : prev.rows.slice();
+      if (fromIdx < 0 || fromIdx >= active.length || targetIdx < 0 || targetIdx >= active.length) {
+        return prev;
+      }
+      const [moved] = active.splice(fromIdx, 1);
+      const adjTarget = fromIdx < targetIdx ? targetIdx - 1 : targetIdx;
+      const insertIdx = pos === "after" ? adjTarget + 1 : adjTarget;
+      active.splice(Math.max(0, Math.min(active.length, insertIdx)), 0, moved);
+      return { ...prev, rows: withTrailingEmpty(active) };
+    });
+    toast("تم تغيير ترتيب الشباك", 1400);
+  };
+
   useEffect(() => {
     return () => {
       dragCleanupRef.current?.();
     };
   }, []);
 
-  const beginUnitDrag = (unitId: string) => {
+  const suppressNextClickOnce = () => {
+    const blocker = (cev: MouseEvent) => {
+      cev.preventDefault();
+      cev.stopPropagation();
+    };
+    window.addEventListener("click", blocker, { capture: true, once: true });
+    window.setTimeout(() => {
+      window.removeEventListener("click", blocker, { capture: true });
+    }, 450);
+  };
+
+  const beginUnitDrag = (
+    unitId: string,
+    startClientY: number,
+    pointerId?: number,
+    captureEl?: HTMLElement | null
+  ) => {
     dragCleanupRef.current?.();
+    try {
+      window.getSelection?.()?.removeAllRanges?.();
+    } catch {
+      // ignore
+    }
+    if (captureEl && typeof pointerId === "number") {
+      try {
+        captureEl.setPointerCapture(pointerId);
+      } catch {
+        // ignore
+      }
+    }
     document.body.classList.add("is-dragging");
+    const startScrollY = window.scrollY;
     let latestTarget: string | null = null;
     let latestPos: "before" | "after" = "before";
-    setDragUnit({ id: unitId, targetId: null, pos: "before" });
+    let finished = false;
+    setDragUnit({ id: unitId, targetId: null, pos: "before", dy: 0 });
 
-    const blockTouchScroll = (ev: TouchEvent) => {
-      if (ev.cancelable) ev.preventDefault();
-    };
-
-    const onMove = (ev: PointerEvent) => {
-      if (ev.clientY < 85) window.scrollBy(0, -14);
-      else if (ev.clientY > window.innerHeight - 95) window.scrollBy(0, 14);
+    const handleCoords = (clientY: number) => {
+      if (finished) return;
+      if (clientY < 85) window.scrollBy(0, -14);
+      else if (clientY > window.innerHeight - 95) window.scrollBy(0, 14);
 
       const els = Array.from(document.querySelectorAll<HTMLElement>("[data-drag-unit]"));
       let bestId: string | null = null;
@@ -1585,30 +2029,67 @@ export default function App() {
         if (!uid || uid === unitId) return;
         const rect = el.getBoundingClientRect();
         const mid = rect.top + rect.height / 2;
-        const dist = Math.abs(ev.clientY - mid);
+        const dist = Math.abs(clientY - mid);
         if (dist < bestDist) {
           bestDist = dist;
           bestId = uid;
-          bestPos = ev.clientY < mid ? "before" : "after";
+          bestPos = clientY < mid ? "before" : "after";
         }
       });
 
       latestTarget = bestId;
       latestPos = bestPos;
-      setDragUnit({ id: unitId, targetId: bestId, pos: bestPos });
+      const dy = clientY - startClientY + (window.scrollY - startScrollY);
+      setDragUnit({ id: unitId, targetId: bestId, pos: bestPos, dy });
+    };
+
+    const onPointerMove = (ev: PointerEvent) => {
+      if (typeof pointerId === "number" && ev.pointerId !== pointerId) return;
+      handleCoords(ev.clientY);
+    };
+
+    const onTouchMove = (ev: TouchEvent) => {
+      if (ev.cancelable) ev.preventDefault();
+      const t = ev.touches[0];
+      if (t) handleCoords(t.clientY);
+    };
+
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        latestTarget = null;
+        cleanup();
+      }
     };
 
     const cleanup = () => {
+      if (finished) return;
+      finished = true;
       document.body.classList.remove("is-dragging");
-      window.removeEventListener("touchmove", blockTouchScroll);
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", cleanup);
+      if (captureEl && typeof pointerId === "number") {
+        try {
+          if (captureEl.hasPointerCapture(pointerId)) captureEl.releasePointerCapture(pointerId);
+        } catch {
+          // ignore
+        }
+      }
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onEnd);
+      window.removeEventListener("touchcancel", onCancel);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("mouseup", onEnd);
+      window.removeEventListener("keydown", onKeyDown);
       dragCleanupRef.current = null;
       setDragUnit(null);
     };
 
-    const onUp = () => {
+    const onCancel = () => {
+      latestTarget = null;
+      cleanup();
+    };
+
+    const onEnd = () => {
+      if (finished) return;
       const tid = latestTarget;
       const pos = latestPos;
       cleanup();
@@ -1618,26 +2099,46 @@ export default function App() {
     };
 
     dragCleanupRef.current = cleanup;
-    window.addEventListener("touchmove", blockTouchScroll, { passive: false });
-    window.addEventListener("pointermove", onMove, { passive: true });
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", cleanup);
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onEnd);
+    window.addEventListener("touchcancel", onCancel);
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("mouseup", onEnd);
+    window.addEventListener("keydown", onKeyDown);
   };
 
-  const beginKidDrag = (unitId: string, fieldId: string) => {
+  const beginKidDrag = (
+    unitId: string,
+    fieldId: string,
+    startClientY: number,
+    pointerId?: number,
+    captureEl?: HTMLElement | null
+  ) => {
     dragCleanupRef.current?.();
+    try {
+      window.getSelection?.()?.removeAllRanges?.();
+    } catch {
+      // ignore
+    }
+    if (captureEl && typeof pointerId === "number") {
+      try {
+        captureEl.setPointerCapture(pointerId);
+      } catch {
+        // ignore
+      }
+    }
     document.body.classList.add("is-dragging");
+    const startScrollY = window.scrollY;
     let latestTarget: string | null = null;
     let latestPos: "before" | "after" = "before";
-    setDragKid({ unitId, fieldId, targetFieldId: null, pos: "before" });
+    let finished = false;
+    setDragKid({ unitId, fieldId, targetFieldId: null, pos: "before", dy: 0 });
 
-    const blockTouchScroll = (ev: TouchEvent) => {
-      if (ev.cancelable) ev.preventDefault();
-    };
-
-    const onMove = (ev: PointerEvent) => {
-      if (ev.clientY < 85) window.scrollBy(0, -14);
-      else if (ev.clientY > window.innerHeight - 95) window.scrollBy(0, 14);
+    const handleCoords = (clientY: number) => {
+      if (finished) return;
+      if (clientY < 85) window.scrollBy(0, -14);
+      else if (clientY > window.innerHeight - 95) window.scrollBy(0, 14);
 
       const els = Array.from(document.querySelectorAll<HTMLElement>("[data-drag-kid-id]"));
       let bestId: string | null = null;
@@ -1650,30 +2151,67 @@ export default function App() {
         if (!fid || fid === fieldId) return;
         const rect = el.getBoundingClientRect();
         const mid = rect.top + rect.height / 2;
-        const dist = Math.abs(ev.clientY - mid);
+        const dist = Math.abs(clientY - mid);
         if (dist < bestDist) {
           bestDist = dist;
           bestId = fid;
-          bestPos = ev.clientY < mid ? "before" : "after";
+          bestPos = clientY < mid ? "before" : "after";
         }
       });
 
       latestTarget = bestId;
       latestPos = bestPos;
-      setDragKid({ unitId, fieldId, targetFieldId: bestId, pos: bestPos });
+      const dy = clientY - startClientY + (window.scrollY - startScrollY);
+      setDragKid({ unitId, fieldId, targetFieldId: bestId, pos: bestPos, dy });
+    };
+
+    const onPointerMove = (ev: PointerEvent) => {
+      if (typeof pointerId === "number" && ev.pointerId !== pointerId) return;
+      handleCoords(ev.clientY);
+    };
+
+    const onTouchMove = (ev: TouchEvent) => {
+      if (ev.cancelable) ev.preventDefault();
+      const t = ev.touches[0];
+      if (t) handleCoords(t.clientY);
+    };
+
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        latestTarget = null;
+        cleanup();
+      }
     };
 
     const cleanup = () => {
+      if (finished) return;
+      finished = true;
       document.body.classList.remove("is-dragging");
-      window.removeEventListener("touchmove", blockTouchScroll);
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", cleanup);
+      if (captureEl && typeof pointerId === "number") {
+        try {
+          if (captureEl.hasPointerCapture(pointerId)) captureEl.releasePointerCapture(pointerId);
+        } catch {
+          // ignore
+        }
+      }
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onEnd);
+      window.removeEventListener("touchcancel", onCancel);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("mouseup", onEnd);
+      window.removeEventListener("keydown", onKeyDown);
       dragCleanupRef.current = null;
       setDragKid(null);
     };
 
-    const onUp = () => {
+    const onCancel = () => {
+      latestTarget = null;
+      cleanup();
+    };
+
+    const onEnd = () => {
+      if (finished) return;
       const tid = latestTarget;
       const pos = latestPos;
       cleanup();
@@ -1683,15 +2221,141 @@ export default function App() {
     };
 
     dragCleanupRef.current = cleanup;
-    window.addEventListener("touchmove", blockTouchScroll, { passive: false });
-    window.addEventListener("pointermove", onMove, { passive: true });
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", cleanup);
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onEnd);
+    window.addEventListener("touchcancel", onCancel);
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("mouseup", onEnd);
+    window.addEventListener("keydown", onKeyDown);
+  };
+
+  const beginRowDrag = (
+    rowIdx: number,
+    startClientX: number,
+    startClientY: number,
+    pointerId?: number,
+    captureEl?: HTMLElement | null
+  ) => {
+    dragCleanupRef.current?.();
+    try {
+      window.getSelection?.()?.removeAllRanges?.();
+    } catch {
+      // ignore
+    }
+    if (captureEl && typeof pointerId === "number") {
+      try {
+        captureEl.setPointerCapture(pointerId);
+      } catch {
+        // ignore
+      }
+    }
+    document.body.classList.add("is-dragging");
+    const startScrollY = window.scrollY;
+    let latestTarget: number | null = null;
+    let latestPos: "before" | "after" = "before";
+    let finished = false;
+    setDragRow({ idx: rowIdx, targetIdx: null, pos: "before", dx: 0, dy: 0 });
+
+    const handleCoords = (clientX: number, clientY: number) => {
+      if (finished) return;
+      if (clientY < 85) window.scrollBy(0, -14);
+      else if (clientY > window.innerHeight - 95) window.scrollBy(0, 14);
+
+      const els = Array.from(document.querySelectorAll<HTMLElement>("[data-drag-row]"));
+      let bestIdx: number | null = null;
+      let bestPos: "before" | "after" = "before";
+      let bestDist = Infinity;
+
+      els.forEach((el) => {
+        const idx = Number(el.dataset.dragRow);
+        if (!Number.isInteger(idx) || idx === rowIdx) return;
+        const rect = el.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const dist = Math.hypot(clientX - cx, clientY - cy);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIdx = idx;
+          bestPos = clientY < cy ? "before" : "after";
+        }
+      });
+
+      latestTarget = bestIdx;
+      latestPos = bestPos;
+      const dx = clientX - startClientX;
+      const dy = clientY - startClientY + (window.scrollY - startScrollY);
+      setDragRow({ idx: rowIdx, targetIdx: bestIdx, pos: bestPos, dx, dy });
+    };
+
+    const onPointerMove = (ev: PointerEvent) => {
+      if (typeof pointerId === "number" && ev.pointerId !== pointerId) return;
+      handleCoords(ev.clientX, ev.clientY);
+    };
+
+    const onTouchMove = (ev: TouchEvent) => {
+      if (ev.cancelable) ev.preventDefault();
+      const t = ev.touches[0];
+      if (t) handleCoords(t.clientX, t.clientY);
+    };
+
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        latestTarget = null;
+        cleanup();
+      }
+    };
+
+    const cleanup = () => {
+      if (finished) return;
+      finished = true;
+      document.body.classList.remove("is-dragging");
+      if (captureEl && typeof pointerId === "number") {
+        try {
+          if (captureEl.hasPointerCapture(pointerId)) captureEl.releasePointerCapture(pointerId);
+        } catch {
+          // ignore
+        }
+      }
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onEnd);
+      window.removeEventListener("touchcancel", onCancel);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("mouseup", onEnd);
+      window.removeEventListener("keydown", onKeyDown);
+      dragCleanupRef.current = null;
+      setDragRow(null);
+    };
+
+    const onCancel = () => {
+      latestTarget = null;
+      cleanup();
+    };
+
+    const onEnd = () => {
+      if (finished) return;
+      const tid = latestTarget;
+      const pos = latestPos;
+      cleanup();
+      if (tid !== null && tid !== rowIdx) {
+        reorderRow(rowIdx, tid, pos);
+      }
+    };
+
+    dragCleanupRef.current = cleanup;
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onEnd);
+    window.addEventListener("touchcancel", onCancel);
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("mouseup", onEnd);
+    window.addEventListener("keydown", onKeyDown);
   };
 
   const startCardDragGesture = (
     e: React.PointerEvent,
-    onActivate: () => void,
+    onActivate: (clientY: number, pointerId: number) => void,
     ignoreSelector: string
   ) => {
     if (e.button !== 0 && e.pointerType === "mouse") return;
@@ -1704,18 +2368,8 @@ export default function App() {
     const pointerId = e.pointerId;
     const isTouch = e.pointerType !== "mouse";
     let done = false;
+    let activated = false;
     let holdTimer: number | null = null;
-
-    const suppressNextClick = () => {
-      const blocker = (cev: MouseEvent) => {
-        cev.preventDefault();
-        cev.stopPropagation();
-      };
-      window.addEventListener("click", blocker, { capture: true, once: true });
-      window.setTimeout(() => {
-        window.removeEventListener("click", blocker, { capture: true });
-      }, 450);
-    };
 
     const detachTemp = () => {
       if (done) return;
@@ -1727,12 +2381,16 @@ export default function App() {
       window.removeEventListener("pointermove", onTempMove);
       window.removeEventListener("pointerup", detachTemp);
       window.removeEventListener("pointercancel", detachTemp);
+      window.removeEventListener("touchmove", onTempTouchMove);
+      window.removeEventListener("touchend", detachTemp);
+      window.removeEventListener("touchcancel", detachTemp);
     };
 
-    const activate = () => {
+    const activate = (curY: number) => {
       if (done) return;
+      activated = true;
       detachTemp();
-      suppressNextClick();
+      suppressNextClickOnce();
       if (isTouch && typeof navigator !== "undefined" && "vibrate" in navigator) {
         try {
           navigator.vibrate(14);
@@ -1740,7 +2398,18 @@ export default function App() {
           // ignore
         }
       }
-      onActivate();
+      onActivate(curY, pointerId);
+    };
+
+    const onTempTouchMove = (ev: TouchEvent) => {
+      if (activated) {
+        if (ev.cancelable) ev.preventDefault();
+        return;
+      }
+      const t = ev.touches[0];
+      if (!t) return;
+      const dist = Math.hypot(t.clientX - startX, t.clientY - startY);
+      if (dist > 10) detachTemp();
     };
 
     const onTempMove = (ev: PointerEvent) => {
@@ -1748,17 +2417,19 @@ export default function App() {
       const dist = Math.hypot(ev.clientX - startX, ev.clientY - startY);
       if (isTouch) {
         if (dist > 10) detachTemp();
-      } else if (dist > 5) {
-        activate();
+      } else if (dist > 4) {
+        activate(ev.clientY);
       }
     };
 
     window.addEventListener("pointermove", onTempMove, { passive: true });
     window.addEventListener("pointerup", detachTemp);
     window.addEventListener("pointercancel", detachTemp);
-
     if (isTouch) {
-      holdTimer = window.setTimeout(activate, 175);
+      window.addEventListener("touchmove", onTempTouchMove, { passive: false });
+      window.addEventListener("touchend", detachTemp);
+      window.addEventListener("touchcancel", detachTemp);
+      holdTimer = window.setTimeout(() => activate(startY), 140);
     }
   };
 
@@ -1766,14 +2437,24 @@ export default function App() {
     if (e.button !== 0 && e.pointerType === "mouse") return;
     e.preventDefault();
     e.stopPropagation();
-    beginUnitDrag(unitId);
+    suppressNextClickOnce();
+    beginUnitDrag(unitId, e.clientY, e.pointerId, e.currentTarget as HTMLElement);
   };
 
   const startKidDrag = (e: React.PointerEvent, unitId: string, fieldId: string) => {
     if (e.button !== 0 && e.pointerType === "mouse") return;
     e.preventDefault();
     e.stopPropagation();
-    beginKidDrag(unitId, fieldId);
+    suppressNextClickOnce();
+    beginKidDrag(unitId, fieldId, e.clientY, e.pointerId, e.currentTarget as HTMLElement);
+  };
+
+  const startRowDrag = (e: React.PointerEvent, rowIdx: number) => {
+    if (e.button !== 0 && e.pointerType === "mouse") return;
+    e.preventDefault();
+    e.stopPropagation();
+    suppressNextClickOnce();
+    beginRowDrag(rowIdx, e.clientX, e.clientY, e.pointerId, e.currentTarget as HTMLElement);
   };
 
   // ---------- Step 1 Type Actions ----------
@@ -2060,6 +2741,14 @@ export default function App() {
   };
 
   const handleExportXlsx = async (mode: "save" | "share") => {
+    if (!canExportFiles) {
+      toast(
+        "حفظ ومشاركة ملفات Excel غير متاح في الفترة التجريبية أو الباقة الأساسية. قم بالترقية للباقة الاحترافية.",
+        4000
+      );
+      setSubModalOpen(true);
+      return;
+    }
     if (!res.table.length) {
       toast("لا توجد نتائج للتصدير");
       return;
@@ -2228,6 +2917,14 @@ export default function App() {
   };
 
   const handleExportPdf = async (mode: "save" | "share") => {
+    if (!canExportFiles) {
+      toast(
+        "حفظ ومشاركة ملفات PDF غير متاح في الفترة التجريبية أو الباقة الأساسية. قم بالترقية للباقة الاحترافية.",
+        4000
+      );
+      setSubModalOpen(true);
+      return;
+    }
     if (!res.table.length) {
       toast("لا توجد نتائج للتصدير");
       return;
@@ -2637,7 +3334,8 @@ export default function App() {
             </span>
             {e.dv && num(e.m) === 0 && (
               <small style={{ display: "block", marginTop: 4, color: "var(--bad, #dc2626)", fontWeight: 700 }}>
-                ⚠️ لا يمكن القسمة على صفر — أدخل رقماً أكبر من 0
+                <AlertTriangle className="ico-inline" aria-hidden="true" />
+                لا يمكن القسمة على صفر — أدخل رقماً أكبر من 0
               </small>
             )}
           </div>
@@ -2797,7 +3495,8 @@ export default function App() {
               </button>
             )}
             <button type="button" className="btn sm r" onClick={() => delCustomField(k)}>
-              🗑 حذف هذه الخانة
+              <Trash2 className="ico-sm" aria-hidden="true" />
+              حذف هذه الخانة
             </button>
           </div>
         ) : (
@@ -2846,6 +3545,8 @@ export default function App() {
         data-drag-kid-unit={!isHeadless ? parentUnitId : undefined}
         data-drag-kid-id={!isHeadless ? k : undefined}
         className={`fld${on ? "" : " off"}${isKidDragging ? " dragging" : ""}${isKidDropBefore ? " drop-before" : ""}${isKidDropAfter ? " drop-after" : ""}`}
+        style={isKidDragging && dragKid ? ({ ["--drag-y" as string]: `${dragKid.dy}px` } as React.CSSProperties) : undefined}
+        onDragStart={(e) => e.preventDefault()}
       >
         {!isHeadless && (
           <div
@@ -2853,7 +3554,7 @@ export default function App() {
             onPointerDown={(e) =>
               startCardDragGesture(
                 e,
-                () => beginKidDrag(parentUnitId, k),
+                (cy, pid) => beginKidDrag(parentUnitId, k, cy, pid),
                 "button, input, select, textarea, a, .fl2"
               )
             }
@@ -2885,7 +3586,12 @@ export default function App() {
                 }}
               />
               <span>{cat.SUB[k]}</span>
-              {fdim(cat, k) === 2 && <b className="mod">📐 مساحة</b>}
+              {fdim(cat, k) === 2 && (
+                <b className="mod">
+                  <Ruler className="ico-inline" aria-hidden="true" />
+                  مساحة
+                </b>
+              )}
               {isCid(k) && <b className="mod">جديدة</b>}
             </label>
             <div className="o-dock">
@@ -2967,147 +3673,267 @@ export default function App() {
   const activeThemeEff = DARK_ONLY_PALS.has(pal) ? "dark" : themeMode;
   const curStepTab = state.step === 3 ? 4 : state.step;
 
+  if (!authReady || (authUser && !tenantLoaded)) {
+    return (
+      <>
+        {showSplash && <Splash onDone={() => setShowSplash(false)} />}
+        <div className="saas-gate-wrap" dir="rtl">
+          <div className="saas-gate-card" style={{ textAlign: "center" }}>
+            <h2>جارٍ التحقق من الحساب والاشتراك...</h2>
+            <p className="saas-gate-sub">يرجى الانتظار لحظة</p>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <>
+        {showSplash && <Splash onDone={() => setShowSplash(false)} />}
+        <AuthGateScreen
+          onGoogleSignIn={handleGoogleSignIn}
+          onEmailSignIn={handleEmailSignIn}
+          onEmailSignUp={handleEmailSignUp}
+          onForgotPassword={handleForgotPassword}
+          plans={plans}
+          config={platformConfig}
+          authError={authError}
+          onClearError={() => setAuthError("")}
+        />
+        <div id="toast" role="status" aria-live="polite" className={toastOn ? "on" : ""}>
+          {toastMsg}
+        </div>
+      </>
+    );
+  }
+
+  if (tenant && !tenantAccess.allowed) {
+    return (
+      <>
+        <SubscriptionModal
+          locked={true}
+          user={authUser}
+          tenant={tenant}
+          access={tenantAccess}
+          plans={plans}
+          config={platformConfig}
+          myRequests={myRequests}
+          onSignOut={handleSignOut}
+          onToast={toast}
+        />
+        <div id="toast" role="status" aria-live="polite" className={toastOn ? "on" : ""}>
+          {toastMsg}
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
+      <a href="#main-content" className="skip-link">
+        انتقل إلى المحتوى الرئيسي
+      </a>
       {showSplash && <Splash onDone={() => setShowSplash(false)} />}
 
       {/* الشريط العلوي */}
-      <div className="top">
-        <div className="top-head">
-          <div className="top-title">
-            <h1>
-              <img src={appIconUrl} alt="" className="app-logo" />
-              <span>حاسبة القياسات</span>
-            </h1>
-            <p>اكتب القياسات واحصل على كل المقاسات جاهزة</p>
-          </div>
-          <div className="top-acts">
-            <button
-              type="button"
-              className={`thm fs${fontOpen ? " on" : ""}`}
-              title="تكبير وتصغير الخط"
-              aria-label="حجم الخط"
-              onClick={() => {
-                setFontOpen((o) => !o);
-                setPalBarOpen(false);
-              }}
-            >
-              أ±
-            </button>
-            <button
-              type="button"
-              className={`thm${palBarOpen ? " on" : ""}`}
-              title="تغيير ألوان التطبيق"
-              aria-label="تغيير الثيم"
-              onClick={() => {
-                setPalBarOpen((o) => !o);
-                setFontOpen(false);
-              }}
-            >
-              🎨
-            </button>
-            <button
-              type="button"
-              className="thm"
-              title="كيف أستخدم التطبيق؟"
-              aria-label="مساعدة"
-              onClick={() => setWelOpen(true)}
-            >
-              ؟
-            </button>
-            <button
-              type="button"
-              className="thm"
-              title={activeThemeEff === "dark" ? "التحويل إلى الوضع الفاتح" : "التحويل إلى الوضع الداكن"}
-              aria-label="تبديل الوضع الداكن والفاتح"
-              onClick={() => {
-                if (DARK_ONLY_PALS.has(pal)) {
-                  toast("هذا الثيم مصمم للوضع الداكن. اختر ثيماً آخر لتبديل الفاتح/الداكن", 2600);
-                  return;
-                }
-                setThemeMode((m) => (m === "dark" ? "light" : "dark"));
-              }}
-            >
-              {activeThemeEff === "dark" ? "☀️" : "🌙"}
-            </button>
-          </div>
-        </div>
-
-        {/* مؤشر حجم الخط (5 درجات) */}
-        {fontOpen && (
-          <div id="fontbar">
-            <div className="fontbar-h">
-              <b>حجم خط التطبيق</b>
-              <span>الدرجة {fontLevel} من 5</span>
+      <header className="top">
+        <div className="top-inner">
+          <div className="top-head">
+            <div className="top-title">
+              <h1>
+                <img src={appIconUrl} alt="" className="app-logo" />
+                <span>حاسبة القياسات</span>
+              </h1>
+              <p>أدخل قياسات الشبابيك واحصل على جدول القصّ جاهزاً</p>
             </div>
-            <div className="fontbar-dots">
-              {FONT_LEVELS.map((fl) => (
+
+            <div className="top-acts">
+              <button
+                type="button"
+                className={`thm fs${fontOpen ? " on" : ""}`}
+                title="تكبير وتصغير الخط"
+                aria-label="حجم الخط"
+                onClick={() => {
+                  setFontOpen((o) => !o);
+                  setPalBarOpen(false);
+                }}
+              >
+                أ±
+              </button>
+              <button
+                type="button"
+                className={`thm${palBarOpen ? " on" : ""}`}
+                title="تغيير ألوان التطبيق"
+                aria-label="تغيير الثيم"
+                onClick={() => {
+                  setPalBarOpen((o) => !o);
+                  setFontOpen(false);
+                }}
+              >
+                <Palette className="ico" aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className="thm"
+                title="دليل الاستخدام"
+                aria-label="مساعدة"
+                onClick={() => setWelOpen(true)}
+              >
+                <HelpCircle className="ico" aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className="thm"
+                title={activeThemeEff === "dark" ? "التحويل إلى الوضع الفاتح" : "التحويل إلى الوضع الداكن"}
+                aria-label="تبديل الوضع الداكن والفاتح"
+                onClick={() => {
+                  if (DARK_ONLY_PALS.has(pal)) {
+                    toast("هذا الثيم مصمم للوضع الداكن. اختر ثيماً آخر لتبديل الفاتح/الداكن", 2600);
+                    return;
+                  }
+                  setThemeMode((m) => (m === "dark" ? "light" : "dark"));
+                }}
+              >
+                {activeThemeEff === "dark" ? (
+                  <Sun className="ico" aria-hidden="true" />
+                ) : (
+                  <Moon className="ico" aria-hidden="true" />
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* شريط الحساب والاشتراك والإدارة */}
+          {tenant && (
+            <div className="saas-top-bar">
+              <div className="saas-top-info">
+                <span className="saas-top-name">{tenant.workshopName || tenant.displayName}</span>
+                <span className={`saas-status-tag st-${tenantAccess.state}`}>
+                  {tenantAccess.state === "owner_free"
+                    ? "مالك المنصة · مجاني"
+                    : tenantAccess.state === "active"
+                      ? `مشترك · ${activePlan?.name || tenant.planId}${tenantAccess.activeUntilMs ? ` (${tenantAccess.daysLeft} يوم)` : ""}`
+                      : `تجربة مجانية · متبقي ${tenantAccess.daysLeft} ${tenantAccess.daysLeft === 1 ? "يوم" : "أيام"}`}
+                </span>
+              </div>
+              <div className="saas-top-acts">
+                {isAdminUser && (
+                  <button
+                    type="button"
+                    className="saas-pill-btn admin"
+                    onClick={() => setAdminPanelOpen(true)}
+                  >
+                    <Shield className="ico-xs" aria-hidden="true" />
+                    <span>لوحة الإدارة</span>
+                    {adminPendingCount > 0 && <span className="saas-badge-dot">{adminPendingCount}</span>}
+                  </button>
+                )}
                 <button
-                  key={fl.level}
                   type="button"
-                  className={fontLevel === fl.level ? "on" : ""}
-                  onClick={() => setFontLevel(fl.level)}
+                  className={`saas-pill-btn${tenantAccess.state === "trialing" ? " upgrade" : ""}`}
+                  onClick={() => setSubModalOpen(true)}
                 >
-                  <span>{fl.level}</span>
-                  <small>{fl.label}</small>
+                  <CreditCard className="ico-xs" aria-hidden="true" />
+                  <span>{tenantAccess.state === "trialing" ? "تفعيل الاشتراك" : "الحساب"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="saas-pill-btn"
+                  title="تسجيل الخروج"
+                  aria-label="تسجيل الخروج"
+                  onClick={() => void handleSignOut()}
+                >
+                  <LogOut className="ico-xs" aria-hidden="true" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* شريط الخطوات */}
+          <nav id="steps" aria-label="خطوات الحاسبة">
+            {[
+              { g: 1 as StepNum, num: 1, label: "النوع" },
+              { g: 2 as StepNum, num: 2, label: "القياسات" },
+              { g: 4 as StepNum, num: 3, label: "النتائج" },
+            ].map((s) => {
+              const isDone = s.g < curStepTab;
+              const isCur = s.g === curStepTab;
+              return (
+                <button
+                  key={s.g}
+                  type="button"
+                  aria-current={isCur ? "step" : undefined}
+                  className={isCur ? "on" : isDone ? "done" : ""}
+                  onClick={() => {
+                    if (s.g !== state.step) {
+                      goToStep(s.g);
+                    }
+                  }}
+                >
+                  <i>{isDone ? "✓" : s.num}</i>
+                  <span>{s.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+
+          {/* مؤشر حجم الخط (5 درجات) */}
+          {fontOpen && (
+            <div id="fontbar">
+              <div className="fontbar-h">
+                <b>حجم خط التطبيق</b>
+                <span>الدرجة {fontLevel} من 5</span>
+              </div>
+              <div className="fontbar-dots">
+                {FONT_LEVELS.map((fl) => (
+                  <button
+                    key={fl.level}
+                    type="button"
+                    className={fontLevel === fl.level ? "on" : ""}
+                    onClick={() => setFontLevel(fl.level)}
+                  >
+                    <span>{fl.level}</span>
+                    <small>{fl.label}</small>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* شريط الألوان */}
+          {palBarOpen && (
+            <div id="palbar">
+              {PALS.map(([id, name, color]) => (
+                <button
+                  key={id}
+                  type="button"
+                  className={pal === id ? "on" : ""}
+                  onClick={() => {
+                    setPal(id);
+                    if (id === "sunlit") setThemeMode("light");
+                  }}
+                >
+                  <i style={{ background: color }} />
+                  <span className="pn">{name}</span>
                 </button>
               ))}
             </div>
-          </div>
-        )}
-
-        {/* شريط الخطوات */}
-        <div id="steps">
-          {[
-            { g: 1 as StepNum, num: 1, label: "النوع" },
-            { g: 2 as StepNum, num: 2, label: "القياسات" },
-            { g: 4 as StepNum, num: 3, label: "النتائج" },
-          ].map((s) => (
-            <button
-              key={s.g}
-              type="button"
-              className={s.g === curStepTab ? "on" : s.g < curStepTab ? "done" : ""}
-              onClick={() => {
-                if (s.g !== state.step) {
-                  goToStep(s.g);
-                }
-              }}
-            >
-              <i>{s.num}</i>
-              <span>{s.label}</span>
-            </button>
-          ))}
+          )}
         </div>
+      </header>
 
-        {/* شريط الألوان */}
-        {palBarOpen && (
-          <div id="palbar">
-            {PALS.map(([id, name, color]) => (
-              <button
-                key={id}
-                type="button"
-                className={pal === id ? "on" : ""}
-                onClick={() => {
-                  setPal(id);
-                  if (id === "sunlit") setThemeMode("light");
-                }}
-              >
-                <i style={{ background: color }} />
-                <span className="pn">{name}</span>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <main>
+      <main id="main-content">
         {/* ================= الخطوة 1: النوع والمشاريع ================= */}
         {state.step === 1 && (
           <section className="step">
             {/* المشاريع المحفوظة */}
             <details className="proj-sec">
               <summary>
-                <span>📁 المشاريع المحفوظة {pjName ? `· ${pjName}` : ""}</span>
+                <span className="sum-title">
+                  <FolderOpen className="ico" aria-hidden="true" />
+                  <span>المشاريع المحفوظة {pjName ? `· ${pjName}` : ""}</span>
+                </span>
                 <span className="proj-badge">{projects.length} مشروع</span>
               </summary>
               <div className="proj-save-row">
@@ -3118,13 +3944,16 @@ export default function App() {
                   onChange={(e) => setNewProjName(e.target.value)}
                 />
                 <button type="button" className="btn sm p" onClick={handleSaveCurrentProject}>
-                  💾 حفظ المشروع
+                  <Save className="ico-sm" aria-hidden="true" />
+                  حفظ المشروع
                 </button>
                 <button type="button" className="btn sm w" onClick={handleNewBlankProject}>
-                  🆕 جديد
+                  <FilePlus2 className="ico-sm" aria-hidden="true" />
+                  جديد
                 </button>
                 <button type="button" className="btn sm g" onClick={openXlsxImport}>
-                  📊 استيراد Excel
+                  <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                  استيراد Excel
                 </button>
               </div>
               {projects.length > 0 ? (
@@ -3153,10 +3982,19 @@ export default function App() {
                               onClick={() => {
                                 const nm = clean(editingProjName).trim();
                                 if (!nm) return;
-                                setProjects((prev) =>
-                                  prev.map((x) => (x.id === pj.id ? { ...x, name: nm } : x))
-                                );
-                                if (pjName === pj.name) setPjName(nm);
+                                if (authUser && tenantAccess.allowed) {
+                                  void renameCloudProject(authUser.uid, pj.id, nm)
+                                    .then(() => {
+                                      if (pjName === pj.name) setPjName(nm);
+                                      toast("تمت إعادة تسمية المشروع ✓");
+                                    })
+                                    .catch(() => toast("تعذر تعديل اسم المشروع"));
+                                } else {
+                                  setProjects((prev) =>
+                                    prev.map((x) => (x.id === pj.id ? { ...x, name: nm } : x))
+                                  );
+                                  if (pjName === pj.name) setPjName(nm);
+                                }
                                 setEditingProjId(null);
                               }}
                             >
@@ -3208,8 +4046,14 @@ export default function App() {
                                     confirmLabel: "حذف",
                                     danger: true,
                                     onConfirm: () => {
-                                      setProjects((prev) => prev.filter((x) => x.id !== pj.id));
-                                      toast("تم حذف المشروع");
+                                      if (authUser && tenantAccess.allowed) {
+                                        void deleteCloudProject(authUser.uid, pj.id)
+                                          .then(() => toast("تم حذف المشروع"))
+                                          .catch(() => toast("تعذر حذف المشروع"));
+                                      } else {
+                                        setProjects((prev) => prev.filter((x) => x.id !== pj.id));
+                                        toast("تم حذف المشروع");
+                                      }
                                     },
                                   })
                                 }
@@ -3230,12 +4074,12 @@ export default function App() {
               )}
             </details>
 
-            <h2>ما نوع المنتج؟</h2>
+            <h2>اختر نوع النظام</h2>
             <p className="lead">
-              اضغط على النوع الذي تريده وسننتقل للخطوة التالية. لتعديل علاقات الخانات أو إضافة نوع جديد استخدم زر «⚙ تعديل الأنواع والعلاقات» في الأسفل.
+              اختر نوع الشباك أو الواجهة للانتقال مباشرةً لإدخال القياسات. يمكنك تعديل المعادلات أو إضافة نوع مخصص من الأسفل.
             </p>
 
-            <div>
+            <div className="tgrid">
               {cat.TN.map((n) => {
                 const ed = typeEdit || Boolean(relFor) || ntForm;
                 const cOv = Object.keys((state.rel && state.rel[n]) || {}).filter((k) => !isCid(k)).length;
@@ -3257,7 +4101,7 @@ export default function App() {
                       <TypeIcon iconKey={cat.TINFO[n]?.iconKey || "d"} />
                       <span>
                         <b>{n}</b>
-                        <small>{cat.TINFO[n]?.sub || ""}</small>
+                        {cat.TINFO[n]?.sub ? <small>{cat.TINFO[n].sub}</small> : null}
                       </span>
                       <span className="tick">✓</span>
                     </button>
@@ -3272,7 +4116,8 @@ export default function App() {
                           setRelFor((prev) => (prev === n ? null : n));
                         }}
                       >
-                        ⚙ علاقات الخانات{" "}
+                        <Settings className="ico-sm" aria-hidden="true" />
+                        <span>علاقات الخانات</span>
                         {cOv > 0 && <b className="mod">{cOv} معدّلة</b>}{" "}
                         {uCnt > 0 && <b className="mod">{uCnt} جديدة</b>}{" "}
                         {relFor === n ? "▲" : "▼"}
@@ -3305,7 +4150,13 @@ export default function App() {
                             <div key={k} className="fld">
                               <div className="fl1">
                                 <span style={{ flex: 1, fontWeight: "bold" }}>
-                                  {cat.LABEL[k]} {fdim(cat, k) === 2 && <b className="mod">📐 مساحة</b>}
+                                  {cat.LABEL[k]}{" "}
+                                  {fdim(cat, k) === 2 && (
+                                    <b className="mod">
+                                      <Ruler className="ico-inline" aria-hidden="true" />
+                                      مساحة
+                                    </b>
+                                  )}
                                   {cust && <b className="mod">جديدة</b>}
                                 </span>
                                 <button
@@ -3338,7 +4189,8 @@ export default function App() {
                               className="btn sm r"
                               onClick={() => handleDeleteUserType(n)}
                             >
-                              🗑 حذف النوع
+                              <Trash2 className="ico-sm" aria-hidden="true" />
+                              حذف النوع
                             </button>
                           )}
                           <button
@@ -3358,81 +4210,90 @@ export default function App() {
                 );
               })}
 
-              {ntForm ? (
-                <div className="rpanel">
-                  <h3>إضافة نوع جديد</h3>
-                  <p className="rtip">
-                    اكتب اسم النوع (مثل: شباك سحاب 3 مسارات). بعد الإنشاء تضيف خانات النوع وعلاقاتها.
-                  </p>
-                  <input
-                    className="ntin"
-                    placeholder="اسم النوع"
-                    maxLength={60}
-                    value={ntName}
-                    onChange={(e) => setNtName(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        handleCreateType();
-                      }
-                    }}
-                  />
-                  <div className="rpf">
-                    <button
-                      type="button"
-                      className="btn sm w"
-                      onClick={() => {
-                        setNtForm(false);
-                        setNtName("");
-                      }}
-                    >
-                      إلغاء
-                    </button>
-                    <button type="button" className="btn sm g" onClick={handleCreateType}>
-                      إنشاء النوع ←
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                (typeEdit || Boolean(relFor)) && (
-                  <button
-                    type="button"
-                    className="addnew"
-                    onClick={() => {
-                      setNtForm(true);
-                      setRelFor(null);
-                    }}
-                  >
-                    ＋ إضافة نوع جديد
-                  </button>
-                )
-              )}
-
-              <button
-                type="button"
-                className={`tedit tmode${typeEdit || Boolean(relFor) || ntForm ? " on" : ""}`}
-                onClick={() => {
-                  const ed = typeEdit || Boolean(relFor) || ntForm;
-                  setTypeEdit(!ed);
-                  setRelFor(null);
-                  setNtForm(false);
-                  setOpenK(null);
-                }}
-              >
-                {typeEdit || Boolean(relFor) || ntForm
-                  ? "✓ إنهاء تعديل الأنواع"
-                  : "⚙ تعديل الأنواع والعلاقات"}
-              </button>
             </div>
 
-            <details className="tools">
-              <summary>💾 نسخة احتياطية لأنواعك وعلاقاتك</summary>
+            {ntForm ? (
+              <div className="rpanel" style={{ marginTop: 10 }}>
+                <h3>إضافة نوع جديد</h3>
+                <p className="rtip">
+                  اكتب اسم النوع (مثل: شباك سحاب 3 مسارات). بعد الإنشاء تضيف خانات النوع وعلاقاتها.
+                </p>
+                <input
+                  className="ntin"
+                  placeholder="اسم النوع"
+                  maxLength={60}
+                  value={ntName}
+                  onChange={(e) => setNtName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleCreateType();
+                    }
+                  }}
+                />
+                <div className="rpf">
+                  <button
+                    type="button"
+                    className="btn sm w"
+                    onClick={() => {
+                      setNtForm(false);
+                      setNtName("");
+                    }}
+                  >
+                    إلغاء
+                  </button>
+                  <button type="button" className="btn sm g" onClick={handleCreateType}>
+                    إنشاء النوع
+                  </button>
+                </div>
+              </div>
+            ) : (
+              (typeEdit || Boolean(relFor)) && (
+                <button
+                  type="button"
+                  className="addnew"
+                  onClick={() => {
+                    setNtForm(true);
+                    setRelFor(null);
+                  }}
+                >
+                  <Plus className="ico-sm" aria-hidden="true" />
+                  إضافة نوع جديد
+                </button>
+              )
+            )}
+
+            <button
+              type="button"
+              className={`tedit tmode${typeEdit || Boolean(relFor) || ntForm ? " on" : ""}`}
+              onClick={() => {
+                const ed = typeEdit || Boolean(relFor) || ntForm;
+                setTypeEdit(!ed);
+                setRelFor(null);
+                setNtForm(false);
+                setOpenK(null);
+              }}
+            >
+              <Wrench className="ico-sm" aria-hidden="true" />
+              {typeEdit || Boolean(relFor) || ntForm
+                ? "إنهاء تعديل الأنواع"
+                : "تعديل الأنواع والعلاقات"}
+            </button>
+
+            <details className="tools" style={{ marginTop: 14 }}>
+              <summary>
+                <span className="sum-title">
+                  <Save className="ico" aria-hidden="true" />
+                  <span>نسخة احتياطية لأنواعك وعلاقاتك</span>
+                </span>
+              </summary>
               <p className="rtip">
                 احفظ نسخة قبل تحديث التطبيق أو حذفه، ثم استعدها بعد التثبيت.
               </p>
               <div className="row">
                 <button type="button" className="btn g sm" onClick={handleBackupSave}>
-                  💾 حفظ نسخة احتياطية
+                  <Download className="ico-sm" aria-hidden="true" />
+                  حفظ نسخة احتياطية
                 </button>
                 <button
                   type="button"
@@ -3444,10 +4305,12 @@ export default function App() {
                     }
                   }}
                 >
-                  📥 استعادة من ملف
+                  <Upload className="ico-sm" aria-hidden="true" />
+                  استعادة من ملف
                 </button>
                 <button type="button" className="btn p sm" onClick={openXlsxImport}>
-                  📊 استيراد من Excel
+                  <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                  استيراد من Excel
                 </button>
               </div>
               {typeof window !== "undefined" && window.location.protocol.startsWith("http") && (
@@ -3458,7 +4321,8 @@ export default function App() {
                     className="btn p sm"
                     style={{ width: "100%", textDecoration: "none" }}
                   >
-                    📲 تنزيل نسخة ملف HTML واحد (للتشغيل بدون إنترنت)
+                    <Download className="ico-sm" aria-hidden="true" />
+                    تنزيل نسخة ملف HTML واحد (للتشغيل بدون إنترنت)
                   </a>
                 </div>
               )}
@@ -3505,7 +4369,7 @@ export default function App() {
 
             {state.unit === "m" && (
               <p id="uhint">
-                💡 بالمتر: اكتب <b>150</b> فتصبح <b>1.50</b> تلقائياً. للأطوال 10 م فأكثر اكتب الفاصلة بنفسك (مثل 12.5).
+                بالمتر: اكتب <b>150</b> فتصبح <b>1.50</b> تلقائياً. للأطوال 10 م فأكثر اكتب الفاصلة بنفسك (مثل 12.5).
               </p>
             )}
 
@@ -3530,7 +4394,7 @@ export default function App() {
 
             {!state.rows.some((r) => r.L || r.W || r.p) && (
               <div className="hintbox">
-                لا تعرف من أين تبدأ؟{" "}
+                <span>بداية سريعة:</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -3548,9 +4412,9 @@ export default function App() {
                 >
                   جرّب مثالاً
                 </button>
-                {" أو "}
                 <button type="button" onClick={openXlsxImport}>
-                  📊 استيراد من Excel
+                  <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                  استيراد من Excel
                 </button>
               </div>
             )}
@@ -3561,12 +4425,13 @@ export default function App() {
                   يوجد {middleEmptyCount} {middleEmptyCount === 1 ? "صف فارغ غير مستخدم" : "صفوف فارغة غير مستخدمة"}
                 </span>
                 <button type="button" onClick={handleCleanEmptyRows}>
-                  🗑 حذف الفارغة
+                  <Trash2 className="ico-sm" aria-hidden="true" />
+                  حذف الفارغة
                 </button>
               </div>
             )}
 
-            <div ref={rowsBoxRef}>
+            <div ref={rowsBoxRef} className="wgrid">
               {state.rows.map((r, i) => {
                 const isBlankMiddle = i < state.rows.length - 1 && isRowBlank(r);
                 const err = rowErr(r, state.unit, negHighlightedRows.has(r));
@@ -3600,9 +4465,45 @@ export default function App() {
                       </div>
                     )}
 
-                    <div className={`wcard${err ? " bad" : warn ? " warn" : ""}`}>
-                      {/* صف علوي منفصل للشارة والاسم وزر الحذف ✕ (بعيد تماماً عن خانة العدد) */}
+                    {(() => {
+                      const canDragRow = !(i === state.rows.length - 1 && isRowBlank(r));
+                      const isRowDragging = dragRow?.idx === i;
+                      const isRowDropBefore = dragRow?.targetIdx === i && dragRow?.pos === "before";
+                      const isRowDropAfter = dragRow?.targetIdx === i && dragRow?.pos === "after";
+                      return (
+                    <div
+                      data-drag-row={canDragRow ? i : undefined}
+                      className={`wcard${err ? " bad" : warn ? " warn" : ""}${isRowDragging ? " dragging" : ""}${isRowDropBefore ? " drop-before" : ""}${isRowDropAfter ? " drop-after" : ""}`}
+                      style={
+                        isRowDragging && dragRow
+                          ? ({
+                              ["--drag-x" as string]: `${dragRow.dx}px`,
+                              ["--drag-y" as string]: `${dragRow.dy}px`,
+                            } as React.CSSProperties)
+                          : undefined
+                      }
+                      onDragStart={(e) => e.preventDefault()}
+                    >
+                      {/* صف علوي منفصل لمقبض السحب والشارة والاسم وزر الحذف ✕ */}
                       <div className="wcard-top">
+                        {canDragRow && (
+                          <button
+                            type="button"
+                            className="drag-h wdrag"
+                            title="اسحب لإعادة ترتيب الشباك"
+                            aria-label={`سحب الشباك ${i + 1} لإعادة الترتيب`}
+                            onPointerDown={(e) => startRowDrag(e, i)}
+                          >
+                            <svg width="14" height="18" viewBox="0 0 14 18" aria-hidden="true">
+                              <circle cx="4" cy="3.5" r="1.7" fill="currentColor" />
+                              <circle cx="10" cy="3.5" r="1.7" fill="currentColor" />
+                              <circle cx="4" cy="9" r="1.7" fill="currentColor" />
+                              <circle cx="10" cy="9" r="1.7" fill="currentColor" />
+                              <circle cx="4" cy="14.5" r="1.7" fill="currentColor" />
+                              <circle cx="10" cy="14.5" r="1.7" fill="currentColor" />
+                            </svg>
+                          </button>
+                        )}
                         <button
                           type="button"
                           className={`badge${r.n ? " cust" : ""}`}
@@ -3645,7 +4546,7 @@ export default function App() {
                           aria-label={isBlankMiddle ? `حذف الصف الفارغ ${i + 1}` : `حذف شباك ${i + 1}`}
                           onClick={() => handleDeleteRow(i)}
                         >
-                          {isBlankMiddle ? "🗑" : "✕"}
+                          {isBlankMiddle ? <Trash2 className="ico-sm" aria-hidden="true" /> : "✕"}
                         </button>
                       </div>
 
@@ -3804,6 +4705,8 @@ export default function App() {
 
                       {err && <div className="wmsg">{err}</div>}
                     </div>
+                      );
+                    })()}
                   </React.Fragment>
                 );
               })}
@@ -3833,34 +4736,41 @@ export default function App() {
 
             <div className="addrow">
               <button type="button" className="add" onClick={handleAddEmptyRow}>
-                ＋ إضافة شباك
+                <Plus className="ico-sm" aria-hidden="true" />
+                إضافة شباك
               </button>
               <button type="button" className="add clr" onClick={handleClearAll}>
-                🗑 تصفير الكل
+                <Trash2 className="ico-sm" aria-hidden="true" />
+                تصفير الكل
               </button>
             </div>
 
             <div className="addrow" style={{ marginTop: 10 }}>
               <button
                 type="button"
-                className="add"
-                style={{ border: "2px solid var(--pri)" }}
+                className="add pri-outline"
                 onClick={handleDupLast}
               >
-                ⧉ نسخ الشباك السابق
+                <Copy className="ico-sm" aria-hidden="true" />
+                نسخ الشباك السابق
               </button>
               <button
                 type="button"
-                className="add"
-                style={{ border: "2px solid var(--pri)" }}
+                className="add pri-outline"
                 onClick={openCopyByNumber}
               >
-                🔢 نسخ شباك محدد
+                <Hash className="ico-sm" aria-hidden="true" />
+                نسخ شباك محدد
               </button>
             </div>
 
             <details className="tools" style={{ marginTop: 12 }}>
-              <summary>📋 أدوات: لصق قياسات · استيراد Excel · مسح الكل</summary>
+              <summary>
+                <span className="sum-title">
+                  <ClipboardList className="ico-sm" aria-hidden="true" />
+                  <span>أدوات: لصق قياسات · استيراد Excel · مسح الكل</span>
+                </span>
+              </summary>
               <textarea
                 placeholder="الصق هنا: كل سطر فيه طول ثم عرض (أو طول عرض اسم)"
                 value={pasteText}
@@ -3871,10 +4781,12 @@ export default function App() {
                   إضافة المُلصق
                 </button>
                 <button type="button" className="btn p sm" onClick={openXlsxImport}>
-                  📊 استيراد من ملف Excel
+                  <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                  استيراد من ملف Excel
                 </button>
                 <button type="button" className="btn r sm" onClick={handleClearAll}>
-                  🗑 مسح كل الشبابيك
+                  <Trash2 className="ico-sm" aria-hidden="true" />
+                  مسح كل الشبابيك
                 </button>
               </div>
             </details>
@@ -3963,7 +4875,8 @@ export default function App() {
                 className={advOpen ? "on" : ""}
                 onClick={() => setAdvOpen(true)}
               >
-                ⚙ علاقات وتعديل
+                <Settings className="ico-sm" aria-hidden="true" />
+                علاقات وتعديل
               </button>
             </div>
 
@@ -4081,7 +4994,8 @@ export default function App() {
               </div>
 
               <p className="rtip" style={{ marginBottom: 10 }}>
-                ✋ لإعادة الترتيب: اسحب أي بطاقة من <b>⋮⋮</b> أو بالضغط والسحب من <b>أي مكان فيها</b>، أو استخدم الأسهم.
+                <GripVertical className="ico-inline" aria-hidden="true" />
+                لإعادة الترتيب: اسحب أي بطاقة من <b>⋮⋮</b> أو بالضغط والسحب من <b>أي مكان فيها</b>، أو استخدم الأسهم.
               </p>
 
               {visUnits.map((id) => {
@@ -4137,11 +5051,17 @@ export default function App() {
                       key={id}
                       data-drag-unit={id}
                       className={`ur${unitDragCls}`}
-                      style={{ ["--h" as string]: cat.HUE[id] ?? 0 }}
+                      style={
+                        {
+                          ["--h" as string]: cat.HUE[id] ?? 0,
+                          ...(isUnitDragging && dragUnit ? { ["--drag-y" as string]: `${dragUnit.dy}px` } : {}),
+                        } as React.CSSProperties
+                      }
+                      onDragStart={(e) => e.preventDefault()}
                       onPointerDown={(e) =>
                         startCardDragGesture(
                           e,
-                          () => beginUnitDrag(id),
+                          (cy, pid) => beginUnitDrag(id, cy, pid),
                           ".fld, .fl2, button, input, select, textarea, a"
                         )
                       }
@@ -4223,11 +5143,17 @@ export default function App() {
                     key={id}
                     data-drag-unit={id}
                     className={`ur${unitDragCls}`}
-                    style={{ ["--h" as string]: cat.HUE[id] ?? 0 }}
+                    style={
+                      {
+                        ["--h" as string]: cat.HUE[id] ?? 0,
+                        ...(isUnitDragging && dragUnit ? { ["--drag-y" as string]: `${dragUnit.dy}px` } : {}),
+                      } as React.CSSProperties
+                    }
+                    onDragStart={(e) => e.preventDefault()}
                     onPointerDown={(e) =>
                       startCardDragGesture(
                         e,
-                        () => beginUnitDrag(id),
+                        (cy, pid) => beginUnitDrag(id, cy, pid),
                         ".fld, .fl2, button, input, select, textarea, a"
                       )
                     }
@@ -4253,7 +5179,12 @@ export default function App() {
                           }}
                         />
                         <b>{cat.LABEL[k]}</b>
-                        {isA && <b className="mod">📐 مساحة</b>}
+                        {isA && (
+                          <b className="mod">
+                            <Ruler className="ico-inline" aria-hidden="true" />
+                            مساحة
+                          </b>
+                        )}
                         {isCid(k) && <b className="mod">جديدة</b>}
                       </label>
                       <div className="o-dock">
@@ -4330,19 +5261,19 @@ export default function App() {
               </button>
             </div>
 
-            <h2>النتائج ✅</h2>
+            <h2>النتائج</h2>
 
             <div className="sum">
               <span>
-                {res.data.length} شباك{res.hasQ ? ` · ${res.qtotal} قطعة` : ""}
+                {res.data.length} شباك{res.hasQ ? ` (${res.qtotal} قطعة)` : ""}
               </span>
               <span>{res.keys.length} خانة</span>
+              {res.adj && <span>معدّلة</span>}
               {res.areaTotals.map((item) => (
-                <span key={item.key} className="atot">
-                  إجمالي {item.label}: <b>{item.totalSqM.toFixed(2)}</b> م²
+                <span key={item.key}>
+                  {item.label}: {item.totalSqM.toFixed(2)} م²
                 </span>
               ))}
-              {res.adj && <span>فيه تعديلات</span>}
               {res.rndOn && (
                 <button
                   type="button"
@@ -4361,10 +5292,11 @@ export default function App() {
                 className={`btn${Number(state.gr.s) > 0 || rndOpen ? " on" : ""}`}
                 onClick={() => setRndOpen((o) => !o)}
               >
-                {Number(state.gr.s) > 0 ? `≈ تقريب: ${state.gr.s} ✓` : "≈ تقريب"}
+                {Number(state.gr.s) > 0 ? `≈ تقريب: ${state.gr.s}` : "≈ تقريب"}
               </button>
               <button type="button" id="bAdv" className="btn" onClick={() => goToStep(3)}>
-                ⚙️ تخصيص
+                <SlidersHorizontal className="ico-sm" aria-hidden="true" />
+                تخصيص
               </button>
               <button
                 type="button"
@@ -4375,7 +5307,8 @@ export default function App() {
                   goToStep(3);
                 }}
               >
-                🛠 متقدمة
+                <Wrench className="ico-sm" aria-hidden="true" />
+                متقدمة
               </button>
             </div>
 
@@ -4450,7 +5383,7 @@ export default function App() {
                     }
                   }}
                 >
-                  🔍
+                  <Search className="ico" aria-hidden="true" />
                 </button>
                 {searchOpen && (
                   <>
@@ -4497,13 +5430,17 @@ export default function App() {
             </div>
 
             <div id="unote">
-              📏 الوحدة: <b>{UFULL[state.unit]}</b>
-              {res.area && (
-                <>
-                  {" "}
-                  &nbsp;·&nbsp; المساحة: <b>{UAREA[state.unit]}</b>
-                </>
-              )}
+              <span className="sum-title">
+                <Ruler className="ico-sm" aria-hidden="true" />
+                <span>
+                  الوحدة: <b>{UFULL[state.unit]}</b>
+                  {res.area && (
+                    <>
+                      {" · "}المساحة: <b>{UAREA[state.unit]}</b>
+                    </>
+                  )}
+                </span>
+              </span>
               {res.pend.length > 0 && (
                 <div className="pnote">
                   ⏳ قياسات غير جاهزة في الشباك {res.pend.join("، ")}: خاناتها فارغة وتُعبّأ يدوياً لاحقاً
@@ -4522,7 +5459,7 @@ export default function App() {
             ) : (
               <>
                 {state.view === "cards" ? (
-                  <div>
+                  <div className="rc-grid">
                     {res.data
                       .filter(
                         (d) =>
@@ -4688,12 +5625,15 @@ export default function App() {
                 {res.areaTotals.length > 0 && (
                   <div className="area-sum">
                     <div className="dup-h">
-                      <b>📐 ملخص إجمالي المساحات (لطلب المواد)</b>
+                      <b>
+                        <Layers className="ico-sm" aria-hidden="true" />
+                        ملخص إجمالي المساحات (لطلب المواد)
+                      </b>
                       <span>إجمالي القطع: {res.qtotal}</span>
                     </div>
                     {res.areaTotals.map((item) => (
                       <div key={item.key} className="dup-r">
-                        <span style={{ fontWeight: 800, flex: 1 }}>{item.label}</span>
+                        <span style={{ fontWeight: 700, flex: 1 }}>{item.label}</span>
                         <span className="dup-c">{item.totalSqM.toFixed(3)} م²</span>
                         {state.unit !== "m" && (
                           <small>
@@ -4709,7 +5649,10 @@ export default function App() {
                 {res.dups.length > 0 && (
                   <div className="dup">
                     <div className="dup-h">
-                      <b>🔁 ملخص الشبابيك المتشابهة</b>
+                      <b>
+                        <RotateCcw className="ico-sm" aria-hidden="true" />
+                        ملخص الشبابيك المتشابهة
+                      </b>
                       <span>
                         {res.dups.length} قياس مكرر · {res.dups.reduce((a, g) => a + g.cnt, 0)} شباك
                       </span>
@@ -4731,8 +5674,8 @@ export default function App() {
                   </div>
                 )}
 
-                <p className="lead" style={{ marginTop: 10 }}>
-                  💡 اضغط على أي رقم في البطاقات أو الجدول لنسخه.
+                <p className="lead" style={{ marginTop: 12 }}>
+                  اضغط على أي رقم في البطاقات أو الجدول لنسخه فوراً.
                 </p>
               </>
             )}
@@ -4746,10 +5689,12 @@ export default function App() {
           {state.step === 4 && (
             <>
               <button type="button" className="btn back s4" onClick={() => goToStep(2)}>
-                → القياسات
+                <ArrowRight className="ico-sm" aria-hidden="true" />
+                القياسات
               </button>
               <button type="button" className="btn p" onClick={() => openSaveDialog()}>
-                💾 حفظ ومشاركة
+                <Save className="ico-sm" aria-hidden="true" />
+                حفظ ومشاركة
               </button>
             </>
           )}
@@ -4757,7 +5702,7 @@ export default function App() {
             <>
               <button
                 type="button"
-                className="btn cx"
+                className="btn"
                 style={{ flex: 1 }}
                 onClick={() => goToStep(4)}
               >
@@ -4781,10 +5726,12 @@ export default function App() {
           {state.step === 2 && (
             <>
               <button type="button" className="btn back" onClick={() => goToStep(1)}>
-                → النوع
+                <ArrowRight className="ico-sm" aria-hidden="true" />
+                النوع
               </button>
               <button type="button" className="btn p" onClick={() => goToStep(4)}>
-                عرض النتائج ←
+                عرض النتائج
+                <ArrowLeft className="ico-sm" aria-hidden="true" />
               </button>
             </>
           )}
@@ -4894,8 +5841,11 @@ export default function App() {
         });
 
         return (
-          <div className="dlg">
-            <div style={{ fontSize: 19, fontWeight: "bold" }}>⚠️ تأكد قبل المتابعة</div>
+          <div className="dlg" role="dialog" aria-modal="true" aria-label="تأكد قبل المتابعة">
+            <div className="sum-title" style={{ fontSize: 19, fontWeight: "bold" }}>
+              <AlertTriangle className="ico" style={{ color: "var(--warn)" }} aria-hidden="true" />
+              <span>تأكد قبل المتابعة</span>
+            </div>
             <p style={{ margin: "6px 0 0", color: "var(--mut)", fontSize: 15 }}>
               أدخل الطول والعرض مباشرة هنا، أو اتركه فارغاً عمداً، أو احذفه:
             </p>
@@ -4905,7 +5855,8 @@ export default function App() {
                 className="pq-bulk"
                 onClick={() => handleRemovePendingRows(new Set(emptyPendIndices))}
               >
-                🗑 حذف جميع الصفوف الفارغة ({emptyPendIndices.length})
+                <Trash2 className="ico-inline" aria-hidden="true" />
+                حذف جميع الصفوف الفارغة ({emptyPendIndices.length})
               </button>
             )}
             {pendChoices.map((x) => {
@@ -5003,7 +5954,8 @@ export default function App() {
                     className="w3"
                     onClick={() => handleRemovePendingRows(new Set([x.i]))}
                   >
-                    🗑 لا أحتاجه (احذفه)
+                    <Trash2 className="ico-inline" aria-hidden="true" />
+                    لا أحتاجه (احذفه)
                   </button>
                 </div>
               );
@@ -5035,9 +5987,12 @@ export default function App() {
 
       {/* نافذة الحفظ والمشاركة */}
       {saveOpen && (
-        <div className="dlg">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-            <b style={{ fontSize: 19 }}>💾 حفظ ومشاركة النتائج</b>
+        <div className="dlg" role="dialog" aria-modal="true" aria-label="حفظ ومشاركة النتائج">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <b className="sum-title" style={{ fontSize: 18 }}>
+              <Save className="ico" aria-hidden="true" />
+              <span>حفظ ومشاركة النتائج</span>
+            </b>
             <button
               type="button"
               className="btn sm"
@@ -5067,46 +6022,89 @@ export default function App() {
             {res.hasQ ? ` (${res.qtotal} قطعة)` : ""}
           </div>
 
+          {!canExportFiles && (
+            <div className="saas-export-lock">
+              <Lock className="ico-sm" aria-hidden="true" />
+              <div>
+                <b>حفظ ومشاركة PDF و Excel مقفل في حسابك الحالي</b>
+                <small>
+                  غير متاح في الفترة التجريبية ولا في الباقة الأساسية. قم بالترقية للباقة الاحترافية
+                  أو باقة الورش لتفعيل التصدير.
+                </small>
+              </div>
+              <button
+                type="button"
+                className="btn sm p"
+                onClick={() => {
+                  setSaveOpen(false);
+                  setSubModalOpen(true);
+                }}
+              >
+                ترقية
+              </button>
+            </div>
+          )}
+
           <div className="svgrid">
             <button
               type="button"
-              className="btn p"
+              className={`btn p${!canExportFiles ? " export-locked" : ""}`}
               onClick={() => {
                 setSaveOpen(false);
                 handleExportPdf("save");
               }}
             >
-              📄 حفظ PDF
+              {canExportFiles ? (
+                <FileText className="ico-sm" aria-hidden="true" />
+              ) : (
+                <Lock className="ico-sm" aria-hidden="true" />
+              )}
+              حفظ PDF
             </button>
             <button
               type="button"
-              className="btn p"
+              className={`btn p${!canExportFiles ? " export-locked" : ""}`}
               onClick={() => {
                 setSaveOpen(false);
                 handleExportXlsx("save");
               }}
             >
-              📊 حفظ إكسل
+              {canExportFiles ? (
+                <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+              ) : (
+                <Lock className="ico-sm" aria-hidden="true" />
+              )}
+              حفظ إكسل
             </button>
             <button
               type="button"
-              className="btn g"
+              className={`btn g${!canExportFiles ? " export-locked" : ""}`}
               onClick={() => {
                 setSaveOpen(false);
                 handleExportPdf("share");
               }}
             >
-              📤 مشاركة PDF
+              {canExportFiles ? (
+                <Share2 className="ico-sm" aria-hidden="true" />
+              ) : (
+                <Lock className="ico-sm" aria-hidden="true" />
+              )}
+              مشاركة PDF
             </button>
             <button
               type="button"
-              className="btn g"
+              className={`btn g${!canExportFiles ? " export-locked" : ""}`}
               onClick={() => {
                 setSaveOpen(false);
                 handleExportXlsx("share");
               }}
             >
-              📤 مشاركة إكسل
+              {canExportFiles ? (
+                <Share2 className="ico-sm" aria-hidden="true" />
+              ) : (
+                <Lock className="ico-sm" aria-hidden="true" />
+              )}
+              مشاركة إكسل
             </button>
           </div>
 
@@ -5126,7 +6124,8 @@ export default function App() {
                 }
               }}
             >
-              📋 نسخ للإكسل
+              <ClipboardCopy className="ico-sm" aria-hidden="true" />
+              نسخ للإكسل
             </button>
             <button
               type="button"
@@ -5145,7 +6144,8 @@ export default function App() {
                 copyText(txt, "تم نسخ النتائج كنص");
               }}
             >
-              💬 إرسال النتائج كنص
+              <MessageSquare className="ico-sm" aria-hidden="true" />
+              إرسال النتائج كنص
             </button>
             <button
               type="button"
@@ -5160,7 +6160,8 @@ export default function App() {
                 saveBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), `${fnBase()}.csv`, "text/csv", "save");
               }}
             >
-              📄 ملف نصي CSV
+              <FileText className="ico-sm" aria-hidden="true" />
+              ملف نصي CSV
             </button>
             <button
               type="button"
@@ -5170,7 +6171,8 @@ export default function App() {
                 setAltOpen(true);
               }}
             >
-              🆘 لم يُحفظ الملف؟ جرّب طرقاً بديلة
+              <LifeBuoy className="ico-sm" aria-hidden="true" />
+              لم يُحفظ الملف؟ جرّب طرقاً بديلة
             </button>
           </details>
         </div>
@@ -5178,13 +6180,17 @@ export default function App() {
 
       {/* نافذة الطرق البديلة */}
       {altOpen && (
-        <div className="dlg">
+        <div className="dlg" role="dialog" aria-modal="true" aria-label="طرق بديلة للحصول على النتائج">
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-            <b style={{ fontSize: 19 }}>🆘 طرق بديلة للحصول على النتائج</b>
+            <b className="sum-title" style={{ fontSize: 18 }}>
+              <LifeBuoy className="ico" aria-hidden="true" />
+              <span>طرق بديلة للحصول على النتائج</span>
+            </b>
             <button
               type="button"
               className="btn sm"
               style={{ width: "auto", margin: 0 }}
+              aria-label="إغلاق"
               onClick={() => setAltOpen(false)}
             >
               ✕
@@ -5208,7 +6214,8 @@ export default function App() {
               );
             }}
           >
-            📂 إعادة تنزيل الملف
+            <FolderOpen className="ico-sm" aria-hidden="true" />
+            إعادة تنزيل الملف
           </button>
           <button
             type="button"
@@ -5224,7 +6231,8 @@ export default function App() {
               }
             }}
           >
-            📋 نسخ الجدول ثم لصقه في إكسل
+            <ClipboardCopy className="ico-sm" aria-hidden="true" />
+            نسخ الجدول ثم لصقه في إكسل
           </button>
           <button
             type="button"
@@ -5242,14 +6250,16 @@ export default function App() {
               }
             }}
           >
-            💬 إرسال النتائج بالواتساب
+            <MessageSquare className="ico-sm" aria-hidden="true" />
+            إرسال النتائج بالواتساب
           </button>
           <button
             type="button"
             className="btn"
             onClick={() => setAltTextOpen((v) => !v)}
           >
-            👁 عرض النتائج كنص لنسخه يدوياً
+            <Eye className="ico-sm" aria-hidden="true" />
+            عرض النتائج كنص لنسخه يدوياً
           </button>
           {altTextOpen && <textarea readOnly value={getPlainTextResults()} />}
         </div>
@@ -5258,7 +6268,7 @@ export default function App() {
       {/* نافذة نسخ شباك محدد حسب رقمه */}
       {copyByNumOpen && (
         <div className="pop-modal" onClick={() => setCopyByNumOpen(false)}>
-          <div className="wbox" onClick={(e) => e.stopPropagation()}>
+          <div className="wbox" role="dialog" aria-modal="true" aria-label="نسخ شباك محدد" onClick={(e) => e.stopPropagation()}>
             <div className="cnhead">
               <span className="cnico">
                 <svg viewBox="0 0 48 48" width="32" height="32" aria-hidden="true">
@@ -5320,17 +6330,7 @@ export default function App() {
                   confirmCopyByNumber();
                 }
               }}
-              style={{
-                width: "100%",
-                height: 54,
-                textAlign: "center",
-                fontSize: 22,
-                fontWeight: "bold",
-                borderRadius: 16,
-                background: "var(--bg)",
-                marginTop: 8,
-                boxShadow: "var(--cl-press)",
-              }}
+              className="modal-num-in"
             />
 
             {copyNumVal.trim() !== "" && (
@@ -5391,8 +6391,11 @@ export default function App() {
       {/* نافذة استيراد من Excel */}
       {xlImportState && (
         <div className="pop-modal" onClick={() => setXlImportState(null)}>
-          <div className="wbox" onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ marginBottom: 6 }}>📊 استيراد من Excel</h2>
+          <div className="wbox" role="dialog" aria-modal="true" aria-label="استيراد من Excel" onClick={(e) => e.stopPropagation()}>
+            <h2 className="sum-title" style={{ marginBottom: 6 }}>
+              <FileSpreadsheet className="ico" aria-hidden="true" />
+              <span>استيراد من Excel</span>
+            </h2>
             <p className="wl" style={{ marginTop: 0 }}>
               الملف: <b>{xlImportState.fileName}</b>
               {xlImportState.parsed.projectName ? ` · المشروع: ${xlImportState.parsed.projectName}` : ""}
@@ -5412,7 +6415,8 @@ export default function App() {
                     }
                   />
                   <span>
-                    📏 القياسات: <b>{xlImportState.parsed.rows.length}</b> شباك
+                    <Ruler className="ico-inline" aria-hidden="true" />
+                    القياسات: <b>{xlImportState.parsed.rows.length}</b> شباك
                     {(() => {
                       const ready = xlImportState.parsed.rows!.filter(
                         (r) => r.l !== null && r.w !== null
@@ -5484,7 +6488,8 @@ export default function App() {
                   }
                 />
                 <span>
-                  ⚙ الإعدادات: النوع «{String(xlImportState.parsed.settings.type || "")}» والعلاقات
+                  <Settings className="ico-inline" aria-hidden="true" />
+                  الإعدادات: النوع «{String(xlImportState.parsed.settings.type || "")}» والعلاقات
                   والتخصيص <small>(تستبدل علاقاتك الحالية)</small>
                 </span>
               </label>
@@ -5525,8 +6530,11 @@ export default function App() {
       {/* نافذة نقل أو تسمية الشباك عند الضغط على رقمه */}
       {badgeModalIdx !== null && state.rows[badgeModalIdx] && (
         <div className="pop-modal" onClick={() => setBadgeModalIdx(null)}>
-          <div className="wbox" onClick={(e) => e.stopPropagation()}>
-            <h2>🔢 نقل أو تسمية شباك #{badgeModalIdx + 1}</h2>
+          <div className="wbox" role="dialog" aria-modal="true" aria-label={`نقل أو تسمية شباك ${badgeModalIdx + 1}`} onClick={(e) => e.stopPropagation()}>
+            <h2 className="sum-title">
+              <Hash className="ico" aria-hidden="true" />
+              <span>نقل أو تسمية شباك #{badgeModalIdx + 1}</span>
+            </h2>
             <p className="wl">
               اكتب رقماً (1–300) لنقل الشباك إليه (يتبدّل مع الشباك الموجود فيه)، أو اكتب اسماً لتسميته (يظهر في عمود «الاسم» ويُبحث به):
             </p>
@@ -5543,18 +6551,7 @@ export default function App() {
                   confirmBadgeAction();
                 }
               }}
-              style={{
-                width: "100%",
-                height: 54,
-                textAlign: "center",
-                fontSize: 18,
-                fontWeight: "bold",
-                borderRadius: 16,
-                background: "var(--bg)",
-                marginTop: 12,
-                padding: "0 12px",
-                boxShadow: "var(--cl-press)",
-              }}
+              className="modal-num-in"
             />
 
             <div className="svinfo" style={{ marginTop: 12 }}>
@@ -5562,11 +6559,11 @@ export default function App() {
                 const rawTrim = clean(badgeInputVal).trim();
                 const normDigits = rawTrim.replace(/[٠-٩]/g, (d) => String(AR_DIGITS.indexOf(d)));
                 if (/^[-+]?[0-9]+([.,٫][0-9]+)?$/.test(normDigits) && !/^[0-9]+$/.test(normDigits)) {
-                  return "⚠️ اكتب رقماً صحيحاً موجباً للنقل، أو اسماً يحتوي حروفاً";
+                  return "تنبيه: اكتب رقماً صحيحاً موجباً للنقل، أو اسماً يحتوي حروفاً";
                 }
                 if (/^[0-9]+$/.test(normDigits)) {
                   const N = parseInt(normDigits, 10);
-                  if (N < 1 || N > 300) return "⚠️ الرقم المسموح بين 1 و300";
+                  if (N < 1 || N > 300) return "تنبيه: الرقم المسموح بين 1 و300";
                   if (N === badgeModalIdx + 1) return "الرقم الحالي للشباك — اكتب رقماً آخر لنقله أو اسماً لتسميته";
                   const targetRow = state.rows[N - 1];
                   const hasOther =
@@ -5633,22 +6630,22 @@ export default function App() {
             }
           }}
         >
-          <div className="wbox" onClick={(e) => e.stopPropagation()}>
-            <h2>👋 أهلاً بك</h2>
-            <p className="wl">احسب كل مقاسات الشباك أو الواجهة من الطول والعرض فقط، في ثلاث خطوات:</p>
+          <div className="wbox" role="dialog" aria-modal="true" aria-label="دليل الاستخدام" onClick={(e) => e.stopPropagation()}>
+            <h2>أهلاً بك في حاسبة القياسات</h2>
+            <p className="wl">احسب كل مقاسات القصّ للشباك أو الواجهة من الطول والعرض فقط، في ثلاث خطوات:</p>
             <ol>
               <li>
-                <b>اختر النوع</b> (مثل شباك 3 مجاري نظامي أو شباك 2.5 نظامي).
+                <b>اختر النظام</b> (مثل شباك 3 مجاري نظامي أو شباك 2.5 نظامي).
               </li>
               <li>
-                <b>اكتب الطول والعرض</b> لكل شباك، واختر الوحدة (م / سم / مم). الطول = الارتفاع، والعرض = من جنب لجنب.
+                <b>أدخل الطول والعرض</b> لكل شباك واختر الوحدة (م / سم / مم). الطول = الارتفاع، والعرض = من جنب لجنب.
               </li>
               <li>
-                <b>النتائج</b> تظهر جاهزة: انسخ أي رقم بالضغط عليه، أو احفظها PDF نصي خفيف أو Excel.
+                <b>النتائج</b> تظهر جاهزة: اضغط على أي رقم لنسخه، أو احفظها بصيغة PDF أو Excel.
               </li>
             </ol>
             <p className="wn">
-              💡 من «تخصيص» تقدر تخفي أو تُظهر خانات <b>المساحة</b> أو تضيف زيادة أو نقصاناً، ومن «متقدمة» تغيّر العلاقات وتضيف خانة جديدة.
+              من «تخصيص» يمكنك إظهار خانات <b>المساحة</b> أو تعديل الترتيب، ومن «متقدمة» تعديل العلاقات وإضافة خانات مخصصة.
             </p>
             <button
               type="button"
@@ -5672,7 +6669,7 @@ export default function App() {
       {/* نافذة تأكيد عام (بديل مخصص لـ confirm) */}
       {confirmDlg && (
         <div className="pop-modal" onClick={() => setConfirmDlg(null)}>
-          <div className="wbox" onClick={(e) => e.stopPropagation()}>
+          <div className="wbox" role="dialog" aria-modal="true" aria-label={confirmDlg.title} onClick={(e) => e.stopPropagation()}>
             <h2>{confirmDlg.title}</h2>
             <p className="wl" style={{ marginTop: 6 }}>
               {confirmDlg.message}
@@ -5712,8 +6709,11 @@ export default function App() {
             window.history.pushState({ step: state.step }, "");
           }}
         >
-          <div className="wbox" onClick={(e) => e.stopPropagation()}>
-            <h2>⚠️ هل تريد الخروج؟</h2>
+          <div className="wbox" role="dialog" aria-modal="true" aria-label="تأكيد الخروج" onClick={(e) => e.stopPropagation()}>
+            <h2 className="sum-title">
+              <AlertTriangle className="ico" style={{ color: "var(--warn)" }} aria-hidden="true" />
+              <span>هل تريد الخروج؟</span>
+            </h2>
             <p className="wl" style={{ marginTop: 6 }}>
               بياناتك وقياساتك محفوظة تلقائياً على جهازك. هل تريد الخروج من التطبيق؟
             </p>
@@ -5786,7 +6786,8 @@ export default function App() {
               setOpenBar(null);
             }}
           >
-            📂 فتح الملف
+            <FolderOpen className="ico-inline" aria-hidden="true" />
+            فتح الملف
           </button>
           {openBar.web && (
             <button
@@ -5821,7 +6822,32 @@ export default function App() {
         </div>
       )}
 
-      <div id="toast" className={toastOn ? "on" : ""}>
+      {subModalOpen && authUser && tenant && (
+        <SubscriptionModal
+          locked={false}
+          user={authUser}
+          tenant={tenant}
+          access={tenantAccess}
+          plans={plans}
+          config={platformConfig}
+          myRequests={myRequests}
+          onClose={() => setSubModalOpen(false)}
+          onSignOut={handleSignOut}
+          onToast={toast}
+        />
+      )}
+
+      {adminPanelOpen && authUser && isAdminUser && (
+        <AdminPanel
+          adminUser={authUser}
+          plans={plans}
+          config={platformConfig}
+          onClose={() => setAdminPanelOpen(false)}
+          onToast={toast}
+        />
+      )}
+
+      <div id="toast" role="status" aria-live="polite" className={toastOn ? "on" : ""}>
         {toastMsg}
       </div>
     </>

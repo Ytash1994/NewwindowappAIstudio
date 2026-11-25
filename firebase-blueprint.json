@@ -1,0 +1,151 @@
+{
+  "entities": {
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Explicit platform administrator registry entry",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 200 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "createdAt"]
+    },
+    "PlatformConfig": {
+      "title": "PlatformConfig",
+      "description": "Global SaaS payment (CliQ/WhatsApp) and trial configuration",
+      "type": "object",
+      "properties": {
+        "whatsappPhone": { "type": "string", "maxLength": 30 },
+        "cliqAlias": { "type": "string", "maxLength": 100 },
+        "cliqBankName": { "type": "string", "maxLength": 100 },
+        "cliqHolderName": { "type": "string", "maxLength": 120 },
+        "trialDaysDefault": { "type": "number" },
+        "supportNote": { "type": "string", "maxLength": 500 },
+        "updatedBy": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["whatsappPhone", "cliqAlias", "cliqBankName", "cliqHolderName", "trialDaysDefault", "supportNote", "updatedBy", "updatedAt"]
+    },
+    "SubscriptionPlan": {
+      "title": "SubscriptionPlan",
+      "description": "Subscription tier definition editable by platform admin",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 40, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "maxLength": 80 },
+        "priceLabel": { "type": "string", "maxLength": 60 },
+        "priceMonthlyJod": { "type": "number" },
+        "maxProjects": { "type": "number" },
+        "allowExport": { "type": "boolean" },
+        "allowCustomTypes": { "type": "boolean" },
+        "active": { "type": "boolean" },
+        "sortOrder": { "type": "number" },
+        "features": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "priceLabel", "priceMonthlyJod", "maxProjects", "allowExport", "allowCustomTypes", "active", "sortOrder", "features", "updatedAt"]
+    },
+    "TenantAccount": {
+      "title": "TenantAccount",
+      "description": "Isolated workshop workspace account and server-enforced subscription state",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 200 },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "workshopName": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "role": { "type": "string", "enum": ["owner", "admin"] },
+        "subscriptionStatus": { "type": "string", "enum": ["trialing", "active", "expired", "suspended"] },
+        "planId": { "type": "string", "maxLength": 40, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "trialDays": { "type": "number" },
+        "activeUntil": { "type": "string", "format": "date-time" },
+        "adminNote": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "email", "displayName", "workshopName", "phone", "role", "subscriptionStatus", "planId", "trialDays", "activeUntil", "adminNote", "createdAt", "updatedAt"]
+    },
+    "SavedProjectDoc": {
+      "title": "SavedProjectDoc",
+      "description": "Tenant-isolated window calculator project with full calculation snapshot",
+      "type": "object",
+      "properties": {
+        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "maxLength": 120 },
+        "windowType": { "type": "string", "maxLength": 100 },
+        "unit": { "type": "string", "enum": ["m", "cm", "mm"] },
+        "windowCount": { "type": "number" },
+        "snapshot": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerUid", "name", "windowType", "unit", "windowCount", "snapshot", "createdAt", "updatedAt"]
+    },
+    "ActivationRequest": {
+      "title": "ActivationRequest",
+      "description": "WhatsApp/CliQ subscription activation request submitted by a workshop",
+      "type": "object",
+      "properties": {
+        "tenantId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 200 },
+        "workshopName": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "planId": { "type": "string", "maxLength": 40, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "billingCycle": { "type": "string", "enum": ["monthly", "quarterly", "yearly"] },
+        "cliqNote": { "type": "string", "maxLength": 300 },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "reviewedBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["tenantId", "ownerUid", "email", "workshopName", "phone", "planId", "billingCycle", "cliqNote", "status", "reviewedBy", "createdAt", "updatedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable administrative action log",
+      "type": "object",
+      "properties": {
+        "actorUid": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorEmail": { "type": "string", "format": "email", "maxLength": 200 },
+        "action": { "type": "string", "maxLength": 80 },
+        "targetTenantId": { "type": "string", "maxLength": 128 },
+        "details": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["actorUid", "actorEmail", "action", "targetTenantId", "details", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Platform administrator registry"
+    },
+    "/config/{configId}": {
+      "schema": { "$ref": "#/entities/PlatformConfig" },
+      "description": "Platform CliQ/WhatsApp settings document (config/platform)"
+    },
+    "/plans/{planId}": {
+      "schema": { "$ref": "#/entities/SubscriptionPlan" },
+      "description": "Editable SaaS subscription plans catalog"
+    },
+    "/tenants/{tenantId}": {
+      "schema": { "$ref": "#/entities/TenantAccount" },
+      "description": "Per-workshop isolated account and subscription state"
+    },
+    "/tenants/{tenantId}/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/SavedProjectDoc" },
+      "description": "Per-workshop saved window calculation projects"
+    },
+    "/activation_requests/{requestId}": {
+      "schema": { "$ref": "#/entities/ActivationRequest" },
+      "description": "CliQ & WhatsApp activation requests awaiting admin approval"
+    },
+    "/audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Immutable admin action audit trail"
+    }
+  }
+}

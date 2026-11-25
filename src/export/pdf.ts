@@ -96,7 +96,7 @@ function hslToRgb(h: number, s: number, l: number): RGB {
 function sanitizeForPdf(input: string): string {
   return String(input == null ? "" : input)
     .replace(/[\u2066\u2067\u2068\u2069\u200E\u200F]/g, "")
-    .replace(/⏳/g, "—")
+    .replace(/⏳/g, "")
     .replace(/[^\u0020-\u007E\u00A0-\u00FF\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF\u2013\u2014\u2026\u2212\u00D7\u00F7\u00B2\u2248✓✕]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -548,21 +548,25 @@ export async function buildPdf(
       const y = TABLE_TOP + k * RH;
       row.forEach((v, i) => {
         const c = cols[i];
+        const raw = v == null ? "" : String(v).trim();
+        const cellVal = raw === "" || raw === "-" || raw === "—" || raw === "⏳" ? "" : raw;
         if (i < 3) {
           drawRectTop(curPage, c.l, y, c.pw, RH, even ? EVEN_BG : WHITE, BORDER_GRAY, 0.6, H);
-          drawCellText(
-            curPage,
-            String(v === "" ? "—" : v),
-            c.cx,
-            y,
-            RH,
-            c.pw - 4,
-            fBold,
-            nf,
-            INK,
-            H,
-            1
-          );
+          if (cellVal !== "") {
+            drawCellText(
+              curPage,
+              cellVal,
+              c.cx,
+              y,
+              RH,
+              c.pw - 4,
+              fBold,
+              nf,
+              INK,
+              H,
+              1
+            );
+          }
         } else {
           const h = metaHues[i - 3];
           drawRectTop(
@@ -576,19 +580,21 @@ export async function buildPdf(
             0.6,
             H
           );
-          drawCellText(
-            curPage,
-            String(v === "" ? "—" : v),
-            c.cx,
-            y,
-            RH,
-            c.pw - 4,
-            fReg,
-            nf,
-            INK,
-            H,
-            2
-          );
+          if (cellVal !== "") {
+            drawCellText(
+              curPage,
+              cellVal,
+              c.cx,
+              y,
+              RH,
+              c.pw - 4,
+              fReg,
+              nf,
+              INK,
+              H,
+              2
+            );
+          }
         }
       });
       curY = y + RH;
