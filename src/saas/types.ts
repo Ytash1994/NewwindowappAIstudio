@@ -135,6 +135,7 @@ export interface ResolvedPlanLimits {
   maxCustomTypes: number; // -1 غير محدود
   maxCustomFieldsPerType: number; // -1 غير محدود
   allowReorder: true; // تغيير الترتيب مسموح دائماً لجميع العلاقات في كل الباقات
+  allowImportExport: boolean; // استيراد وتصدير الأنواع والقياسات (مقفل في التجربة والباقة الأولى، ومسموح بدءاً من الباقة الثانية)
   canRequestExtraTypesAddon: boolean;
   extraTypesPackSize: number;
   extraTypesPackPriceJod: number;
@@ -172,7 +173,7 @@ export const DEFAULT_PLANS: SubscriptionPlan[] = [
       "الأنواع الأساسية الأربعة الموجودة فقط (بدون إضافة أنواع جديدة)",
       "إضافة علاقتين (خانتين) جديدتين كحد أقصى لكل نوع",
       "تغيير ترتيب جميع العلاقات مسموح بالكامل",
-      "حفظ حتى 25 مشروعاً سحابياً (بدون تصدير PDF/Excel)",
+      "حفظ حتى 25 مشروعاً سحابياً · نسخ ولصق القياسات فقط (بدون استيراد أو تصدير للأنواع أو القياسات)",
     ],
   },
   {
@@ -194,7 +195,7 @@ export const DEFAULT_PLANS: SubscriptionPlan[] = [
       "إضافة حتى نوعين شبابيك جديدين مخصصين للورشة",
       "إضافة حتى 5 علاقات (خانات) جديدة لكل نوع",
       "تغيير ترتيب جميع العلاقات مسموح بالكامل",
-      "حفظ حتى 150 مشروعاً سحابياً + تصدير PDF و Excel",
+      "حفظ حتى 150 مشروعاً سحابياً + استيراد وتصدير الأنواع والقياسات (PDF و Excel و JSON)",
     ],
   },
   {
@@ -216,7 +217,7 @@ export const DEFAULT_PLANS: SubscriptionPlan[] = [
       "إضافة حتى 5 أنواع شبابيك جديدة (+ طلب حزم إضافية مقابل 10 دنانير لمرة واحدة مع الاشتراك)",
       "إضافة علاقات وخانات جديدة غير محدودة لكل نوع",
       "تغيير ترتيب جميع العلاقات مسموح بالكامل",
-      "مشاريع سحابية غير محدودة + تصدير PDF و Excel ودعم واتساب",
+      "مشاريع سحابية غير محدودة + استيراد وتصدير الأنواع والقياسات (PDF و Excel و JSON) ودعم واتساب",
     ],
   },
 ];
@@ -295,6 +296,7 @@ export function resolvePlanLimits(
       maxCustomTypes: LAUNCH_MAX_CUSTOM_TYPES,
       maxCustomFieldsPerType: -1,
       allowReorder: true,
+      allowImportExport: true,
       canRequestExtraTypesAddon: false,
       extraTypesPackSize: DEFAULT_EXTRA_TYPES_PACK_SIZE,
       extraTypesPackPriceJod: DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
@@ -308,6 +310,7 @@ export function resolvePlanLimits(
       maxCustomTypes: TRIAL_MAX_CUSTOM_TYPES,
       maxCustomFieldsPerType: TRIAL_MAX_CUSTOM_FIELDS_PER_TYPE,
       allowReorder: true,
+      allowImportExport: false,
       canRequestExtraTypesAddon: false,
       extraTypesPackSize: DEFAULT_EXTRA_TYPES_PACK_SIZE,
       extraTypesPackPriceJod: DEFAULT_EXTRA_TYPES_PACK_PRICE_JOD,
@@ -315,6 +318,11 @@ export function resolvePlanLimits(
   }
 
   const resolved = getPlanDefaultsById(plan || { id: tenant.planId });
+  const fallbackPlan = DEFAULT_PLANS.find((p) => p.id === (plan?.id || tenant.planId));
+  const allowImportExport =
+    typeof plan?.allowExport === "boolean"
+      ? plan.allowExport
+      : Boolean(fallbackPlan?.allowExport);
   const baseMaxCustomTypes =
     resolved.maxCustomTypes < 0
       ? LAUNCH_MAX_CUSTOM_TYPES
@@ -342,6 +350,7 @@ export function resolvePlanLimits(
     maxCustomTypes,
     maxCustomFieldsPerType: resolved.maxCustomFieldsPerType,
     allowReorder: true,
+    allowImportExport,
     canRequestExtraTypesAddon: resolved.allowExtraTypesAddon && remainingAddonSlots > 0,
     extraTypesPackSize: effectivePackSize || resolved.extraTypesPackSize,
     extraTypesPackPriceJod: resolved.extraTypesPackPriceJod,

@@ -747,6 +747,7 @@ service cloud.firestore {
           (
             incoming().requestType == 'extra_types_addon' &&
             get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.subscriptionStatus == 'active' &&
+            hasActiveTenantAccess(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data) &&
             exists(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)) &&
             planAllowsExtraTypesAddon(get(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)).data) &&
             planBaseMaxCustomTypes(get(/databases/$(database)/documents/plans/$(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.planId)).data) >= 0 &&

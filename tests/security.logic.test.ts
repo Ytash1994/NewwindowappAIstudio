@@ -202,6 +202,7 @@ runTest("حدود الباقات الثلاث والتجربة المجانية 
   assert.equal(trialLim.maxCustomTypes, 0);
   assert.equal(trialLim.maxCustomFieldsPerType, 2);
   assert.equal(trialLim.allowReorder, true);
+  assert.equal(trialLim.allowImportExport, false);
   assert.equal(trialLim.canRequestExtraTypesAddon, false);
 
   const starterLim = resolvePlanLimits(
@@ -212,6 +213,7 @@ runTest("حدود الباقات الثلاث والتجربة المجانية 
   assert.equal(starterLim.maxCustomTypes, 0);
   assert.equal(starterLim.maxCustomFieldsPerType, 2);
   assert.equal(starterLim.allowReorder, true);
+  assert.equal(starterLim.allowImportExport, false, "الباقة الأولى لا تسمح بالاستيراد أو التصدير");
   assert.equal(starterLim.canRequestExtraTypesAddon, false);
 
   const proLim = resolvePlanLimits(
@@ -222,6 +224,7 @@ runTest("حدود الباقات الثلاث والتجربة المجانية 
   assert.equal(proLim.maxCustomTypes, 2, "الحزمة الإضافية لا تنطبق على الباقة الثانية");
   assert.equal(proLim.maxCustomFieldsPerType, 5);
   assert.equal(proLim.allowReorder, true);
+  assert.equal(proLim.allowImportExport, true, "الباقة الثانية تسمح باستيراد وتصدير الأنواع والقياسات");
   assert.equal(proLim.canRequestExtraTypesAddon, false);
 
   const bizLim = resolvePlanLimits(
@@ -232,9 +235,17 @@ runTest("حدود الباقات الثلاث والتجربة المجانية 
   assert.equal(bizLim.maxCustomTypes, 5);
   assert.equal(bizLim.maxCustomFieldsPerType, -1);
   assert.equal(bizLim.allowReorder, true);
+  assert.equal(bizLim.allowImportExport, true);
   assert.equal(bizLim.canRequestExtraTypesAddon, true);
   assert.equal(bizLim.extraTypesPackSize, 5);
   assert.equal(bizLim.extraTypesPackPriceJod, 10);
+
+  const adminLim = resolvePlanLimits(
+    makeTenant({ email: "Xtashtoush@gmail.com", planId: "starter", subscriptionStatus: "active" }),
+    starterPlan,
+    true
+  );
+  assert.equal(adminLim.allowImportExport, true);
 
   const bizWithAddon = resolvePlanLimits(
     makeTenant({ planId: "business", subscriptionStatus: "active", extraCustomTypesQuota: 5 }),
@@ -597,6 +608,12 @@ runTest("التحقق من الالتزام التام بخطة Firebase Spark �
   assert.ok(rulesText.includes("planAllowsCustomTypes"));
   assert.ok(rulesText.includes("planAllowsCustomFields"));
   assert.ok(rulesText.includes("planAllowsExtraTypesAddon"));
+  assert.ok(
+    rulesText.includes(
+      "incoming().requestType == 'extra_types_addon' &&\n            get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data.subscriptionStatus == 'active' &&\n            hasActiveTenantAccess(get(/databases/$(database)/documents/tenants/$(request.auth.uid)).data)"
+    ),
+    "يجب التحقق من hasActiveTenantAccess عند طلب extra_types_addon لمنع الحسابات المنتهية"
+  );
   assert.ok(rulesText.includes("existing().status == 'pending'"));
   assert.ok(rulesText.includes("match /admins/{adminUid} {\n      allow read, write: if false;\n    }"));
   assert.ok(rulesText.includes("match /expiry_alerts/{alertId} {\n      allow read, write: if false;\n    }"));
@@ -609,6 +626,10 @@ runTest("التحقق من الالتزام التام بخطة Firebase Spark �
   assert.ok(firebaseTs.includes("VITE_RECAPTCHA_V3_SITE_KEY"));
   assert.ok(firebaseTs.includes("import.meta.env?.DEV"));
   assert.equal(firebaseTs.includes("SECRET"), false, "لا يجوز تخزين أي سر في src/firebase.ts");
+
+  // 7. فحص وجود تقرير مراجعة الحصص القديمة في AdminPanel (قراءة فقط)
+  const adminPanelTs = fs.readFileSync(path.resolve("src/saas/AdminPanel.tsx"), "utf8");
+  assert.ok(adminPanelTs.includes("legacyQuotaReview"), "يجب عرض تقرير قراءة فقط للحصص القديمة المتجاوزة للسقف");
 });
 
 console.log(`\nاكتملت جميع اختبارات الأمان والاشتراكات وخطة Spark بنجاح (${passed}/${passed}).`);

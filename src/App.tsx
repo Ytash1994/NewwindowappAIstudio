@@ -640,18 +640,18 @@ export default function App() {
     return plans.find((p) => p.id === tenant.planId) || null;
   }, [isAdminUser, tenant, plans]);
 
-  // تصدير PDF و Excel غير مسموح في الفترة التجريبية ولا في الباقة الأساسية
-  const canExportFiles = useMemo(() => {
-    if (isAdminUser) return true;
-    if (!tenant || tenantAccess.state !== "active") return false;
-    return Boolean(activePlan?.allowExport);
-  }, [isAdminUser, tenant, tenantAccess.state, activePlan]);
-
-  // حدود الأنواع المخصصة والعلاقات الجديدة لكل نوع حسب الباقة (تغيير الترتيب مسموح دائماً)
+  // حدود الأنواع المخصصة والعلاقات الجديدة والاستيراد/التصدير حسب الباقة (تغيير الترتيب مسموح دائماً)
   const planLimits = useMemo(
     () => resolvePlanLimits(tenant, activePlan, isAdminUser),
     [tenant, activePlan, isAdminUser]
   );
+
+  // استيراد وتصدير الأنواع والقياسات (PDF / Excel / CSV / JSON) غير مسموح في الفترة التجريبية والباقة الأساسية، ومسموح بدءاً من الباقة الاحترافية
+  const canExportFiles = useMemo(() => {
+    if (isAdminUser) return true;
+    if (!tenant || tenantAccess.state !== "active") return false;
+    return planLimits.allowImportExport;
+  }, [isAdminUser, tenant, tenantAccess.state, planLimits.allowImportExport]);
 
   // مزامنة توقيت الخادم الموثوق عند التشغيل وتحديث المؤقت كل دقيقة لإقفال التجربة المنتهية تلقائياً
   useEffect(() => {
@@ -1805,9 +1805,12 @@ export default function App() {
 
   const handleOpenProject = (proj: SavedProject) => {
     const hydrated = hydrateState(proj.data);
-    // Preserve newer custom user types created after this project was saved
+    // Preserve newer custom user types created after this project was saved without pushing beyond plan cap
     state.utypes.forEach((u) => {
       if (!hydrated.utypes.some((x) => x.name === u.name)) {
+        if (planLimits.maxCustomTypes >= 0 && hydrated.utypes.length >= planLimits.maxCustomTypes) {
+          return;
+        }
         hydrated.utypes.push(u);
         if (state.custom[u.name] && !hydrated.custom[u.name]) {
           hydrated.custom[u.name] = state.custom[u.name].map((c) => ({ ...c }));
@@ -1833,7 +1836,14 @@ export default function App() {
     setNegHighlightedRows(new WeakSet());
     setPjName(proj.name);
     setState(hydrated);
-    toast(`تم فتح مشروع «${proj.name}»`);
+    if (planLimits.maxCustomTypes >= 0 && hydrated.utypes.length > planLimits.maxCustomTypes) {
+      toast(
+        `تم فتح «${proj.name}» مع كامل بياناته. تنبيه: يحتوي على ${hydrated.utypes.length} أنواع مخصصة بينما الحد الفعّال لباقتك هو ${planLimits.maxCustomTypes} — لم يُحذف أي نوع تلقائياً، ولحفظ تعديلات جديدة يرجى تقليصها أو مراجعة الإدارة.`,
+        6000
+      );
+    } else {
+      toast(`تم فتح مشروع «${proj.name}»`);
+    }
   };
 
   const handleNewBlankProject = () => {
@@ -2940,6 +2950,14 @@ export default function App() {
 
   // ---------- Excel Import (.xlsx) ----------
   const openXlsxImport = () => {
+    if (!canExportFiles) {
+      toast(
+        "استيراد الأنواع والقياسات من Excel غير متاح في الفترة التجريبية أو الباقة الأساسية (يتاح نسخ ولصق القياسات فقط). قم بالترقية للباقة الاحترافية.",
+        4500
+      );
+      setSubModalOpen(true);
+      return;
+    }
     if (xlFileRef.current) {
       xlFileRef.current.value = "";
       xlFileRef.current.click();
@@ -2947,6 +2965,14 @@ export default function App() {
   };
 
   const handleXlsxFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!canExportFiles) {
+      toast(
+        "استيراد ملفات Excel غير متاح في الباقة الأساسية أو الفترة التجريبية. قم بالترقية للباقة الاحترافية.",
+        4200
+      );
+      setSubModalOpen(true);
+      return;
+    }
     const f = e.target.files?.[0];
     if (!f) return;
     if (f.size > 8e6) {
@@ -2976,6 +3002,15 @@ export default function App() {
   };
 
   const executeXlsxImport = () => {
+    if (!canExportFiles) {
+      setXlImportState(null);
+      toast(
+        "استيراد الأنواع والقياسات غير متاح في الباقة الأساسية أو الفترة التجريبية. قم بالترقية للباقة الاحترافية.",
+        4500
+      );
+      setSubModalOpen(true);
+      return;
+    }
     if (!xlImportState) return;
     const { parsed, useRows, useSettings, unit, mode } = xlImportState;
     if (!useRows && !useSettings) {
@@ -3032,6 +3067,27 @@ export default function App() {
           step: useRows && nextRows && nextRows.length ? 2 : 1,
         };
         const hydrated = hydrateState(merged);
+        if (planLimits.maxCustomTypes >= 0 && hydrated.utypes.length > planLimits.maxCustomTypes) {
+          toast(
+            `الملف يحتوي على ${hydrated.utypes.length} أنواع مخصصة، بينما حد باقتك الحالية هو ${planLimits.maxCustomTypes}. قم بترقية الباقة أولاً.`,
+            4800
+          );
+          setSubModalOpen(true);
+          return;
+        }
+        if (planLimits.maxCustomFieldsPerType >= 0) {
+          const overType = Object.entries(hydrated.custom || {}).find(
+            ([, list]) => Array.isArray(list) && list.length > planLimits.maxCustomFieldsPerType
+          );
+          if (overType) {
+            toast(
+              `الملف يحتوي على أكثر من ${planLimits.maxCustomFieldsPerType} علاقات جديدة لنوع «${overType[0]}» وهو ما يتجاوز حد باقتك الحالية.`,
+              4800
+            );
+            setSubModalOpen(true);
+            return;
+          }
+        }
         hydrated.layout = syncLayoutWithCustom(hydrated);
         hydrated.rows = withTrailingEmpty(hydrated.rows);
         setDeletedUndo(null);
@@ -3162,6 +3218,14 @@ export default function App() {
 
   // Backup & Restore JSON
   const handleBackupSave = () => {
+    if (!canExportFiles) {
+      toast(
+        "تصدير نسخة احتياطية للأنواع والعلاقات غير متاح في الفترة التجريبية أو الباقة الأساسية. قم بالترقية للباقة الاحترافية.",
+        4500
+      );
+      setSubModalOpen(true);
+      return;
+    }
     persistState(state);
     const { raw: _ignored, ...cleanData } = state;
     void _ignored;
@@ -3178,6 +3242,14 @@ export default function App() {
   };
 
   const handleBackupFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!canExportFiles) {
+      toast(
+        "استيراد الأنواع والعلاقات من ملف غير متاح في الفترة التجريبية أو الباقة الأساسية. قم بالترقية للباقة الاحترافية.",
+        4500
+      );
+      setSubModalOpen(true);
+      return;
+    }
     const f = e.target.files?.[0];
     if (!f) return;
     if (f.size > 3e6) {
@@ -4268,8 +4340,16 @@ export default function App() {
                   <FilePlus2 className="ico-sm" aria-hidden="true" />
                   جديد
                 </button>
-                <button type="button" className="btn sm g" onClick={openXlsxImport}>
-                  <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                <button
+                  type="button"
+                  className={`btn sm g${!canExportFiles ? " export-locked" : ""}`}
+                  onClick={openXlsxImport}
+                >
+                  {canExportFiles ? (
+                    <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                  ) : (
+                    <Lock className="ico-sm" aria-hidden="true" />
+                  )}
                   استيراد Excel
                 </button>
               </div>
@@ -4668,26 +4748,73 @@ export default function App() {
               <p className="rtip">
                 احفظ نسخة قبل تحديث التطبيق أو حذفه، ثم استعدها بعد التثبيت.
               </p>
+              {!canExportFiles && (
+                <div className="saas-export-lock" style={{ marginBottom: 10 }}>
+                  <Lock className="ico-sm" aria-hidden="true" />
+                  <div>
+                    <b>تصدير واستيراد الأنواع والقياسات مقفل في حسابك الحالي</b>
+                    <small>
+                      الباقة الأساسية والفترة التجريبية تتيحان نسخ ولصق القياسات فقط. قم بالترقية
+                      للباقة الاحترافية لتفعيل استيراد وتصدير الأنواع والقياسات.
+                    </small>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn sm p"
+                    onClick={() => setSubModalOpen(true)}
+                  >
+                    ترقية
+                  </button>
+                </div>
+              )}
               <div className="row">
-                <button type="button" className="btn g sm" onClick={handleBackupSave}>
-                  <Download className="ico-sm" aria-hidden="true" />
+                <button
+                  type="button"
+                  className={`btn g sm${!canExportFiles ? " export-locked" : ""}`}
+                  onClick={handleBackupSave}
+                >
+                  {canExportFiles ? (
+                    <Download className="ico-sm" aria-hidden="true" />
+                  ) : (
+                    <Lock className="ico-sm" aria-hidden="true" />
+                  )}
                   حفظ نسخة احتياطية
                 </button>
                 <button
                   type="button"
-                  className="btn w sm"
+                  className={`btn w sm${!canExportFiles ? " export-locked" : ""}`}
                   onClick={() => {
+                    if (!canExportFiles) {
+                      toast(
+                        "استيراد الأنواع والعلاقات غير متاح في الفترة التجريبية أو الباقة الأساسية. قم بالترقية للباقة الاحترافية.",
+                        4500
+                      );
+                      setSubModalOpen(true);
+                      return;
+                    }
                     if (bkFileRef.current) {
                       bkFileRef.current.value = "";
                       bkFileRef.current.click();
                     }
                   }}
                 >
-                  <Upload className="ico-sm" aria-hidden="true" />
+                  {canExportFiles ? (
+                    <Upload className="ico-sm" aria-hidden="true" />
+                  ) : (
+                    <Lock className="ico-sm" aria-hidden="true" />
+                  )}
                   استعادة من ملف
                 </button>
-                <button type="button" className="btn p sm" onClick={openXlsxImport}>
-                  <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                <button
+                  type="button"
+                  className={`btn p sm${!canExportFiles ? " export-locked" : ""}`}
+                  onClick={openXlsxImport}
+                >
+                  {canExportFiles ? (
+                    <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                  ) : (
+                    <Lock className="ico-sm" aria-hidden="true" />
+                  )}
                   استيراد من Excel
                 </button>
               </div>
@@ -4790,10 +4917,12 @@ export default function App() {
                 >
                   جرّب مثالاً
                 </button>
-                <button type="button" onClick={openXlsxImport}>
-                  <FileSpreadsheet className="ico-sm" aria-hidden="true" />
-                  استيراد من Excel
-                </button>
+                {canExportFiles && (
+                  <button type="button" onClick={openXlsxImport}>
+                    <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                    استيراد من Excel
+                  </button>
+                )}
               </div>
             )}
 
@@ -5146,7 +5275,11 @@ export default function App() {
               <summary>
                 <span className="sum-title">
                   <ClipboardList className="ico-sm" aria-hidden="true" />
-                  <span>أدوات: لصق قياسات · استيراد Excel · مسح الكل</span>
+                  <span>
+                    {canExportFiles
+                      ? "أدوات: لصق قياسات · استيراد Excel · مسح الكل"
+                      : "أدوات: لصق قياسات · مسح الكل"}
+                  </span>
                 </span>
               </summary>
               <textarea
@@ -5158,10 +5291,12 @@ export default function App() {
                 <button type="button" className="btn g sm" onClick={handlePaste}>
                   إضافة المُلصق
                 </button>
-                <button type="button" className="btn p sm" onClick={openXlsxImport}>
-                  <FileSpreadsheet className="ico-sm" aria-hidden="true" />
-                  استيراد من ملف Excel
-                </button>
+                {canExportFiles && (
+                  <button type="button" className="btn p sm" onClick={openXlsxImport}>
+                    <FileSpreadsheet className="ico-sm" aria-hidden="true" />
+                    استيراد من ملف Excel
+                  </button>
+                )}
                 <button type="button" className="btn r sm" onClick={handleClearAll}>
                   <Trash2 className="ico-sm" aria-hidden="true" />
                   مسح كل الشبابيك
@@ -6455,10 +6590,10 @@ export default function App() {
             <div className="saas-export-lock">
               <Lock className="ico-sm" aria-hidden="true" />
               <div>
-                <b>حفظ ومشاركة PDF و Excel مقفل في حسابك الحالي</b>
+                <b>تصدير واستيراد الملفات (PDF / Excel / CSV) مقفل في حسابك الحالي</b>
                 <small>
-                  غير متاح في الفترة التجريبية ولا في الباقة الأساسية. قم بالترقية للباقة الاحترافية
-                  أو باقة الورش لتفعيل التصدير.
+                  الباقة الأساسية والفترة التجريبية تتيحان نسخ ولصق القياسات فقط. قم بالترقية
+                  للباقة الاحترافية لتفعيل استيراد وتصدير الأنواع والقياسات.
                 </small>
               </div>
               <button
@@ -6578,8 +6713,17 @@ export default function App() {
             </button>
             <button
               type="button"
-              className="btn w"
+              className={`btn w${!canExportFiles ? " export-locked" : ""}`}
               onClick={() => {
+                if (!canExportFiles) {
+                  toast(
+                    "تصدير ملفات CSV غير متاح في الفترة التجريبية أو الباقة الأساسية (يتاح نسخ القياسات فقط). قم بالترقية للباقة الاحترافية.",
+                    4200
+                  );
+                  setSaveOpen(false);
+                  setSubModalOpen(true);
+                  return;
+                }
                 if (!res.table.length) return;
                 const csv =
                   "\uFEFF" +
@@ -6589,7 +6733,11 @@ export default function App() {
                 saveBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), `${fnBase()}.csv`, "text/csv", "save");
               }}
             >
-              <FileText className="ico-sm" aria-hidden="true" />
+              {canExportFiles ? (
+                <FileText className="ico-sm" aria-hidden="true" />
+              ) : (
+                <Lock className="ico-sm" aria-hidden="true" />
+              )}
               ملف نصي CSV
             </button>
             <button
@@ -6628,8 +6776,17 @@ export default function App() {
           <p className="lead">بعض المتصفحات تمنع حفظ الملفات تلقائياً. جرّب إحدى هذه الطرق:</p>
           <button
             type="button"
-            className="btn p"
+            className={`btn p${!canExportFiles ? " export-locked" : ""}`}
             onClick={async () => {
+              if (!canExportFiles) {
+                toast(
+                  "تنزيل الملفات غير متاح في الفترة التجريبية أو الباقة الأساسية. قم بالترقية للباقة الاحترافية.",
+                  4000
+                );
+                setAltOpen(false);
+                setSubModalOpen(true);
+                return;
+              }
               if (!lastSavedBlobRef.current) {
                 toast("احفظ الملف أولاً ثم افتحه");
                 return;

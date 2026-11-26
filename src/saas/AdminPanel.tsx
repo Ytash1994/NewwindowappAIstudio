@@ -214,6 +214,37 @@ export function AdminPanel({
     };
   }, [tenants, requests, expiringTenants.length, serverNowMs]);
 
+  // تقرير قراءة فقط للحسابات القديمة التي تحمل حصة extraCustomTypesQuota تتجاوز سقف الإطلاق (10 أنواع) أو على باقة لا تدعم الحزم الإضافية
+  const legacyQuotaReview = useMemo(() => {
+    return tenants
+      .map((t) => {
+        const storedExtra =
+          typeof t.extraCustomTypesQuota === "number" && t.extraCustomTypesQuota > 0
+            ? Math.round(t.extraCustomTypesQuota)
+            : 0;
+        if (storedExtra <= 0) return null;
+        const planObj = plans.find((p) => p.id === t.planId) || { id: t.planId };
+        const pDef = getPlanDefaultsById(planObj);
+        const baseMax = Math.max(0, Math.min(LAUNCH_MAX_CUSTOM_TYPES, pDef.maxCustomTypes));
+        const storedTotal = baseMax + storedExtra;
+        const exceedsCap = storedTotal > LAUNCH_MAX_CUSTOM_TYPES;
+        const unsupportedPlan = !pDef.allowExtraTypesAddon;
+        if (!exceedsCap && !unsupportedPlan) return null;
+        return {
+          tenant: t,
+          planName: plans.find((p) => p.id === t.planId)?.name || t.planId,
+          baseMax,
+          storedExtra,
+          storedTotal,
+          effectiveCap: unsupportedPlan ? baseMax : LAUNCH_MAX_CUSTOM_TYPES,
+          reason: unsupportedPlan
+            ? "حصة إضافية مسجّلة على باقة لا تدعم الحزم الإضافية"
+            : `الإجمالي المسجّل (${storedTotal}) يتجاوز سقف الإطلاق (${LAUNCH_MAX_CUSTOM_TYPES})`,
+        };
+      })
+      .filter((x): x is NonNullable<typeof x> => x !== null);
+  }, [tenants, plans]);
+
   const filteredTenants = useMemo(() => {
     const q = searchQ.trim().toLowerCase();
     return tenants.filter((t) => {
@@ -545,6 +576,34 @@ export function AdminPanel({
           {/* 1. الورش والاشتراكات */}
           {tab === "tenants" && (
             <>
+              {legacyQuotaReview.length > 0 && (
+                <div className="saas-section" style={{ borderColor: "rgba(245, 158, 11, 0.45)", marginBottom: 12 }}>
+                  <h3>
+                    تنبيه مراجعة الحصص القديمة ({legacyQuotaReview.length} حساب يتجاوز سقف {LAUNCH_MAX_CUSTOM_TYPES} أنواع)
+                  </h3>
+                  <p className="rtip" style={{ marginBottom: 8 }}>
+                    لا يتم حذف أو خفض حصة أي عميل تلقائياً. هذه الحسابات محكومة فعلياً بسقف{" "}
+                    <b>{LAUNCH_MAX_CUSTOM_TYPES} أنواع مخصصة</b> عند الحفظ السحابي، وتحتاج مراجعة يدوية وموافقتك قبل أي تعديل:
+                  </p>
+                  <div className="saas-admin-list" style={{ gap: 6 }}>
+                    {legacyQuotaReview.map((item) => (
+                      <div key={item.tenant.ownerUid} className="saas-tenant-card" style={{ padding: "8px 10px" }}>
+                        <div className="saas-tenant-top">
+                          <b>{item.tenant.workshopName || item.tenant.displayName || "ورشة"}</b>
+                          <span className="saas-status-tag st-trialing">
+                            مسجّل +{item.storedExtra} · الحد الفعّال {item.effectiveCap}
+                          </span>
+                        </div>
+                        <div className="saas-tenant-meta">
+                          <span>الباقة: <b>{item.planName}</b></span>
+                          <span>الحالة: <b>{item.reason}</b></span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div className="saas-filter-bar">
                 <div className="saas-search-box">
                   <Search className="ico-xs" aria-hidden="true" />
@@ -1268,7 +1327,7 @@ export function AdminPanel({
                                   setPlansDraft(next);
                                 }}
                               />
-                              <span>السماح بتنزيل PDF/Excel</span>
+                              <span>السماح باستيراد وتصدير الأنواع والقياسات (PDF/Excel/JSON)</span>
                             </label>
                             <label>
                               <input

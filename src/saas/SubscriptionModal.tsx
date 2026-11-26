@@ -617,7 +617,10 @@ export function SubscriptionModal({
                           {pl.maxProjects < 0
                             ? "مشاريع سحابية غير محدودة"
                             : `حتى ${pl.maxProjects} مشروعاً سحابياً`}{" "}
-                          · {pl.allowExport ? "تصدير PDF و Excel" : "بدون تصدير PDF/Excel"}
+                          ·{" "}
+                          {pl.allowExport
+                            ? "استيراد وتصدير الأنواع والقياسات (PDF و Excel و JSON)"
+                            : "نسخ ولصق القياسات فقط (بدون استيراد أو تصدير)"}
                         </span>
                       </li>
                     </ul>

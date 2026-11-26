@@ -278,6 +278,16 @@ async function seedBaseFixtures(testEnv: RulesTestEnvironment): Promise<void> {
         projectCount: 1,
       })
     );
+    await setDoc(
+      doc(db, "tenants", "biz_expired_active"),
+      makeSeedTenant("biz_expired_active", "biz_expired@workshop.jo", {
+        subscriptionStatus: "active",
+        planId: "business",
+        activeUntil: past8d, // اشتراك منتهي الصلاحية فعلياً رغم بقاء النص active
+        extraCustomTypesQuota: 0,
+        projectCount: 1,
+      })
+    );
 
     // مشاريع أولية للتحديث واختبارات العزل
     for (const uid of [
@@ -934,6 +944,33 @@ async function main() {
       await assertFails(
         updateDoc(doc(adminDb, "tenants", "pro_user"), {
           extraCustomTypesQuota: 3,
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // مشترك Business منتهي الصلاحية فعلياً (activeUntil في الماضي) يحاول طلب حزمة إضافية -> رفض
+      const bizExpiredDb = asDb(
+        testEnv.authenticatedContext("biz_expired_active", {
+          email: "biz_expired@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertFails(
+        setDoc(doc(bizExpiredDb, "activation_requests", "req_addon_expired"), {
+          tenantId: "biz_expired_active",
+          ownerUid: "biz_expired_active",
+          email: "biz_expired@workshop.jo",
+          workshopName: "ورشة اختبار",
+          phone: "0790000001",
+          planId: "business",
+          billingCycle: "monthly",
+          cliqNote: "محاولة بعد الانتهاء",
+          status: "pending",
+          reviewedBy: "",
+          requestType: "extra_types_addon",
+          extraTypesCount: 5,
+          addonPriceJod: 10,
+          createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         })
       );
