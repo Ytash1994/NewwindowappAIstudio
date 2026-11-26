@@ -18,6 +18,8 @@ export type SubscriptionStatus =
   | "expired"
   | "suspended";
 export type BillingCycle = "monthly" | "quarterly" | "yearly";
+export const ALLOWED_SUBSCRIPTION_DAYS = [30, 90, 365] as const;
+export type AllowedSubscriptionDays = (typeof ALLOWED_SUBSCRIPTION_DAYS)[number];
 export type ActivationStatus = "pending" | "approved" | "rejected";
 export type ActivationRequestType = "subscription" | "extra_types_addon";
 export type TenantRole = "owner" | "admin";
@@ -63,6 +65,11 @@ export interface TenantAccount {
   subscriptionStatus: SubscriptionStatus;
   planId: string;
   trialDays: number;
+  /** وقت التفعيل الرسمي المعتمد من الخادم (serverTimestamp / request.time) للحسابات الجديدة والمجددة */
+  activatedAt?: Timestamp | null;
+  /** مدة الاشتراك بالأيام المعتمدة في القواعد: 30 أو 90 أو 365 */
+  subscriptionDays?: AllowedSubscriptionDays | number | null;
+  /** حقل قديم للتوافق مع الحسابات السابقة فقط — يُصفّر إلى null عند كل تفعيل أو تجديد جديد */
   activeUntil: Timestamp | null;
   adminNote: string;
   projectCount?: number;
@@ -357,11 +364,22 @@ export function resolvePlanLimits(
   };
 }
 
-export const BILLING_CYCLE_LABELS: Record<BillingCycle, { label: string; months: number; days: number }> = {
+export const BILLING_CYCLE_LABELS: Record<
+  BillingCycle,
+  { label: string; months: number; days: AllowedSubscriptionDays }
+> = {
   monthly: { label: "شهري (30 يوم)", months: 1, days: 30 },
   quarterly: { label: "3 أشهر (90 يوم)", months: 3, days: 90 },
   yearly: { label: "سنوي (365 يوم)", months: 12, days: 365 },
 };
+
+export function isAllowedSubscriptionDays(days: unknown): days is AllowedSubscriptionDays {
+  return (
+    typeof days === "number" &&
+    Number.isInteger(days) &&
+    (days === 30 || days === 90 || days === 365)
+  );
+}
 
 export const BLUEPRINT_LIMITS = {
   idMax: 128,
@@ -387,6 +405,43 @@ export function tsToMs(ts?: Timestamp | null): number | null {
   if (!ts) return null;
   if (typeof ts.toMillis === "function") return ts.toMillis();
   return null;
+}
+
+/**
+ * استخراج وقت انتهاء الاشتراك المدفوع بالمللي ثانية:
+ * - الحسابات الجديدة/المجددة (activatedAt + subscriptionDays): تُحسب حصراً من activatedAt + subscriptionDays
+ *   وتتجاهل activeUntil القديم بالكامل لمنع أي تجاوز.
+ * - الحسابات القديمة (دون activatedAt/subscriptionDays): تستمر عبر activeUntil للتوافق الخلفي.
+ */
+export function getSubscriptionExpiryMs(
+  tenant: Pick<TenantAccount, "activatedAt" | "subscriptionDays" | "activeUntil">
+): {
+  endMs: number | null;
+  isServerTimed: boolean;
+} {
+  const hasActivatedField = tenant.activatedAt !== undefined && tenant.activatedAt !== null;
+  const hasDaysField = tenant.subscriptionDays !== undefined && tenant.subscriptionDays !== null;
+
+  const activatedMs = tsToMs(tenant.activatedAt);
+  if (activatedMs !== null && isAllowedSubscriptionDays(tenant.subscriptionDays)) {
+    return {
+      endMs: activatedMs + tenant.subscriptionDays * 86400000,
+      isServerTimed: true,
+    };
+  }
+
+  // بنية جزئية أو غير صالحة لـ activatedAt/subscriptionDays: إغلاق آمن بدون رجوع إلى activeUntil
+  if (hasActivatedField || hasDaysField) {
+    return {
+      endMs: 0,
+      isServerTimed: true,
+    };
+  }
+
+  return {
+    endMs: tsToMs(tenant.activeUntil),
+    isServerTimed: false,
+  };
 }
 
 export function formatRemainingArabic(diffMs: number): string {
@@ -446,7 +501,7 @@ export function evaluateTenantAccess(
   }
 
   if (tenant.subscriptionStatus === "suspended") {
-    const activeUntilMs = tsToMs(tenant.activeUntil);
+    const { endMs: activeUntilMs } = getSubscriptionExpiryMs(tenant);
     return {
       allowed: false,
       state: "suspended",
@@ -462,8 +517,22 @@ export function evaluateTenantAccess(
   }
 
   if (tenant.subscriptionStatus === "active") {
-    const activeUntilMs = tsToMs(tenant.activeUntil);
-    if (activeUntilMs === null) {
+    const { endMs: activeUntilMs, isServerTimed } = getSubscriptionExpiryMs(tenant);
+    if (tenant.planId === "trial") {
+      return {
+        allowed: false,
+        state: "expired",
+        hasPendingPayment: false,
+        daysLeft: 0,
+        hoursLeft: 0,
+        trialEndsAtMs: null,
+        activeUntilMs,
+        expiresAtMs: activeUntilMs,
+        isExpiringSoon: false,
+        remainingLabel: "انتهت المدة",
+      };
+    }
+    if (!isServerTimed && activeUntilMs === null) {
       return {
         allowed: true,
         state: "active",
@@ -477,8 +546,8 @@ export function evaluateTenantAccess(
         remainingLabel: "دائم",
       };
     }
-    const diff = activeUntilMs - nowMs;
-    if (diff > 0) {
+    const diff = activeUntilMs !== null ? activeUntilMs - nowMs : -1;
+    if (activeUntilMs !== null && diff > 0) {
       const daysLeft = Math.max(1, Math.ceil(diff / 86400000));
       const hoursLeft = Math.max(1, Math.ceil(diff / 3600000));
       return {
@@ -515,11 +584,11 @@ export function evaluateTenantAccess(
     tenant.subscriptionStatus === "pending_payment"
   ) {
     const isPendingPayment = tenant.subscriptionStatus === "pending_payment";
-    const activeUntilMs = tsToMs(tenant.activeUntil);
+    const { endMs: activeUntilMs, isServerTimed } = getSubscriptionExpiryMs(tenant);
 
-    if (activeUntilMs !== null) {
-      const diff = activeUntilMs - nowMs;
-      if (diff > 0) {
+    if (isServerTimed || activeUntilMs !== null) {
+      const diff = activeUntilMs !== null ? activeUntilMs - nowMs : -1;
+      if (activeUntilMs !== null && diff > 0) {
         const daysLeft = Math.max(1, Math.ceil(diff / 86400000));
         const hoursLeft = Math.max(1, Math.ceil(diff / 3600000));
         return {
@@ -602,7 +671,7 @@ export function evaluateTenantAccess(
     };
   }
 
-  const fallbackUntil = tsToMs(tenant.activeUntil);
+  const { endMs: fallbackUntil } = getSubscriptionExpiryMs(tenant);
   return {
     allowed: false,
     state: "expired",

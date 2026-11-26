@@ -19,6 +19,7 @@ import {
   Timestamp,
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDoc,
   getDocs,
@@ -1126,7 +1127,9 @@ async function main() {
           tx.update(tenantRef, {
             subscriptionStatus: "active",
             planId: "pro",
-            activeUntil: Timestamp.fromMillis(Date.now() + 30 * DAY_MS),
+            activatedAt: serverTimestamp(),
+            subscriptionDays: 30,
+            activeUntil: null,
             extraCustomTypesQuota: 0,
             adminNote: "تأكيد كليك",
             updatedAt: serverTimestamp(),
@@ -1180,6 +1183,507 @@ async function main() {
       await assertFails(setDoc(doc(adminDb, "admins", "other_uid"), { email: "x@y.com" }));
       await assertFails(setDoc(doc(adminDb, "config_private", "secrets"), { token: "x" }));
       await assertFails(setDoc(doc(adminDb, "expiry_alerts", "a1"), { uid: "u1" }));
+    });
+
+    // 12. تفعيل جديد بتوقيت الخادم ورفض أي activatedAt من العميل أو subscriptionDays غير مدعومة
+    await runCase("توقيت الاشتراكات الخادمي: قبول serverTimestamp + [30,90,365] ورفض أي توقيت عميل أو مدة غير مدعومة", async () => {
+      const adminDb = asDb(
+        testEnv.authenticatedContext(OWNER_UID, {
+          email: OWNER_EMAIL,
+          email_verified: true,
+        })
+      );
+      const tenantRef = doc(adminDb, "tenants", "trial_expired");
+      const nowMs = Date.now();
+
+      // 1) رفض إرسال activatedAt بقيمة Timestamp عشوائية من العميل (حتى لو قريبة من الآن)
+      await assertFails(
+        updateDoc(tenantRef, {
+          subscriptionStatus: "active",
+          planId: "starter",
+          activatedAt: Timestamp.fromMillis(nowMs),
+          subscriptionDays: 30,
+          activeUntil: null,
+          extraCustomTypesQuota: 0,
+          adminNote: "توقيت عميل عشوائي",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // 2) رفض إرسال activatedAt بتاريخ مستقبلي (+10 أيام)
+      await assertFails(
+        updateDoc(tenantRef, {
+          subscriptionStatus: "active",
+          planId: "starter",
+          activatedAt: Timestamp.fromMillis(nowMs + 10 * DAY_MS),
+          subscriptionDays: 30,
+          activeUntil: null,
+          extraCustomTypesQuota: 0,
+          adminNote: "تاريخ مستقبلي",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // 3) رفض إرسال activatedAt بتاريخ قديم (-5 أيام)
+      await assertFails(
+        updateDoc(tenantRef, {
+          subscriptionStatus: "active",
+          planId: "starter",
+          activatedAt: Timestamp.fromMillis(nowMs - 5 * DAY_MS),
+          subscriptionDays: 30,
+          activeUntil: null,
+          extraCustomTypesQuota: 0,
+          adminNote: "تاريخ قديم",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // 4) رفض أي subscriptionDays غير مدعومة (15، 60، 1000، 0، -1، نص، كسر، null)
+      for (const badDays of [15, 60, 1000, 0, -1, 30.5, "30", null]) {
+        await assertFails(
+          updateDoc(tenantRef, {
+            subscriptionStatus: "active",
+            planId: "starter",
+            activatedAt: serverTimestamp(),
+            subscriptionDays: badDays as unknown as number,
+            activeUntil: null,
+            extraCustomTypesQuota: 0,
+            adminNote: "مدة غير صالحة",
+            updatedAt: serverTimestamp(),
+          })
+        );
+      }
+
+      // 5) رفض تمرير activeUntil غير null مع التفعيل الجديد
+      await assertFails(
+        updateDoc(tenantRef, {
+          subscriptionStatus: "active",
+          planId: "starter",
+          activatedAt: serverTimestamp(),
+          subscriptionDays: 30,
+          activeUntil: Timestamp.fromMillis(nowMs + 365 * DAY_MS),
+          extraCustomTypesQuota: 0,
+          adminNote: "محاولة تمرير activeUntil",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // 6) رفض تحويل الحالة إلى active بدون activatedAt == request.time
+      await assertFails(
+        updateDoc(tenantRef, {
+          subscriptionStatus: "active",
+          adminNote: "تفعيل بدون وقت خادم",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // 7) تفعيل جديد صالح (serverTimestamp + 30 يوم + activeUntil: null) ينجح
+      await assertSucceeds(
+        updateDoc(tenantRef, {
+          subscriptionStatus: "active",
+          planId: "pro",
+          activatedAt: serverTimestamp(),
+          subscriptionDays: 30,
+          activeUntil: null,
+          extraCustomTypesQuota: 0,
+          adminNote: "تفعيل 30 يوم",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // التحقق أن الحساب المفعّل يستطيع قراءة وتعديل مشاريعه فوراً
+      const userDb = asDb(
+        testEnv.authenticatedContext("trial_expired", {
+          email: "trial_expired@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertSucceeds(getDoc(doc(userDb, "tenants", "trial_expired", "projects", "proj_existing")));
+
+      // 8) تجديد صالح من المدير إلى 90 يوماً ثم 365 يوماً ينجح
+      await assertSucceeds(
+        updateDoc(tenantRef, {
+          subscriptionStatus: "active",
+          planId: "business",
+          activatedAt: serverTimestamp(),
+          subscriptionDays: 90,
+          activeUntil: null,
+          extraCustomTypesQuota: 0,
+          adminNote: "تجديد 90 يوم",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertSucceeds(
+        updateDoc(tenantRef, {
+          subscriptionStatus: "active",
+          planId: "business",
+          activatedAt: serverTimestamp(),
+          subscriptionDays: 365,
+          activeUntil: null,
+          extraCustomTypesQuota: 0,
+          adminNote: "تجديد سنوي",
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    // 13. منع العميل من تمديد اشتراكه أو تعديل activatedAt أو subscriptionDays أو activeUntil
+    await runCase("منع العميل من تعديل activatedAt أو subscriptionDays أو activeUntil أو تمديد اشتراكه", async () => {
+      const adminDb = asDb(
+        testEnv.authenticatedContext(OWNER_UID, {
+          email: OWNER_EMAIL,
+          email_verified: true,
+        })
+      );
+      // تفعيل حساب starter بتوقيت الخادم أولاً
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "trial_ok"), {
+          subscriptionStatus: "active",
+          planId: "starter",
+          activatedAt: serverTimestamp(),
+          subscriptionDays: 30,
+          activeUntil: null,
+          extraCustomTypesQuota: 0,
+          adminNote: "تفعيل",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      const userDb = asDb(
+        testEnv.authenticatedContext("trial_ok", {
+          email: "trial_ok@workshop.jo",
+          email_verified: true,
+        })
+      );
+      const ownRef = doc(userDb, "tenants", "trial_ok");
+
+      // العميل يحاول تعديل subscriptionDays من 30 إلى 365 -> رفض
+      await assertFails(
+        updateDoc(ownRef, {
+          subscriptionDays: 365,
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // العميل يحاول تعديل activatedAt (سواء serverTimestamp أو تاريخ مستقبلي) -> رفض
+      await assertFails(
+        updateDoc(ownRef, {
+          activatedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertFails(
+        updateDoc(ownRef, {
+          activatedAt: Timestamp.fromMillis(Date.now() + 90 * DAY_MS),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // العميل يحاول كتابة activeUntil مستقبلي -> رفض
+      await assertFails(
+        updateDoc(ownRef, {
+          activeUntil: Timestamp.fromMillis(Date.now() + 365 * DAY_MS),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // العميل يحاول تعديل ملفه الشخصي (workshopName) بشكل طبيعي -> قبول
+      await assertSucceeds(
+        updateDoc(ownRef, {
+          workshopName: "ورشة محدثة",
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    // 14. انتهاء الاشتراك عند تجاوز activatedAt + subscriptionDays وحدود التوقيت ومنع extra_types_addon بعد الانتهاء
+    await runCase("انتهاء الاشتراك الخادمي بدقة بعد activatedAt + subscriptionDays ومنع المشاريع وحزم الأنواع الإضافية", async () => {
+      const nowMs = Date.now();
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = asDb(ctx);
+        // حساب قبل الانتهاء بقليل (مفعّل قبل 30 يوماً إلا 10 دقائق) -> ما زال فعّالاً
+        await setDoc(
+          doc(db, "tenants", "srv_almost_exp"),
+          makeSeedTenant("srv_almost_exp", "srv_almost@workshop.jo", {
+            subscriptionStatus: "active",
+            planId: "business",
+            activatedAt: Timestamp.fromMillis(nowMs - 30 * DAY_MS + 10 * 60 * 1000),
+            subscriptionDays: 30,
+            activeUntil: null,
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "srv_almost_exp", "projects", "p1"),
+          makeProjectDoc("srv_almost_exp", { utypes: [], custom: {} }, Timestamp.now())
+        );
+
+        // حساب بعد الانتهاء مباشرة (مفعّل قبل 30 يوماً و 10 دقائق) -> منتهي ومقفل
+        await setDoc(
+          doc(db, "tenants", "srv_expired"),
+          makeSeedTenant("srv_expired", "srv_expired@workshop.jo", {
+            subscriptionStatus: "active",
+            planId: "business",
+            activatedAt: Timestamp.fromMillis(nowMs - 30 * DAY_MS - 10 * 60 * 1000),
+            subscriptionDays: 30,
+            activeUntil: null,
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "srv_expired", "projects", "p1"),
+          makeProjectDoc("srv_expired", { utypes: [], custom: {} }, Timestamp.now())
+        );
+      });
+
+      const almostDb = asDb(
+        testEnv.authenticatedContext("srv_almost_exp", {
+          email: "srv_almost@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertSucceeds(getDoc(doc(almostDb, "tenants", "srv_almost_exp", "projects", "p1")));
+      await assertSucceeds(
+        updateDoc(doc(almostDb, "tenants", "srv_almost_exp", "projects", "p1"), {
+          name: "مشروع قبل الانتهاء",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      const expiredDb = asDb(
+        testEnv.authenticatedContext("srv_expired", {
+          email: "srv_expired@workshop.jo",
+          email_verified: true,
+        })
+      );
+      // قراءة وتعديل وحذف المشاريع مرفوضة فور تجاوز activatedAt + 30d
+      await assertFails(getDoc(doc(expiredDb, "tenants", "srv_expired", "projects", "p1")));
+      await assertFails(
+        updateDoc(doc(expiredDb, "tenants", "srv_expired", "projects", "p1"), {
+          name: "بعد الانتهاء",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertFails(deleteDoc(doc(expiredDb, "tenants", "srv_expired", "projects", "p1")));
+
+      // طلب حزمة extra_types_addon للحساب الخادمي المنتهي -> مرفوض
+      await assertFails(
+        setDoc(doc(expiredDb, "activation_requests", "req_addon_srv_expired"), {
+          tenantId: "srv_expired",
+          ownerUid: "srv_expired",
+          email: "srv_expired@workshop.jo",
+          workshopName: "ورشة اختبار",
+          phone: "0790000001",
+          planId: "business",
+          billingCycle: "monthly",
+          cliqNote: "حزمة بعد انتهاء الاشتراك",
+          status: "pending",
+          reviewedBy: "",
+          requestType: "extra_types_addon",
+          extraTypesCount: 5,
+          addonPriceJod: 10,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    // 15. التوافق الخلفي للحسابات القديمة (activeUntil) ومنع الحسابات المحدّثة من التجاوز عبر activeUntil
+    await runCase("استمرار عمل الحسابات القديمة بـ activeUntil ومنع أي تجاوز عبر activeUntil في الحسابات الجديدة أو المحدّثة", async () => {
+      const nowMs = Date.now();
+      const adminDb = asDb(
+        testEnv.authenticatedContext(OWNER_UID, {
+          email: OWNER_EMAIL,
+          email_verified: true,
+        })
+      );
+
+      // الحساب القديم starter_user (يملك activeUntil دون activatedAt/subscriptionDays) يعمل بشكل طبيعي
+      const legacyDb = asDb(
+        testEnv.authenticatedContext("starter_user", {
+          email: "starter@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertSucceeds(getDoc(doc(legacyDb, "tenants", "starter_user", "projects", "proj_existing")));
+      await assertSucceeds(
+        updateDoc(doc(legacyDb, "tenants", "starter_user"), {
+          workshopName: "ورشة قديمة فعّالة",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // ممنوع حتى على المدير تعديل activeUntil القديم مباشرة دون الانتقال للآلية الخادمية
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "starter_user"), {
+          activeUntil: Timestamp.fromMillis(nowMs + 500 * DAY_MS),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // عند تجديد الحساب القديم يتحول نظيفاً للآلية الخادمية (activeUntil: null + activatedAt + subscriptionDays)
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "starter_user"), {
+          subscriptionStatus: "active",
+          planId: "pro",
+          activatedAt: serverTimestamp(),
+          subscriptionDays: 30,
+          activeUntil: null,
+          extraCustomTypesQuota: 0,
+          adminNote: "ترحيل تلقائي عند التجديد",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // ممنوع حذف activatedAt أو subscriptionDays للعودة إلى activeUntil القديم
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "starter_user"), {
+          activatedAt: deleteField(),
+          subscriptionDays: deleteField(),
+          activeUntil: Timestamp.fromMillis(nowMs + 365 * DAY_MS),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // حتى لو وُجد مستند متضارب في قاعدة البيانات (activatedAt منتهي + activeUntil مستقبلي): القواعد تتجاهل activeUntil وتقفل الحساب!
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = asDb(ctx);
+        await setDoc(
+          doc(db, "tenants", "conflict_bypass"),
+          makeSeedTenant("conflict_bypass", "conflict@workshop.jo", {
+            subscriptionStatus: "active",
+            planId: "business",
+            activatedAt: Timestamp.fromMillis(nowMs - 40 * DAY_MS),
+            subscriptionDays: 30,
+            activeUntil: Timestamp.fromMillis(nowMs + 365 * DAY_MS), // حقل قديم مستقبلي يجب تجاهله
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "conflict_bypass", "projects", "p1"),
+          makeProjectDoc("conflict_bypass", { utypes: [], custom: {} }, Timestamp.now())
+        );
+      });
+
+      const conflictDb = asDb(
+        testEnv.authenticatedContext("conflict_bypass", {
+          email: "conflict@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertFails(getDoc(doc(conflictDb, "tenants", "conflict_bypass", "projects", "p1")));
+    });
+
+    // 16. استمرار منع suspended وحماية إعادة التفعيل الإداري والتجربة المجانية 7 أيام
+    await runCase("قفل الحساب الموقوف (suspended) ومنع إعادة تفعيله إلى active إن كان منتهياً + استمرار التجربة 7 أيام", async () => {
+      const nowMs = Date.now();
+      const adminDb = asDb(
+        testEnv.authenticatedContext(OWNER_UID, {
+          email: OWNER_EMAIL,
+          email_verified: true,
+        })
+      );
+
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = asDb(ctx);
+        // حساب موقوف لديه مدة خادمية متبقية
+        await setDoc(
+          doc(db, "tenants", "susp_valid"),
+          makeSeedTenant("susp_valid", "susp_valid@workshop.jo", {
+            subscriptionStatus: "suspended",
+            planId: "pro",
+            activatedAt: Timestamp.fromMillis(nowMs - 5 * DAY_MS),
+            subscriptionDays: 30,
+            activeUntil: null,
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "susp_valid", "projects", "p1"),
+          makeProjectDoc("susp_valid", { utypes: [], custom: {} }, Timestamp.now())
+        );
+
+        // حساب موقوف انتهت مدته الخادمية
+        await setDoc(
+          doc(db, "tenants", "susp_expired"),
+          makeSeedTenant("susp_expired", "susp_expired@workshop.jo", {
+            subscriptionStatus: "suspended",
+            planId: "pro",
+            activatedAt: Timestamp.fromMillis(nowMs - 40 * DAY_MS),
+            subscriptionDays: 30,
+            activeUntil: null,
+            projectCount: 1,
+          })
+        );
+
+        // حساب تجربة موقوف
+        await setDoc(
+          doc(db, "tenants", "susp_trial"),
+          makeSeedTenant("susp_trial", "susp_trial@workshop.jo", {
+            subscriptionStatus: "suspended",
+            planId: "trial",
+            trialDays: 7,
+            activeUntil: null,
+          })
+        );
+      });
+
+      // الحساب الموقوف ممنوع من الوصول لمشاريعه حتى لو كانت مدته لم تنته
+      const suspValidDb = asDb(
+        testEnv.authenticatedContext("susp_valid", {
+          email: "susp_valid@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertFails(getDoc(doc(suspValidDb, "tenants", "susp_valid", "projects", "p1")));
+
+      // المدير يستطيع إعادة تفعيل الموقوف الذي ما زالت له مدة متبقية دون المساس بـ activatedAt/subscriptionDays
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "susp_valid"), {
+          subscriptionStatus: "active",
+          adminNote: "إعادة تفعيل",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertSucceeds(getDoc(doc(suspValidDb, "tenants", "susp_valid", "projects", "p1")));
+
+      // المدير ممنوع من إعادة تفعيل حساب موقوف منتهي الصلاحية إلى active بدون تجديد خادمي جديد
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "susp_expired"), {
+          subscriptionStatus: "active",
+          adminNote: "محاولة إعادة تفعيل منتهي",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // المدير ممنوع من تحويل حساب تجربة موقوف إلى active عبر إعادة التفعيل دون تجديد حقيقي
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "susp_trial"), {
+          subscriptionStatus: "active",
+          adminNote: "محاولة ترقية تجربة",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // التجربة المجانية 7 أيام ما زالت تعمل كما هي (إنشاء مشروع داخل المدة)
+      const trialDb = asDb(
+        testEnv.authenticatedContext("trial_ok", {
+          email: "trial_ok@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertSucceeds(
+        runTransaction(trialDb, async (tx) => {
+          const tRef = doc(trialDb, "tenants", "trial_ok");
+          const pRef = doc(trialDb, "tenants", "trial_ok", "projects", "pj_trial_check");
+          tx.set(pRef, makeProjectDoc("trial_ok", { utypes: [], custom: {} }));
+          tx.update(tRef, {
+            projectCount: 1,
+            lastProjectActionId: "pj_trial_check",
+            updatedAt: serverTimestamp(),
+          });
+        })
+      );
     });
 
     console.log(`\nاكتملت جميع اختبارات محاكي Firestore بنجاح (${passed}/${passed}).`);

@@ -57,19 +57,66 @@ service cloud.firestore {
         : 0;
     }
 
+    function isValidSubscriptionDays(d) {
+      return d is int && d in [30, 90, 365];
+    }
+
+    function hasServerTimedSubscription(tenantData) {
+      return 'activatedAt' in tenantData &&
+        tenantData.activatedAt is timestamp &&
+        'subscriptionDays' in tenantData &&
+        isValidSubscriptionDays(tenantData.subscriptionDays);
+    }
+
+    function activatedAtUnchanged(inc, ex) {
+      return (!('activatedAt' in inc) && !('activatedAt' in ex)) ||
+        ('activatedAt' in inc && 'activatedAt' in ex && inc.activatedAt == ex.activatedAt);
+    }
+
+    function subscriptionDaysUnchanged(inc, ex) {
+      return (!('subscriptionDays' in inc) && !('subscriptionDays' in ex)) ||
+        ('subscriptionDays' in inc && 'subscriptionDays' in ex && inc.subscriptionDays == ex.subscriptionDays);
+    }
+
+    // Paid subscription validity using authoritative server request.time.
+    // Server-timed accounts (activatedAt + subscriptionDays) STRICTLY ignore legacy activeUntil.
+    // Legacy accounts without activatedAt/subscriptionDays remain compatible via activeUntil.
+    function hasValidPaidSubscription(tenantData) {
+      return tenantData.planId != 'trial' && (
+        hasServerTimedSubscription(tenantData)
+          ? request.time <= tenantData.activatedAt + duration.value(tenantData.subscriptionDays, 'd')
+          : (
+              !('activatedAt' in tenantData) &&
+              !('subscriptionDays' in tenantData) &&
+              (tenantData.activeUntil == null || request.time <= tenantData.activeUntil)
+            )
+      );
+    }
+
     // Active access evaluation using authoritative server request.time.
     // pending_payment STILL strictly enforces trial/paid expiry so an expired trial stays locked!
     function hasActiveTenantAccess(tenantData) {
       return (tenantData.role == 'admin' && isOwnerAdmin()) ||
         (
           tenantData.subscriptionStatus == 'active' &&
-          (tenantData.activeUntil == null || request.time <= tenantData.activeUntil)
+          hasValidPaidSubscription(tenantData)
         ) ||
         (
           tenantData.subscriptionStatus in ['trialing', 'pending_payment'] &&
           (
-            (tenantData.activeUntil != null && request.time <= tenantData.activeUntil) ||
             (
+              hasServerTimedSubscription(tenantData) &&
+              request.time <= tenantData.activatedAt + duration.value(tenantData.subscriptionDays, 'd')
+            ) ||
+            (
+              !('activatedAt' in tenantData) &&
+              !('subscriptionDays' in tenantData) &&
+              tenantData.activeUntil != null &&
+              request.time <= tenantData.activeUntil
+            ) ||
+            (
+              !('activatedAt' in tenantData) &&
+              !('subscriptionDays' in tenantData) &&
               tenantData.activeUntil == null &&
               tenantData.trialDays is int &&
               tenantData.trialDays > 0 &&
@@ -361,6 +408,7 @@ service cloud.firestore {
         data.keys().hasOnly([
           'ownerUid', 'email', 'displayName', 'workshopName', 'phone',
           'role', 'subscriptionStatus', 'planId', 'trialDays',
+          'activatedAt', 'subscriptionDays',
           'activeUntil', 'adminNote', 'projectCount', 'lastProjectActionId',
           'extraCustomTypesQuota', 'createdAt', 'updatedAt'
         ]) &&
@@ -375,6 +423,16 @@ service cloud.firestore {
         isValidId(data.planId) && data.planId.size() <= 40 &&
         data.trialDays is int && data.trialDays >= 0 && data.trialDays <= 3650 &&
         (data.activeUntil == null || data.activeUntil is timestamp) &&
+        (
+          (!('activatedAt' in data) && !('subscriptionDays' in data)) ||
+          (
+            'activatedAt' in data &&
+            data.activatedAt is timestamp &&
+            'subscriptionDays' in data &&
+            isValidSubscriptionDays(data.subscriptionDays) &&
+            data.activeUntil == null
+          )
+        ) &&
         isValidString(data.adminNote, 0, 500) &&
         (!('projectCount' in data) || (data.projectCount is int && data.projectCount >= 0 && data.projectCount <= 100000)) &&
         (!('lastProjectActionId' in data) || isValidString(data.lastProjectActionId, 0, 128)) &&
@@ -525,6 +583,8 @@ service cloud.firestore {
         incoming().email.lower() == request.auth.token.email.lower() &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
+        !('activatedAt' in incoming()) &&
+        !('subscriptionDays' in incoming()) &&
         tenantProjectCount(incoming()) == 0 &&
         tenantExtraTypesQuota(incoming()) == 0 &&
         (
@@ -547,7 +607,7 @@ service cloud.firestore {
           )
         );
 
-      // Action-Based Update: Owner Admin vs Tenant Profile vs Pending Payment vs Atomic Project Counter
+      // Action-Based Update: Admin Activation (Server-Time) vs Admin Non-Activation vs Tenant Actions
       allow update: if isVerified() && isValidId(tenantId) &&
         isValidTenant(incoming(), existing().ownerUid) &&
         incoming().ownerUid == existing().ownerUid &&
@@ -556,16 +616,53 @@ service cloud.firestore {
         incoming().updatedAt == request.time &&
         (
           (
+            // Branch A1: Owner Admin Subscription Activation / Renewal (STRICT SERVER TIME)
+            // Requires activatedAt == request.time, subscriptionDays in [30, 90, 365], and activeUntil == null.
             isOwnerAdmin() &&
             incoming().role == existing().role &&
+            incoming().subscriptionStatus == 'active' &&
+            incoming().planId != 'trial' &&
+            incoming().planId != 'owner_free' &&
+            incoming().activatedAt == request.time &&
+            isValidSubscriptionDays(incoming().subscriptionDays) &&
+            incoming().activeUntil == null &&
+            incoming().trialDays == existing().trialDays &&
+            tenantProjectCount(incoming()) == tenantProjectCount(existing()) &&
+            (
+              tenantExtraTypesQuota(incoming()) == tenantExtraTypesQuota(existing()) ||
+              tenantExtraTypesQuota(incoming()) == 0 ||
+              adminExtraQuotaWithinCap(incoming())
+            ) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'subscriptionStatus', 'planId', 'activatedAt', 'subscriptionDays',
+              'activeUntil', 'extraCustomTypesQuota', 'adminNote', 'updatedAt'
+            ])
+          ) ||
+          (
+            // Branch A2: Owner Admin Non-Activation Operations (Suspend, Reactivate unexpired, Extend Trial, Extra Quota, Profile)
+            // Strictly forbids modifying activatedAt, subscriptionDays, activeUntil, or planId.
+            isOwnerAdmin() &&
+            incoming().role == existing().role &&
+            incoming().planId == existing().planId &&
+            activatedAtUnchanged(incoming(), existing()) &&
+            subscriptionDaysUnchanged(incoming(), existing()) &&
+            incoming().activeUntil == existing().activeUntil &&
+            (
+              incoming().subscriptionStatus != 'active' ||
+              existing().subscriptionStatus == 'active' ||
+              (
+                existing().subscriptionStatus == 'suspended' &&
+                hasValidPaidSubscription(existing())
+              )
+            ) &&
             (
               tenantExtraTypesQuota(incoming()) == tenantExtraTypesQuota(existing()) ||
               adminExtraQuotaWithinCap(incoming())
             ) &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'workshopName', 'phone', 'displayName', 'subscriptionStatus',
-              'planId', 'trialDays', 'activeUntil', 'adminNote',
-              'projectCount', 'lastProjectActionId', 'extraCustomTypesQuota', 'updatedAt'
+              'trialDays', 'adminNote', 'projectCount', 'lastProjectActionId',
+              'extraCustomTypesQuota', 'updatedAt'
             ])
           ) ||
           (
@@ -575,6 +672,8 @@ service cloud.firestore {
             incoming().subscriptionStatus == existing().subscriptionStatus &&
             incoming().planId == existing().planId &&
             incoming().trialDays == existing().trialDays &&
+            activatedAtUnchanged(incoming(), existing()) &&
+            subscriptionDaysUnchanged(incoming(), existing()) &&
             incoming().activeUntil == existing().activeUntil &&
             incoming().adminNote == existing().adminNote &&
             tenantProjectCount(incoming()) == tenantProjectCount(existing()) &&
@@ -591,6 +690,8 @@ service cloud.firestore {
             incoming().role == existing().role &&
             incoming().planId == existing().planId &&
             incoming().trialDays == existing().trialDays &&
+            activatedAtUnchanged(incoming(), existing()) &&
+            subscriptionDaysUnchanged(incoming(), existing()) &&
             incoming().activeUntil == existing().activeUntil &&
             incoming().adminNote == existing().adminNote &&
             tenantProjectCount(incoming()) == tenantProjectCount(existing()) &&
@@ -608,6 +709,8 @@ service cloud.firestore {
             incoming().subscriptionStatus == existing().subscriptionStatus &&
             incoming().planId == existing().planId &&
             incoming().trialDays == existing().trialDays &&
+            activatedAtUnchanged(incoming(), existing()) &&
+            subscriptionDaysUnchanged(incoming(), existing()) &&
             incoming().activeUntil == existing().activeUntil &&
             incoming().adminNote == existing().adminNote &&
             tenantExtraTypesQuota(incoming()) == tenantExtraTypesQuota(existing()) &&
@@ -628,6 +731,8 @@ service cloud.firestore {
             incoming().subscriptionStatus == existing().subscriptionStatus &&
             incoming().planId == existing().planId &&
             incoming().trialDays == existing().trialDays &&
+            activatedAtUnchanged(incoming(), existing()) &&
+            subscriptionDaysUnchanged(incoming(), existing()) &&
             incoming().activeUntil == existing().activeUntil &&
             incoming().adminNote == existing().adminNote &&
             tenantExtraTypesQuota(incoming()) == tenantExtraTypesQuota(existing()) &&

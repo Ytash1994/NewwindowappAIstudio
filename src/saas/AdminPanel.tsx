@@ -38,6 +38,7 @@ import {
 } from "./types";
 import type {
   ActivationRequestDoc,
+  AllowedSubscriptionDays,
   AuditLogDoc,
   PlatformConfig,
   SubscriptionPlan,
@@ -271,7 +272,7 @@ export function AdminPanel({
     });
   }, [tenants, searchQ, statusFilter, serverNowMs]);
 
-  const handleActivate = async (t: TenantAccount, durationDays: number | null) => {
+  const handleActivate = async (t: TenantAccount, durationDays: AllowedSubscriptionDays) => {
     setBusyId(t.ownerUid);
     try {
       const chosenPlan =
@@ -283,8 +284,7 @@ export function AdminPanel({
         {
           planId: chosenPlan,
           durationDays,
-        },
-        serverNowMs
+        }
       );
       auditLoadedRef.current = false;
       await loadCoreData();

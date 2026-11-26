@@ -17,7 +17,13 @@ import {
 } from "../src/saas/storage";
 import type { StorageLike } from "../src/saas/storage";
 import { assertSnapshotWithinPlanLimits } from "../src/saas/service";
-import { DEFAULT_PLANS, evaluateTenantAccess, resolvePlanLimits } from "../src/saas/types";
+import {
+  DEFAULT_PLANS,
+  evaluateTenantAccess,
+  getSubscriptionExpiryMs,
+  isAllowedSubscriptionDays,
+  resolvePlanLimits,
+} from "../src/saas/types";
 import type { TenantAccount } from "../src/saas/types";
 import type { AppState } from "../src/types";
 
@@ -630,6 +636,146 @@ runTest("التحقق من الالتزام التام بخطة Firebase Spark �
   // 7. فحص وجود تقرير مراجعة الحصص القديمة في AdminPanel (قراءة فقط)
   const adminPanelTs = fs.readFileSync(path.resolve("src/saas/AdminPanel.tsx"), "utf8");
   assert.ok(adminPanelTs.includes("legacyQuotaReview"), "يجب عرض تقرير قراءة فقط للحصص القديمة المتجاوزة للسقف");
+});
+
+runTest("توقيت الاشتراكات الخادمي: activatedAt + subscriptionDays [30,90,365] وتجاهل activeUntil القديم والتوافق الخلفي", () => {
+  const start = 1_750_000_000_000;
+
+  // 1. فحص المدد المسموحة فقط
+  assert.equal(isAllowedSubscriptionDays(30), true);
+  assert.equal(isAllowedSubscriptionDays(90), true);
+  assert.equal(isAllowedSubscriptionDays(365), true);
+  for (const invalid of [0, -1, 7, 15, 60, 180, 1000, 30.5, "30", null, undefined]) {
+    assert.equal(isAllowedSubscriptionDays(invalid), false, `يجب رفض المدة غير المدعومة: ${String(invalid)}`);
+  }
+
+  // 2. اشتراك خادمي 30 يوماً: فعّال خلال المدة، تحذير أقل من 48 ساعة، ومنتهي فور تجاوز activatedAt + 30d
+  const srvTenant = makeTenant({
+    subscriptionStatus: "active",
+    planId: "pro",
+    activatedAt: Timestamp.fromMillis(start),
+    subscriptionDays: 30,
+    activeUntil: null,
+  });
+  const expiryInfo = getSubscriptionExpiryMs(srvTenant);
+  assert.equal(expiryInfo.isServerTimed, true);
+  assert.equal(expiryInfo.endMs, start + 30 * DAY_MS);
+
+  const day10 = evaluateTenantAccess(srvTenant, start + 10 * DAY_MS);
+  assert.equal(day10.allowed, true);
+  assert.equal(day10.state, "active");
+  assert.equal(day10.daysLeft, 20);
+  assert.equal(day10.isExpiringSoon, false);
+  assert.equal(day10.activeUntilMs, start + 30 * DAY_MS);
+
+  const day29 = evaluateTenantAccess(srvTenant, start + 29 * DAY_MS);
+  assert.equal(day29.allowed, true);
+  assert.equal(day29.isExpiringSoon, true);
+
+  const after30 = evaluateTenantAccess(srvTenant, start + 30 * DAY_MS + 1000);
+  assert.equal(after30.allowed, false);
+  assert.equal(after30.state, "expired");
+
+  // 3. تجديد 90 يوماً و 365 يوماً
+  const srv90 = makeTenant({
+    subscriptionStatus: "active",
+    planId: "business",
+    activatedAt: Timestamp.fromMillis(start),
+    subscriptionDays: 90,
+    activeUntil: null,
+  });
+  assert.equal(evaluateTenantAccess(srv90, start + 89 * DAY_MS).allowed, true);
+  assert.equal(evaluateTenantAccess(srv90, start + 90 * DAY_MS + 1000).allowed, false);
+
+  const srv365 = makeTenant({
+    subscriptionStatus: "active",
+    planId: "business",
+    activatedAt: Timestamp.fromMillis(start),
+    subscriptionDays: 365,
+    activeUntil: null,
+  });
+  assert.equal(evaluateTenantAccess(srv365, start + 364 * DAY_MS).allowed, true);
+  assert.equal(evaluateTenantAccess(srv365, start + 365 * DAY_MS + 1000).allowed, false);
+
+  // 4. الحساب المحدّث يتجاهل activeUntil القديم تماماً حتى لو كان في المستقبل
+  const conflictTenant = makeTenant({
+    subscriptionStatus: "active",
+    planId: "business",
+    activatedAt: Timestamp.fromMillis(start),
+    subscriptionDays: 30,
+    activeUntil: Timestamp.fromMillis(start + 500 * DAY_MS),
+  });
+  assert.equal(getSubscriptionExpiryMs(conflictTenant).endMs, start + 30 * DAY_MS);
+  assert.equal(evaluateTenantAccess(conflictTenant, start + 31 * DAY_MS).allowed, false);
+
+  // 5. بنية جزئية غير مكتملة (activatedAt دون subscriptionDays أو العكس) تغلق الحساب ولا ترجع لـ activeUntil
+  const halfTenant = makeTenant({
+    subscriptionStatus: "active",
+    planId: "pro",
+    activatedAt: Timestamp.fromMillis(start),
+    activeUntil: Timestamp.fromMillis(start + 300 * DAY_MS),
+  });
+  assert.equal(evaluateTenantAccess(halfTenant, start + 1 * DAY_MS).allowed, false);
+
+  // 6. التوافق الخلفي للحسابات القديمة التي لا تحتوي activatedAt أو subscriptionDays وتعتمد على activeUntil
+  const legacyTenant = makeTenant({
+    subscriptionStatus: "active",
+    planId: "starter",
+    activeUntil: Timestamp.fromMillis(start + 30 * DAY_MS),
+  });
+  assert.equal(getSubscriptionExpiryMs(legacyTenant).isServerTimed, false);
+  assert.equal(evaluateTenantAccess(legacyTenant, start + 15 * DAY_MS).allowed, true);
+  assert.equal(evaluateTenantAccess(legacyTenant, start + 31 * DAY_MS).allowed, false);
+
+  // 7. الحساب الموقوف (suspended) بحساب خادمي يبقى مقفلاً رغم بقاء مدة
+  const suspendedSrv = makeTenant({
+    subscriptionStatus: "suspended",
+    planId: "pro",
+    activatedAt: Timestamp.fromMillis(start),
+    subscriptionDays: 30,
+    activeUntil: null,
+  });
+  const suspEv = evaluateTenantAccess(suspendedSrv, start + 5 * DAY_MS);
+  assert.equal(suspEv.allowed, false);
+  assert.equal(suspEv.state, "suspended");
+  assert.equal(suspEv.activeUntilMs, start + 30 * DAY_MS);
+
+  // 8. التحقق الثابت من الكود وقواعد Firestore لضمان عدم الاعتماد على ساعة المتصفح في التفعيل أو التجديد
+  const serviceText = fs.readFileSync(path.resolve("src/saas/service.ts"), "utf8");
+  const activateBlock = serviceText.slice(
+    serviceText.indexOf("export async function adminActivateTenant"),
+    serviceText.indexOf("export async function adminGrantExtraTypesQuota")
+  );
+  assert.equal(
+    activateBlock.includes("Timestamp.fromMillis"),
+    false,
+    "adminActivateTenant يجب ألا يحسب activeUntil عبر Timestamp.fromMillis في المتصفح"
+  );
+  assert.ok(activateBlock.includes("activatedAt: serverTimestamp()"));
+  assert.ok(activateBlock.includes("subscriptionDays: opts.durationDays"));
+  assert.ok(activateBlock.includes("activeUntil: null"));
+
+  const reviewBlock = serviceText.slice(
+    serviceText.indexOf("export async function adminReviewActivationRequest"),
+    serviceText.indexOf("export async function adminSavePlan")
+  );
+  assert.equal(
+    reviewBlock.includes("Timestamp.fromMillis"),
+    false,
+    "adminReviewActivationRequest يجب ألا يحسب activeUntil عبر Timestamp.fromMillis في المتصفح"
+  );
+  assert.ok(reviewBlock.includes("activatedAt: serverTimestamp()"));
+  assert.ok(reviewBlock.includes("subscriptionDays: durationDays"));
+  assert.ok(reviewBlock.includes("activeUntil: null"));
+
+  const rulesText = fs.readFileSync(path.resolve("firestore.rules"), "utf8");
+  assert.ok(rulesText.includes("function isValidSubscriptionDays(d) {\n      return d is int && d in [30, 90, 365];\n    }"));
+  assert.ok(rulesText.includes("incoming().activatedAt == request.time"));
+  assert.ok(rulesText.includes("isValidSubscriptionDays(incoming().subscriptionDays)"));
+  assert.ok(rulesText.includes("incoming().activeUntil == null"));
+  assert.ok(rulesText.includes("request.time <= tenantData.activatedAt + duration.value(tenantData.subscriptionDays, 'd')"));
+  assert.ok(rulesText.includes("activatedAtUnchanged(incoming(), existing())"));
+  assert.ok(rulesText.includes("subscriptionDaysUnchanged(incoming(), existing())"));
 });
 
 console.log(`\nاكتملت جميع اختبارات الأمان والاشتراكات وخطة Spark بنجاح (${passed}/${passed}).`);

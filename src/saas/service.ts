@@ -44,6 +44,8 @@ import {
   LAUNCH_MAX_CUSTOM_TYPES,
   TRIAL_MAX_PROJECTS,
   getPlanDefaultsById,
+  getSubscriptionExpiryMs,
+  isAllowedSubscriptionDays,
   isOwnerAdminEmail,
   resolvePlanLimits,
   sanitizeStr,
@@ -52,6 +54,7 @@ import {
 import type {
   ActivationRequestDoc,
   ActivationRequestType,
+  AllowedSubscriptionDays,
   AuditLogDoc,
   BillingCycle,
   PlatformConfig,
@@ -91,12 +94,15 @@ export function makeSafeDocId(prefix: string): string {
 }
 
 function summarizeTenantState(t: Partial<TenantAccount>): string {
+  const activatedMs = tsToMs(t.activatedAt as Timestamp | null | undefined);
   const untilMs = tsToMs(t.activeUntil as Timestamp | null | undefined);
   const summary = {
     status: t.subscriptionStatus || "",
     planId: t.planId || "",
     role: t.role || "",
     trialDays: t.trialDays ?? 0,
+    subscriptionDays: typeof t.subscriptionDays === "number" ? t.subscriptionDays : null,
+    activatedAt: activatedMs ? new Date(activatedMs).toISOString().slice(0, 10) : null,
     activeUntil: untilMs ? new Date(untilMs).toISOString().slice(0, 10) : null,
   };
   return sanitizeStr(JSON.stringify(summary), BLUEPRINT_LIMITS.stateSnapMax);
@@ -898,22 +904,27 @@ export async function fetchAuditLogs(maxItems = 80): Promise<AuditLogDoc[]> {
   }
 }
 
-/** تفعيل اشتراك مدفوع داخل معاملة ذرية تبدأ مدتها من تاريخ التأكيد وتسجّل قبل/بعد في audit_logs */
+/**
+ * تفعيل أو تجديد اشتراك مدفوع داخل معاملة ذرية بتوقيت خادمي موثوق (activatedAt: serverTimestamp + subscriptionDays).
+ * لا يعتمد إطلاقاً على ساعة المتصفح، ويصفّر حقل activeUntil القديم لمنع أي تضارب أو تجاوز.
+ */
 export async function adminActivateTenant(
   adminUser: User,
   target: TenantAccount,
-  opts: { planId: string; durationDays: number | null; adminNote?: string },
-  serverNowMs = Date.now()
+  opts: { planId: string; durationDays: AllowedSubscriptionDays; adminNote?: string }
 ): Promise<void> {
+  if (!isAllowedSubscriptionDays(opts.durationDays)) {
+    throw new Error("مدة الاشتراك غير مدعومة. المدد المعتمدة فقط: 30 أو 90 أو 365 يوماً.");
+  }
+
   const path = `tenants/${target.ownerUid}`;
   const cleanPlan = sanitizeStr(opts.planId, BLUEPRINT_LIMITS.planIdMax) || "starter";
-  const activeUntil =
-    opts.durationDays === null
-      ? null
-      : Timestamp.fromMillis(serverNowMs + opts.durationDays * 86400000);
+  if (cleanPlan === "trial" || cleanPlan === "owner_free") {
+    throw new Error("لا يمكن تفعيل الاشتراك المدفوع على هذه الباقة.");
+  }
+
   const note = sanitizeStr(
-    opts.adminNote ??
-      `تفعيل عبر كليك (${opts.durationDays === null ? "دائم" : `${opts.durationDays} يوم`})`,
+    opts.adminNote ?? `تفعيل عبر كليك (${opts.durationDays} يوم)`,
     BLUEPRINT_LIMITS.adminNoteMax
   );
   const logId = makeSafeDocId("log");
@@ -931,13 +942,17 @@ export async function adminActivateTenant(
         ...prev,
         subscriptionStatus: "active",
         planId: cleanPlan,
-        activeUntil,
+        activatedAt: null,
+        subscriptionDays: opts.durationDays,
+        activeUntil: null,
       });
 
       tx.update(tenantRef, {
         subscriptionStatus: "active",
         planId: cleanPlan,
-        activeUntil,
+        activatedAt: serverTimestamp(),
+        subscriptionDays: opts.durationDays,
+        activeUntil: null,
         extraCustomTypesQuota: 0, // حزمة الأنواع الإضافية تُدفع مرة واحدة مع كل اشتراك جديد
         adminNote: note,
         updatedAt: serverTimestamp(),
@@ -949,9 +964,7 @@ export async function adminActivateTenant(
         action: "activate_subscription",
         targetTenantId: target.ownerUid,
         details: sanitizeStr(
-          `تفعيل ${prev.email} على باقة ${cleanPlan} لمدة ${
-            opts.durationDays === null ? "دائمة" : `${opts.durationDays} يوم`
-          }`,
+          `تفعيل ${prev.email} على باقة ${cleanPlan} لمدة ${opts.durationDays} يوم (بتوقيت الخادم)`,
           BLUEPRINT_LIMITS.adminNoteMax
         ),
         beforeState,
@@ -1155,16 +1168,21 @@ export async function adminReactivateTenant(
         throw new Error("لم يتم العثور على حساب الورشة.");
       }
       const prev = snap.data() as TenantAccount;
-      const activeUntilMs = tsToMs(prev.activeUntil);
+      const { endMs: paidEndMs, isServerTimed } = getSubscriptionExpiryMs(prev);
       const createdMs = tsToMs(prev.createdAt) || serverNowMs;
       const trialEndMs = createdMs + (prev.trialDays || 0) * 86400000;
 
-      const nextStatus: TenantAccount["subscriptionStatus"] =
-        activeUntilMs !== null && activeUntilMs > serverNowMs
-          ? "active"
-          : trialEndMs > serverNowMs
-            ? "trialing"
-            : "expired";
+      const hasRemainingPaid =
+        prev.planId !== "trial" &&
+        (isServerTimed
+          ? paidEndMs !== null && paidEndMs > serverNowMs
+          : paidEndMs === null || paidEndMs > serverNowMs);
+
+      const nextStatus: TenantAccount["subscriptionStatus"] = hasRemainingPaid
+        ? "active"
+        : !isServerTimed && prev.activeUntil == null && trialEndMs > serverNowMs
+          ? "trialing"
+          : "expired";
 
       const beforeState = summarizeTenantState(prev);
       const afterState = summarizeTenantState({ ...prev, subscriptionStatus: nextStatus });
@@ -1199,7 +1217,7 @@ export async function adminReviewActivationRequest(
   adminUser: User,
   req: ActivationRequestDoc,
   decision: "approved" | "rejected",
-  durationDays: number | null,
+  durationDays: AllowedSubscriptionDays,
   serverNowMs = Date.now()
 ): Promise<void> {
   const reqPath = `activation_requests/${req.id}`;
@@ -1279,21 +1297,23 @@ export async function adminReviewActivationRequest(
               createdAt: serverTimestamp(),
             });
           } else {
-            const activeUntil =
-              durationDays === null
-                ? null
-                : Timestamp.fromMillis(serverNowMs + durationDays * 86400000);
+            if (!isAllowedSubscriptionDays(durationDays)) {
+              throw new Error("مدة الاشتراك غير مدعومة. المدد المعتمدة فقط: 30 أو 90 أو 365 يوماً.");
+            }
             const cleanPlan = sanitizeStr(liveReq.planId, BLUEPRINT_LIMITS.planIdMax) || "starter";
+            if (cleanPlan === "trial" || cleanPlan === "owner_free") {
+              throw new Error("لا يمكن اعتماد الاشتراك المدفوع على هذه الباقة.");
+            }
 
             tx.update(tenantRef, {
               subscriptionStatus: "active",
               planId: cleanPlan,
-              activeUntil,
+              activatedAt: serverTimestamp(),
+              subscriptionDays: durationDays,
+              activeUntil: null,
               extraCustomTypesQuota: 0,
               adminNote: sanitizeStr(
-                `تأكيد دفع كليك #${req.id.slice(-6)} (${
-                  durationDays === null ? "دائم" : `${durationDays} يوم`
-                })`,
+                `تأكيد دفع كليك #${req.id.slice(-6)} (${durationDays} يوم)`,
                 BLUEPRINT_LIMITS.adminNoteMax
               ),
               updatedAt: serverTimestamp(),
@@ -1303,7 +1323,9 @@ export async function adminReviewActivationRequest(
               ...prevTenant,
               subscriptionStatus: "active",
               planId: cleanPlan,
-              activeUntil,
+              activatedAt: null,
+              subscriptionDays: durationDays,
+              activeUntil: null,
             });
 
             tx.set(doc(db, "audit_logs", logId), {
@@ -1312,9 +1334,7 @@ export async function adminReviewActivationRequest(
               action: "approve_payment_request",
               targetTenantId: req.tenantId,
               details: sanitizeStr(
-                `تأكيد دفع كليك للورشة ${liveReq.email} على باقة ${cleanPlan} لمدة ${
-                  durationDays === null ? "دائمة" : `${durationDays} يوم`
-                }`,
+                `تأكيد دفع كليك للورشة ${liveReq.email} على باقة ${cleanPlan} لمدة ${durationDays} يوم (بتوقيت الخادم)`,
                 BLUEPRINT_LIMITS.adminNoteMax
               ),
               beforeState,
@@ -1325,9 +1345,13 @@ export async function adminReviewActivationRequest(
         } else {
           let nextStatus = prevTenant.subscriptionStatus;
           if (liveReq.requestType !== "extra_types_addon" && prevTenant.subscriptionStatus === "pending_payment") {
+            const { isServerTimed } = getSubscriptionExpiryMs(prevTenant);
             const createdMs = tsToMs(prevTenant.createdAt) || serverNowMs;
             const trialEndMs = createdMs + (prevTenant.trialDays || 0) * 86400000;
-            nextStatus = trialEndMs > serverNowMs ? "trialing" : "expired";
+            nextStatus =
+              !isServerTimed && prevTenant.activeUntil == null && trialEndMs > serverNowMs
+                ? "trialing"
+                : "expired";
             tx.update(tenantRef, {
               subscriptionStatus: nextStatus,
               adminNote: sanitizeStr(`تم رفض طلب الدفع #${req.id.slice(-6)}`, BLUEPRINT_LIMITS.adminNoteMax),
