@@ -101,7 +101,8 @@ service cloud.firestore {
 
     // Paid subscription validity using authoritative server request.time.
     // Server-timed accounts (activatedAt + subscriptionDays) STRICTLY ignore legacy activeUntil.
-    // Legacy accounts without activatedAt/subscriptionDays remain compatible via activeUntil.
+    // Legacy accounts without activatedAt/subscriptionDays remain compatible via activeUntil
+    // (including activeUntil == null for legacy permanent paid accounts in active/suspended/pending_payment).
     function hasValidPaidSubscription(tenantData) {
       return tenantData.planId != 'trial' && (
         hasServerTimedSubscription(tenantData)
@@ -110,7 +111,7 @@ service cloud.firestore {
               !('activatedAt' in tenantData) &&
               !('subscriptionDays' in tenantData) &&
               (
-                (tenantData.subscriptionStatus in ['active', 'suspended'] && tenantData.activeUntil == null) ||
+                (tenantData.subscriptionStatus in ['active', 'suspended', 'pending_payment'] && tenantData.activeUntil == null) ||
                 (tenantData.activeUntil != null && request.time <= tenantData.activeUntil)
               )
             )
@@ -774,6 +775,7 @@ service cloud.firestore {
             isTenantOwner(tenantId) &&
             existing().subscriptionStatus in ['trialing', 'expired'] &&
             incoming().subscriptionStatus == 'pending_payment' &&
+            (!hasValidPaidSubscription(incoming()) || hasValidPaidSubscription(existing())) &&
             incoming().role == existing().role &&
             incoming().planId == existing().planId &&
             incoming().trialDays == existing().trialDays &&

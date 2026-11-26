@@ -2183,6 +2183,205 @@ async function main() {
       );
     });
 
+    // 21. توافق الحسابات المدفوعة القديمة (activeUntil == null دون activatedAt/subscriptionDays) في حالة pending_payment ومنع التصعيد من expired
+    await runCase("توافق الحساب المدفوع القديم (activeUntil == null) في حالة pending_payment عند رفض الدفع وإعادة التفعيل مع منع تصعيد expired", async () => {
+      const nowMs = Date.now();
+      const adminDb = asDb(
+        testEnv.authenticatedContext(OWNER_UID, {
+          email: OWNER_EMAIL,
+          email_verified: true,
+        })
+      );
+
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = asDb(ctx);
+        // 1) حساب مدفوع قديم دائم (activeUntil == null، بدون activatedAt و subscriptionDays) في حالة pending_payment
+        await setDoc(
+          doc(db, "tenants", "legacy_perm_pending"),
+          makeSeedTenant("legacy_perm_pending", "legacy_perm@workshop.jo", {
+            subscriptionStatus: "pending_payment",
+            planId: "pro",
+            activeUntil: null,
+            createdAt: Timestamp.fromMillis(nowMs - 90 * DAY_MS),
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "legacy_perm_pending", "projects", "p1"),
+          makeProjectDoc("legacy_perm_pending", { utypes: [], custom: {} }, Timestamp.now())
+        );
+        await setDoc(doc(db, "activation_requests", "req_legacy_perm_rej"), {
+          tenantId: "legacy_perm_pending",
+          ownerUid: "legacy_perm_pending",
+          email: "legacy_perm@workshop.jo",
+          workshopName: "ورشة قديمة",
+          phone: "0790000001",
+          planId: "business",
+          billingCycle: "yearly",
+          cliqNote: "طلب ترقية",
+          status: "pending",
+          reviewedBy: "",
+          createdAt: Timestamp.now(),
+          updatedAt: Timestamp.now(),
+        });
+
+        // 2) حساب مدفوع قديم انتهى فعلياً (subscriptionStatus == 'expired' مع activeUntil == null) لاختبار منع التصعيد
+        await setDoc(
+          doc(db, "tenants", "legacy_null_expired"),
+          makeSeedTenant("legacy_null_expired", "legacy_null_exp@workshop.jo", {
+            subscriptionStatus: "expired",
+            planId: "starter",
+            activeUntil: null,
+            createdAt: Timestamp.fromMillis(nowMs - 90 * DAY_MS),
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "legacy_null_expired", "projects", "p1"),
+          makeProjectDoc("legacy_null_expired", { utypes: [], custom: {} }, Timestamp.now())
+        );
+
+        // 3) حساب مدفوع خادمي منتهٍ (activatedAt + 30d في الماضي، activeUntil == null) في حالة pending_payment
+        await setDoc(
+          doc(db, "tenants", "srv_exp_pending"),
+          makeSeedTenant("srv_exp_pending", "srv_exp_pending@workshop.jo", {
+            subscriptionStatus: "pending_payment",
+            planId: "pro",
+            activatedAt: Timestamp.fromMillis(nowMs - 45 * DAY_MS),
+            subscriptionDays: 30,
+            activeUntil: null,
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "srv_exp_pending", "projects", "p1"),
+          makeProjectDoc("srv_exp_pending", { utypes: [], custom: {} }, Timestamp.now())
+        );
+        await setDoc(doc(db, "activation_requests", "req_srv_exp_rej"), {
+          tenantId: "srv_exp_pending",
+          ownerUid: "srv_exp_pending",
+          email: "srv_exp_pending@workshop.jo",
+          workshopName: "ورشة خادمية منتهية",
+          phone: "0790000001",
+          planId: "pro",
+          billingCycle: "monthly",
+          cliqNote: "تجديد",
+          status: "pending",
+          reviewedBy: "",
+          createdAt: Timestamp.now(),
+          updatedAt: Timestamp.now(),
+        });
+      });
+
+      const legacyPermDb = asDb(
+        testEnv.authenticatedContext("legacy_perm_pending", {
+          email: "legacy_perm@workshop.jo",
+          email_verified: true,
+        })
+      );
+
+      // أ) الحساب القديم الدائم في حالة pending_payment يحتفظ بصلاحية الوصول لمشاريعه
+      await assertSucceeds(getDoc(doc(legacyPermDb, "tenants", "legacy_perm_pending", "projects", "p1")));
+
+      // ب) ممنوع تحويل هذا الحساب إلى expired عند رفض طلب الدفع (حتى لو أخطأت الواجهة أو ساعة الجهاز)
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "legacy_perm_pending"), {
+          subscriptionStatus: "expired",
+          adminNote: "محاولة إنهاء حساب قديم دائم بالخطأ",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // ج) رفض طلب الدفع يعيد الحساب إلى active داخل معاملة ذرية دون المساس ببنية الاشتراك
+      await assertSucceeds(
+        runTransaction(adminDb, async (tx) => {
+          tx.update(doc(adminDb, "activation_requests", "req_legacy_perm_rej"), {
+            status: "rejected",
+            reviewedBy: OWNER_UID,
+            updatedAt: serverTimestamp(),
+          });
+          tx.update(doc(adminDb, "tenants", "legacy_perm_pending"), {
+            subscriptionStatus: "active",
+            adminNote: "تم رفض طلب الدفع",
+            updatedAt: serverTimestamp(),
+          });
+        })
+      );
+      const afterRej = await assertSucceeds(getDoc(doc(adminDb, "tenants", "legacy_perm_pending")));
+      if (
+        afterRej.data()?.subscriptionStatus !== "active" ||
+        afterRej.data()?.activeUntil !== null ||
+        "activatedAt" in (afterRej.data() || {}) ||
+        "subscriptionDays" in (afterRej.data() || {})
+      ) {
+        throw new Error("فشل الحفاظ على حالة وبنية الحساب المدفوع القديم بعد رفض طلب الدفع");
+      }
+      await assertSucceeds(getDoc(doc(legacyPermDb, "tenants", "legacy_perm_pending", "projects", "p1")));
+
+      // د) إيقاف الحساب القديم الدائم ثم إعادة تفعيله إلى active يعمل بنجاح
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "legacy_perm_pending"), {
+          subscriptionStatus: "suspended",
+          adminNote: "إيقاف مؤقت",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertFails(getDoc(doc(legacyPermDb, "tenants", "legacy_perm_pending", "projects", "p1")));
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "legacy_perm_pending"), {
+          subscriptionStatus: "active",
+          adminNote: "إعادة تفعيل",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertSucceeds(getDoc(doc(legacyPermDb, "tenants", "legacy_perm_pending", "projects", "p1")));
+
+      // هـ) حماية منع التصعيد: حساب expired مع activeUntil == null ممنوع من الوصول وممنوع من تحويل نفسه إلى pending_payment
+      const legacyNullExpDb = asDb(
+        testEnv.authenticatedContext("legacy_null_expired", {
+          email: "legacy_null_exp@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertFails(getDoc(doc(legacyNullExpDb, "tenants", "legacy_null_expired", "projects", "p1")));
+      await assertFails(
+        updateDoc(doc(legacyNullExpDb, "tenants", "legacy_null_expired"), {
+          subscriptionStatus: "pending_payment",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // و) الحساب الخادمي المنتهي (activatedAt + 30d في الماضي، activeUntil == null) في pending_payment يبقى مقفلاً ولا يعود إلى active
+      const srvExpDb = asDb(
+        testEnv.authenticatedContext("srv_exp_pending", {
+          email: "srv_exp_pending@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertFails(getDoc(doc(srvExpDb, "tenants", "srv_exp_pending", "projects", "p1")));
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "srv_exp_pending"), {
+          subscriptionStatus: "active",
+          adminNote: "محاولة إعادة تفعيل خادمي منتهي",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertSucceeds(
+        runTransaction(adminDb, async (tx) => {
+          tx.update(doc(adminDb, "activation_requests", "req_srv_exp_rej"), {
+            status: "rejected",
+            reviewedBy: OWNER_UID,
+            updatedAt: serverTimestamp(),
+          });
+          tx.update(doc(adminDb, "tenants", "srv_exp_pending"), {
+            subscriptionStatus: "expired",
+            adminNote: "رفض طلب تجديد لحساب خادمي منتهي",
+            updatedAt: serverTimestamp(),
+          });
+        })
+      );
+    });
+
     console.log(`\nاكتملت جميع اختبارات محاكي Firestore بنجاح (${passed}/${passed}).`);
   } finally {
     await testEnv.cleanup();

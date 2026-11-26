@@ -658,6 +658,21 @@ export function evaluateTenantAccess(
     const isPendingPayment = tenant.subscriptionStatus === "pending_payment";
     const { endMs: activeUntilMs, isServerTimed } = getSubscriptionExpiryMs(tenant);
 
+    if (isPendingPayment && tenant.planId !== "trial" && !isServerTimed && activeUntilMs === null) {
+      return {
+        allowed: true,
+        state: "active",
+        hasPendingPayment: true,
+        daysLeft: 9999,
+        hoursLeft: 9999,
+        trialEndsAtMs: null,
+        activeUntilMs: null,
+        expiresAtMs: null,
+        isExpiringSoon: false,
+        remainingLabel: "دائم",
+      };
+    }
+
     if (isServerTimed || activeUntilMs !== null) {
       const diff = activeUntilMs !== null ? activeUntilMs - nowMs : -1;
       if (activeUntilMs !== null && diff > 0) {

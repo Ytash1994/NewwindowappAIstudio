@@ -911,4 +911,60 @@ runTest("توحيد التحقق الزمني في العمليات الإدار
   );
 });
 
+runTest("توافق الحساب المدفوع القديم (activeUntil == null دون activatedAt/subscriptionDays) في حالة pending_payment دون كسر الإغلاق الخادمي", () => {
+  const now = 1_760_000_000_000;
+
+  // 1. حساب مدفوع قديم دائم (planId != trial، لا يوجد activatedAt/subscriptionDays، activeUntil == null) في حالة pending_payment
+  const legacyPermPending = makeTenant({
+    subscriptionStatus: "pending_payment",
+    planId: "pro",
+    activeUntil: null,
+    createdAt: Timestamp.fromMillis(now - 90 * DAY_MS),
+  });
+  const evalLegacyPending = evaluateTenantAccess(legacyPermPending, now);
+  assert.equal(evalLegacyPending.allowed, true, "الحساب المدفوع القديم الدائم في pending_payment يجب أن يبقى فعّالاً");
+  assert.equal(evalLegacyPending.state, "active");
+  assert.equal(evalLegacyPending.hasPendingPayment, true);
+  assert.equal(evalLegacyPending.remainingLabel, "دائم");
+
+  const candLegacyPending = resolveServerVerifiedStatusCandidates(legacyPermPending);
+  assert.equal(candLegacyPending.primaryStatus, "active");
+  assert.equal(candLegacyPending.isPaidAccount, true);
+
+  // 2. حساب خادمي منتهي (activatedAt + 30d في الماضي، activeUntil == null) في pending_payment يبقى مقفلاً بالكامل
+  const serverExpiredPending = makeTenant({
+    subscriptionStatus: "pending_payment",
+    planId: "pro",
+    activatedAt: Timestamp.fromMillis(now - 45 * DAY_MS),
+    subscriptionDays: 30,
+    activeUntil: null,
+    createdAt: Timestamp.fromMillis(now - 90 * DAY_MS),
+  });
+  const evalSrvExp = evaluateTenantAccess(serverExpiredPending, now);
+  assert.equal(evalSrvExp.allowed, false, "الحساب الخادمي المنتهي مع activeUntil == null يجب أن يبقى مقفلاً");
+  assert.equal(evalSrvExp.state, "pending_payment");
+
+  // 3. حساب قديم expired مع activeUntil == null يبقى مقفلاً بالكامل
+  const legacyExpiredNull = makeTenant({
+    subscriptionStatus: "expired",
+    planId: "starter",
+    activeUntil: null,
+    createdAt: Timestamp.fromMillis(now - 90 * DAY_MS),
+  });
+  const evalLegacyExp = evaluateTenantAccess(legacyExpiredNull, now);
+  assert.equal(evalLegacyExp.allowed, false);
+  assert.equal(evalLegacyExp.state, "expired");
+
+  // 4. التحقق من قاعدة firestore.rules: شمول pending_payment للحساب القديم الدائم + حارس منع التصعيد من expired -> pending_payment
+  const rulesText = fs.readFileSync(path.resolve("firestore.rules"), "utf8");
+  assert.ok(
+    rulesText.includes("(tenantData.subscriptionStatus in ['active', 'suspended', 'pending_payment'] && tenantData.activeUntil == null)"),
+    "hasValidPaidSubscription يجب أن تشمل pending_payment للحسابات المدفوعة القديمة التي activeUntil لديها null"
+  );
+  assert.ok(
+    rulesText.includes("(!hasValidPaidSubscription(incoming()) || hasValidPaidSubscription(existing()))"),
+    "يجب وجود حارس منع تصعيد حساب expired إلى pending_payment في قاعدة العميل"
+  );
+});
+
 console.log(`\nاكتملت جميع اختبارات الأمان والاشتراكات وخطة Spark بنجاح (${passed}/${passed}).`);
