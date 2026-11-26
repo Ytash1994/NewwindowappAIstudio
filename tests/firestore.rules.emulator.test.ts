@@ -1686,6 +1686,503 @@ async function main() {
       );
     });
 
+    // 17. إعادة التفعيل الإداري بتوقيت الخادم فقط: حساب مدفوع صالح، قديم activeUntil، ومنع تحويل صالح إلى expired
+    await runCase("إعادة التفعيل الإداري (adminReactivateTenant) بتوقيت الخادم فقط ومنع تحويل اشتراك صالح إلى expired", async () => {
+      const nowMs = Date.now();
+      const adminDb = asDb(
+        testEnv.authenticatedContext(OWNER_UID, {
+          email: OWNER_EMAIL,
+          email_verified: true,
+        })
+      );
+
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = asDb(ctx);
+        // 1) حساب مدفوع خادمي موقوف وما زال صالحاً
+        await setDoc(
+          doc(db, "tenants", "susp_srv_valid"),
+          makeSeedTenant("susp_srv_valid", "susp_srv_valid@workshop.jo", {
+            subscriptionStatus: "suspended",
+            planId: "pro",
+            activatedAt: Timestamp.fromMillis(nowMs - 5 * DAY_MS),
+            subscriptionDays: 30,
+            activeUntil: null,
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "susp_srv_valid", "projects", "p1"),
+          makeProjectDoc("susp_srv_valid", { utypes: [], custom: {} }, Timestamp.now())
+        );
+
+        // 2) حساب قديم (activeUntil) موقوف وما زال صالحاً
+        await setDoc(
+          doc(db, "tenants", "susp_legacy_valid"),
+          makeSeedTenant("susp_legacy_valid", "susp_legacy_valid@workshop.jo", {
+            subscriptionStatus: "suspended",
+            planId: "starter",
+            activeUntil: Timestamp.fromMillis(nowMs + 20 * DAY_MS),
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "susp_legacy_valid", "projects", "p1"),
+          makeProjectDoc("susp_legacy_valid", { utypes: [], custom: {} }, Timestamp.now())
+        );
+
+        // 3) حساب قديم (activeUntil) موقوف ومنتهي الصلاحية
+        await setDoc(
+          doc(db, "tenants", "susp_legacy_expired"),
+          makeSeedTenant("susp_legacy_expired", "susp_legacy_expired@workshop.jo", {
+            subscriptionStatus: "suspended",
+            planId: "starter",
+            activeUntil: Timestamp.fromMillis(nowMs - 5 * DAY_MS),
+            projectCount: 1,
+          })
+        );
+
+        // 4) حساب تجربة موقوف وما زال ضمن الـ 7 أيام
+        await setDoc(
+          doc(db, "tenants", "susp_trial_valid"),
+          makeSeedTenant("susp_trial_valid", "susp_trial_valid@workshop.jo", {
+            subscriptionStatus: "suspended",
+            planId: "trial",
+            trialDays: 7,
+            activeUntil: null,
+            createdAt: Timestamp.fromMillis(nowMs - 2 * DAY_MS),
+          })
+        );
+
+        // 5) حساب تجربة موقوف وانتهت تجربته
+        await setDoc(
+          doc(db, "tenants", "susp_trial_expired"),
+          makeSeedTenant("susp_trial_expired", "susp_trial_expired@workshop.jo", {
+            subscriptionStatus: "suspended",
+            planId: "trial",
+            trialDays: 7,
+            activeUntil: null,
+            createdAt: Timestamp.fromMillis(nowMs - 15 * DAY_MS),
+          })
+        );
+      });
+
+      // محاكاة خطأ ساعة جهاز متقدمة (+365 يوم): محاولة تحويل اشتراك مدفوع صالح إلى expired -> مرفوضة من القواعد!
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "susp_srv_valid"), {
+          subscriptionStatus: "expired",
+          adminNote: "خطأ ساعة متقدمة",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "starter_user"), {
+          subscriptionStatus: "expired",
+          adminNote: "محاولة إنهاء اشتراك قديم صالح",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // إعادة تفعيل الحساب المدفوع الخادمي الصالح إلى active (دون تعديل activatedAt أو subscriptionDays) -> نجاح
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "susp_srv_valid"), {
+          subscriptionStatus: "active",
+          adminNote: "إعادة تفعيل",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // إعادة تفعيل الحساب القديم الصالح (activeUntil) إلى active -> نجاح
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "susp_legacy_valid"), {
+          subscriptionStatus: "active",
+          adminNote: "إعادة تفعيل قديم",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      const legacyUserDb = asDb(
+        testEnv.authenticatedContext("susp_legacy_valid", {
+          email: "susp_legacy_valid@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertSucceeds(getDoc(doc(legacyUserDb, "tenants", "susp_legacy_valid", "projects", "p1")));
+
+      // رفض إعادة تفعيل الحساب القديم المنتهي إلى active
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "susp_legacy_expired"), {
+          subscriptionStatus: "active",
+          adminNote: "محاولة إعادة تفعيل قديم منتهي",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // إعادة تفعيل حساب تجربة ما زال ضمن الـ 7 أيام إلى trialing -> نجاح، والمنتهي -> رفض
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "susp_trial_valid"), {
+          subscriptionStatus: "trialing",
+          adminNote: "إعادة تفعيل تجربة صالحة",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "susp_trial_expired"), {
+          subscriptionStatus: "trialing",
+          adminNote: "محاولة إعادة تفعيل تجربة منتهية",
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
+    // 18. رفض طلب الدفع (adminReviewActivationRequest): استعادة الحالة بتوقيت الخادم وعدم المساس بـ activatedAt
+    await runCase("رفض طلب الدفع بتوقيت الخادم: حماية المدفوع الصالح والتجربة الصالحة ومنع إعادة المنتهي إلى trialing", async () => {
+      const nowMs = Date.now();
+      const origActivatedAt = Timestamp.fromMillis(nowMs - 4 * DAY_MS);
+      const adminDb = asDb(
+        testEnv.authenticatedContext(OWNER_UID, {
+          email: OWNER_EMAIL,
+          email_verified: true,
+        })
+      );
+
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = asDb(ctx);
+        // 1) حساب مدفوع صالح في حالة pending_payment
+        await setDoc(
+          doc(db, "tenants", "pend_paid_valid"),
+          makeSeedTenant("pend_paid_valid", "pend_paid@workshop.jo", {
+            subscriptionStatus: "pending_payment",
+            planId: "pro",
+            activatedAt: origActivatedAt,
+            subscriptionDays: 30,
+            activeUntil: null,
+          })
+        );
+        // 2) حساب تجربة صالحة في حالة pending_payment
+        await setDoc(
+          doc(db, "tenants", "pend_trial_valid"),
+          makeSeedTenant("pend_trial_valid", "pend_trial_valid@workshop.jo", {
+            subscriptionStatus: "pending_payment",
+            planId: "trial",
+            trialDays: 7,
+            activeUntil: null,
+            createdAt: Timestamp.fromMillis(nowMs - 2 * DAY_MS),
+          })
+        );
+        // 3) حساب تجربة منتهية في حالة pending_payment (pending_expired موجود مسبقاً)
+        // طلبات الدفع المقابلة
+        for (const [reqId, uid, email] of [
+          ["req_rej_paid", "pend_paid_valid", "pend_paid@workshop.jo"],
+          ["req_rej_trial_valid", "pend_trial_valid", "pend_trial_valid@workshop.jo"],
+          ["req_rej_trial_exp", "pending_expired", "pending_expired@workshop.jo"],
+        ] as const) {
+          await setDoc(doc(db, "activation_requests", reqId), {
+            tenantId: uid,
+            ownerUid: uid,
+            email,
+            workshopName: "ورشة اختبار",
+            phone: "0790000001",
+            planId: "pro",
+            billingCycle: "monthly",
+            cliqNote: "حوالة",
+            status: "pending",
+            reviewedBy: "",
+            createdAt: Timestamp.now(),
+            updatedAt: Timestamp.now(),
+          });
+        }
+      });
+
+      // أ) حساب مدفوع صالح في pending_payment: ممنوع تحويله إلى expired عند الرفض، وممنوع تعديل activatedAt
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "pend_paid_valid"), {
+          subscriptionStatus: "expired",
+          adminNote: "رفض خاطئ بسبب ساعة متقدمة",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "pend_paid_valid"), {
+          subscriptionStatus: "active",
+          activatedAt: Timestamp.fromMillis(nowMs - 10 * DAY_MS),
+          adminNote: "محاولة تغيير activatedAt عند الرفض",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      // رفض الطلب واستعادة الحساب المدفوع الصالح إلى active دون مساس بـ activatedAt -> نجاح
+      await assertSucceeds(
+        runTransaction(adminDb, async (tx) => {
+          tx.update(doc(adminDb, "activation_requests", "req_rej_paid"), {
+            status: "rejected",
+            reviewedBy: OWNER_UID,
+            updatedAt: serverTimestamp(),
+          });
+          tx.update(doc(adminDb, "tenants", "pend_paid_valid"), {
+            subscriptionStatus: "active",
+            adminNote: "تم رفض طلب الدفع",
+            updatedAt: serverTimestamp(),
+          });
+        })
+      );
+      const afterPaid = await assertSucceeds(getDoc(doc(adminDb, "tenants", "pend_paid_valid")));
+      if (afterPaid.data()?.activatedAt?.toMillis() !== origActivatedAt.toMillis()) {
+        throw new Error("تغيّر activatedAt بشكل غير مصرح به عند رفض طلب الدفع");
+      }
+
+      // ب) حساب تجربة صالحة في pending_payment: ممنوع تحويله إلى expired (ساعة متقدمة)، ويُسمح بإعادته إلى trialing
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "pend_trial_valid"), {
+          subscriptionStatus: "expired",
+          adminNote: "خطأ ساعة متقدمة",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertSucceeds(
+        runTransaction(adminDb, async (tx) => {
+          tx.update(doc(adminDb, "activation_requests", "req_rej_trial_valid"), {
+            status: "rejected",
+            reviewedBy: OWNER_UID,
+            updatedAt: serverTimestamp(),
+          });
+          tx.update(doc(adminDb, "tenants", "pend_trial_valid"), {
+            subscriptionStatus: "trialing",
+            adminNote: "رفض طلب الدفع مع بقاء التجربة",
+            updatedAt: serverTimestamp(),
+          });
+        })
+      );
+
+      // ج) حساب تجربة منتهية في pending_payment: ممنوع إعادته إلى trialing (ساعة متأخرة)، ويُسمح فقط بضبطه إلى expired
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "pending_expired"), {
+          subscriptionStatus: "trialing",
+          adminNote: "خطأ ساعة متأخرة",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertSucceeds(
+        runTransaction(adminDb, async (tx) => {
+          tx.update(doc(adminDb, "activation_requests", "req_rej_trial_exp"), {
+            status: "rejected",
+            reviewedBy: OWNER_UID,
+            updatedAt: serverTimestamp(),
+          });
+          tx.update(doc(adminDb, "tenants", "pending_expired"), {
+            subscriptionStatus: "expired",
+            adminNote: "رفض طلب الدفع بعد انتهاء التجربة",
+            updatedAt: serverTimestamp(),
+          });
+        })
+      );
+    });
+
+    // 19. تمديد التجربة الإداري (Branch A3): توقيت خادمي صارم، منع المدفوع/الموقوف، وحماية trialDays
+    await runCase("تمديد التجربة الإداري بتوقيت الخادم (trialExtendedAt == request.time) ومنع المدفوع والموقوف وتعديل trialDays", async () => {
+      const nowMs = Date.now();
+      const adminDb = asDb(
+        testEnv.authenticatedContext(OWNER_UID, {
+          email: OWNER_EMAIL,
+          email_verified: true,
+        })
+      );
+
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = asDb(ctx);
+        // حساب موقوف على خطة تجربة
+        await setDoc(
+          doc(db, "tenants", "susp_trial_no_ext"),
+          makeSeedTenant("susp_trial_no_ext", "susp_t@workshop.jo", {
+            subscriptionStatus: "suspended",
+            planId: "trial",
+            trialDays: 7,
+            activeUntil: null,
+          })
+        );
+        // حساب مدفوع منتهي (خادمي)
+        await setDoc(
+          doc(db, "tenants", "paid_exp_no_ext"),
+          makeSeedTenant("paid_exp_no_ext", "paid_exp@workshop.jo", {
+            subscriptionStatus: "active",
+            planId: "pro",
+            activatedAt: Timestamp.fromMillis(nowMs - 40 * DAY_MS),
+            subscriptionDays: 30,
+            activeUntil: null,
+          })
+        );
+        // حساب تجربة ممددة منتهية فعلياً (ممددة قبل 10 أيام لمدة 7 أيام)
+        await setDoc(
+          doc(db, "tenants", "trial_ext_expired"),
+          makeSeedTenant("trial_ext_expired", "trial_ext_exp@workshop.jo", {
+            subscriptionStatus: "trialing",
+            planId: "trial",
+            trialDays: 7,
+            createdAt: Timestamp.fromMillis(nowMs - 30 * DAY_MS),
+            trialExtendedAt: Timestamp.fromMillis(nowMs - 10 * DAY_MS),
+            trialExtensionDays: 7,
+            activeUntil: null,
+            projectCount: 1,
+          })
+        );
+        await setDoc(
+          doc(db, "tenants", "trial_ext_expired", "projects", "p1"),
+          makeProjectDoc("trial_ext_expired", { utypes: [], custom: {} }, Timestamp.now())
+        );
+      });
+
+      // 1) رفض تعديل trialDays مباشرة (الحفاظ على قاعدة الـ 7 أيام الأصلية)
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "trial_expired"), {
+          subscriptionStatus: "trialing",
+          trialDays: 30,
+          adminNote: "محاولة تغيير trialDays",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // 2) رفض تمديد تجربة حساب مدفوع (سواء خادمي منتهي أو قديم activeUntil منتهي أو فعال)
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "paid_exp_no_ext"), {
+          subscriptionStatus: "trialing",
+          trialExtendedAt: serverTimestamp(),
+          trialExtensionDays: 7,
+          adminNote: "محاولة تمديد مدفوع",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "biz_expired_active"), {
+          subscriptionStatus: "trialing",
+          trialExtendedAt: serverTimestamp(),
+          trialExtensionDays: 7,
+          adminNote: "محاولة تمديد قديم مدفوع",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // 3) رفض تمديد تجربة حساب موقوف إدارياً (suspended)
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "susp_trial_no_ext"), {
+          subscriptionStatus: "trialing",
+          trialExtendedAt: serverTimestamp(),
+          trialExtensionDays: 7,
+          adminNote: "محاولة فتح موقوف",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // 4) رفض trialExtendedAt بتوقيت عميل (مستقبلي أو ماضٍ أو عشوائي)
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "trial_expired"), {
+          subscriptionStatus: "trialing",
+          trialExtendedAt: Timestamp.fromMillis(nowMs + 30 * DAY_MS),
+          trialExtensionDays: 7,
+          adminNote: "توقيت مستقبلي",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertFails(
+        updateDoc(doc(adminDb, "tenants", "trial_expired"), {
+          subscriptionStatus: "trialing",
+          trialExtendedAt: Timestamp.fromMillis(nowMs - 2 * DAY_MS),
+          trialExtensionDays: 7,
+          adminNote: "توقيت قديم",
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // 5) رفض مدد تمديد غير معتمدة (1، 10، 60، 365، 0، -5، نص)
+      for (const badExtDays of [1, 10, 60, 365, 0, -5, "7"]) {
+        await assertFails(
+          updateDoc(doc(adminDb, "tenants", "trial_expired"), {
+            subscriptionStatus: "trialing",
+            trialExtendedAt: serverTimestamp(),
+            trialExtensionDays: badExtDays as unknown as number,
+            adminNote: "مدة غير مدعومة",
+            updatedAt: serverTimestamp(),
+          })
+        );
+      }
+
+      // 6) تمديد إداري صالح بتوقيت الخادم (+7 أيام) لحساب تجربة صرف -> نجاح وفتح وصول المشاريع مع بقاء trialDays == 7
+      await assertSucceeds(
+        updateDoc(doc(adminDb, "tenants", "trial_expired"), {
+          subscriptionStatus: "trialing",
+          trialExtendedAt: serverTimestamp(),
+          trialExtensionDays: 7,
+          adminNote: "تمديد التجربة +7 يوم (بتوقيت الخادم)",
+          updatedAt: serverTimestamp(),
+        })
+      );
+      const trialUserDb = asDb(
+        testEnv.authenticatedContext("trial_expired", {
+          email: "trial_expired@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertSucceeds(getDoc(doc(trialUserDb, "tenants", "trial_expired", "projects", "proj_existing")));
+
+      // 7) حساب انتهت مدة تمديده (trialExtendedAt + 7d في الماضي) يُقفل فوراً من القواعد
+      const extExpUserDb = asDb(
+        testEnv.authenticatedContext("trial_ext_expired", {
+          email: "trial_ext_exp@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertFails(getDoc(doc(extExpUserDb, "tenants", "trial_ext_expired", "projects", "p1")));
+    });
+
+    // 20. منع العميل العادي من تعديل أو حقن حقول توقيت التجربة (trialExtendedAt / trialExtensionDays / trialDays)
+    await runCase("منع العميل العادي من تعديل أو حقن trialExtendedAt أو trialExtensionDays أو trialDays", async () => {
+      const u = testEnv.authenticatedContext("new_trial_attacker", {
+        email: "attacker_trial@workshop.jo",
+        email_verified: true,
+      });
+      const db = asDb(u);
+
+      // رفض حقن trialExtendedAt و trialExtensionDays عند إنشاء الحساب
+      await assertFails(
+        setDoc(doc(db, "tenants", "new_trial_attacker"), {
+          ownerUid: "new_trial_attacker",
+          email: "attacker_trial@workshop.jo",
+          displayName: "ورشة",
+          workshopName: "ورشة",
+          phone: "",
+          role: "owner",
+          subscriptionStatus: "trialing",
+          planId: "trial",
+          trialDays: 7,
+          trialExtendedAt: serverTimestamp(),
+          trialExtensionDays: 30,
+          activeUntil: null,
+          adminNote: "",
+          projectCount: 0,
+          extraCustomTypesQuota: 0,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      // رفض تعديل حقول توقيت التجربة من العميل على حساب قائم
+      const existingTrialDb = asDb(
+        testEnv.authenticatedContext("trial_expired", {
+          email: "trial_expired@workshop.jo",
+          email_verified: true,
+        })
+      );
+      await assertFails(
+        updateDoc(doc(existingTrialDb, "tenants", "trial_expired"), {
+          trialExtendedAt: serverTimestamp(),
+          trialExtensionDays: 30,
+          updatedAt: serverTimestamp(),
+        })
+      );
+      await assertFails(
+        updateDoc(doc(existingTrialDb, "tenants", "trial_expired"), {
+          trialDays: 365,
+          updatedAt: serverTimestamp(),
+        })
+      );
+    });
+
     console.log(`\nاكتملت جميع اختبارات محاكي Firestore بنجاح (${passed}/${passed}).`);
   } finally {
     await testEnv.cleanup();

@@ -44,10 +44,11 @@ import {
   LAUNCH_MAX_CUSTOM_TYPES,
   TRIAL_MAX_PROJECTS,
   getPlanDefaultsById,
-  getSubscriptionExpiryMs,
   isAllowedSubscriptionDays,
+  isAllowedTrialExtensionDays,
   isOwnerAdminEmail,
   resolvePlanLimits,
+  resolveServerVerifiedStatusCandidates,
   sanitizeStr,
   tsToMs,
 } from "./types";
@@ -55,6 +56,7 @@ import type {
   ActivationRequestDoc,
   ActivationRequestType,
   AllowedSubscriptionDays,
+  AllowedTrialExtensionDays,
   AuditLogDoc,
   BillingCycle,
   PlatformConfig,
@@ -95,17 +97,30 @@ export function makeSafeDocId(prefix: string): string {
 
 function summarizeTenantState(t: Partial<TenantAccount>): string {
   const activatedMs = tsToMs(t.activatedAt as Timestamp | null | undefined);
+  const trialExtMs = tsToMs(t.trialExtendedAt as Timestamp | null | undefined);
   const untilMs = tsToMs(t.activeUntil as Timestamp | null | undefined);
   const summary = {
     status: t.subscriptionStatus || "",
     planId: t.planId || "",
     role: t.role || "",
     trialDays: t.trialDays ?? 0,
+    trialExtensionDays: typeof t.trialExtensionDays === "number" ? t.trialExtensionDays : null,
+    trialExtendedAt: trialExtMs ? new Date(trialExtMs).toISOString().slice(0, 10) : null,
     subscriptionDays: typeof t.subscriptionDays === "number" ? t.subscriptionDays : null,
     activatedAt: activatedMs ? new Date(activatedMs).toISOString().slice(0, 10) : null,
     activeUntil: untilMs ? new Date(untilMs).toISOString().slice(0, 10) : null,
   };
   return sanitizeStr(JSON.stringify(summary), BLUEPRINT_LIMITS.stateSnapMax);
+}
+
+function isFirestorePermissionDenied(err: unknown): boolean {
+  const code = (err as { code?: string } | null)?.code || "";
+  const msg = err instanceof Error ? err.message : String(err || "");
+  return (
+    code === "permission-denied" ||
+    msg.includes("permission-denied") ||
+    msg.includes("Missing or insufficient permissions")
+  );
 }
 
 /**
@@ -1056,12 +1071,20 @@ export async function adminGrantExtraTypesQuota(
   }
 }
 
+/**
+ * تمديد الفترة التجريبية إدارياً بتوقيت خادمي موثوق (trialExtendedAt: serverTimestamp + trialExtensionDays).
+ * لا يعتمد إطلاقاً على ساعة جهاز المدير أو serverNowMs، ولا يُسمح بتطبيقه على الحسابات المدفوعة أو الموقوفة،
+ * مع الإبقاء على قيمة trialDays الأصلية (7 أيام) دون تعديل.
+ */
 export async function adminExtendTrial(
   adminUser: User,
   target: TenantAccount,
-  extraDays: number,
-  serverNowMs = Date.now()
+  extraDays: AllowedTrialExtensionDays
 ): Promise<void> {
+  if (!isAllowedTrialExtensionDays(extraDays)) {
+    throw new Error("مدة تمديد التجربة غير مدعومة. المدد المعتمدة فقط: 3 أو 7 أو 14 أو 30 يوماً.");
+  }
+
   const path = `tenants/${target.ownerUid}`;
   const logId = makeSafeDocId("log");
 
@@ -1073,21 +1096,36 @@ export async function adminExtendTrial(
         throw new Error("لم يتم العثور على حساب الورشة.");
       }
       const prev = snap.data() as TenantAccount;
-      const createdMs = tsToMs(prev.createdAt) || serverNowMs;
-      const elapsedDays = Math.max(0, Math.ceil((serverNowMs - createdMs) / 86400000));
-      const nextTrialDays = Math.min(3650, Math.max((prev.trialDays || 0) + extraDays, elapsedDays + extraDays));
+
+      if (prev.subscriptionStatus === "suspended") {
+        throw new Error("لا يمكن تمديد تجربة حساب موقوف إدارياً؛ يجب مراجعة حالة الإيقاف أولاً.");
+      }
+
+      const hasPaidHistory =
+        prev.planId !== "trial" ||
+        (prev.activatedAt !== undefined && prev.activatedAt !== null) ||
+        (prev.subscriptionDays !== undefined && prev.subscriptionDays !== null) ||
+        prev.activeUntil !== null;
+
+      if (hasPaidHistory) {
+        throw new Error(
+          "لا يمكن تمديد التجربة المجانية لحساب لديه اشتراك مدفوع سابق أو حالي؛ يرجى استخدام أزرار تفعيل الباقة."
+        );
+      }
 
       const beforeState = summarizeTenantState(prev);
       const afterState = summarizeTenantState({
         ...prev,
         subscriptionStatus: "trialing",
-        trialDays: nextTrialDays,
+        trialExtendedAt: null,
+        trialExtensionDays: extraDays,
       });
 
       tx.update(tenantRef, {
         subscriptionStatus: "trialing",
-        trialDays: nextTrialDays,
-        adminNote: sanitizeStr(`تمديد التجربة +${extraDays} يوم`, BLUEPRINT_LIMITS.adminNoteMax),
+        trialExtendedAt: serverTimestamp(),
+        trialExtensionDays: extraDays,
+        adminNote: sanitizeStr(`تمديد التجربة +${extraDays} يوم (بتوقيت الخادم)`, BLUEPRINT_LIMITS.adminNoteMax),
         updatedAt: serverTimestamp(),
       });
 
@@ -1097,7 +1135,7 @@ export async function adminExtendTrial(
         action: "extend_trial",
         targetTenantId: target.ownerUid,
         details: sanitizeStr(
-          `تمديد تجربة ${prev.email} بمقدار ${extraDays} يوم (الإجمالي ${nextTrialDays} يوم)`,
+          `تمديد تجربة ${prev.email} بمقدار ${extraDays} يوم اعتباراً من وقت الخادم`,
           BLUEPRINT_LIMITS.adminNoteMax
         ),
         beforeState,
@@ -1106,6 +1144,12 @@ export async function adminExtendTrial(
       });
     });
   } catch (err) {
+    if (
+      err instanceof Error &&
+      (err.message.includes("لا يمكن تمديد") || err.message.includes("مدة تمديد"))
+    ) {
+      throw err;
+    }
     handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
@@ -1152,13 +1196,18 @@ export async function adminSuspendTenant(
   }
 }
 
+/**
+ * إعادة تفعيل حساب موقوف بالاعتماد الحصري على تحقق قواعد Firestore ووقت الخادم (request.time).
+ * لا يستخدم ساعة المتصفح أو serverNowMs أبداً، ولا يعدّل activatedAt أو subscriptionDays أو activeUntil،
+ * ويرفض إعادة تفعيل أي اشتراك أو تجربة منتهية الصلاحية حسب وقت الخادم.
+ */
 export async function adminReactivateTenant(
   adminUser: User,
-  target: TenantAccount,
-  serverNowMs = Date.now()
+  target: TenantAccount
 ): Promise<void> {
   const path = `tenants/${target.ownerUid}`;
   const logId = makeSafeDocId("log");
+  let attemptedIsPaid = false;
 
   try {
     await runTransaction(db, async (tx) => {
@@ -1168,27 +1217,18 @@ export async function adminReactivateTenant(
         throw new Error("لم يتم العثور على حساب الورشة.");
       }
       const prev = snap.data() as TenantAccount;
-      const { endMs: paidEndMs, isServerTimed } = getSubscriptionExpiryMs(prev);
-      const createdMs = tsToMs(prev.createdAt) || serverNowMs;
-      const trialEndMs = createdMs + (prev.trialDays || 0) * 86400000;
+      if (prev.subscriptionStatus !== "suspended") {
+        throw new Error("هذا الحساب غير موقوف حالياً.");
+      }
 
-      const hasRemainingPaid =
-        prev.planId !== "trial" &&
-        (isServerTimed
-          ? paidEndMs !== null && paidEndMs > serverNowMs
-          : paidEndMs === null || paidEndMs > serverNowMs);
-
-      const nextStatus: TenantAccount["subscriptionStatus"] = hasRemainingPaid
-        ? "active"
-        : !isServerTimed && prev.activeUntil == null && trialEndMs > serverNowMs
-          ? "trialing"
-          : "expired";
+      const { primaryStatus, isPaidAccount } = resolveServerVerifiedStatusCandidates(prev);
+      attemptedIsPaid = isPaidAccount;
 
       const beforeState = summarizeTenantState(prev);
-      const afterState = summarizeTenantState({ ...prev, subscriptionStatus: nextStatus });
+      const afterState = summarizeTenantState({ ...prev, subscriptionStatus: primaryStatus });
 
       tx.update(tenantRef, {
-        subscriptionStatus: nextStatus,
+        subscriptionStatus: primaryStatus,
         adminNote: "تمت إعادة تفعيل الحساب من الإدارة",
         updatedAt: serverTimestamp(),
       });
@@ -1198,27 +1238,40 @@ export async function adminReactivateTenant(
         actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
         action: "reactivate_tenant",
         targetTenantId: target.ownerUid,
-        details: sanitizeStr(`إعادة تفعيل حساب ${prev.email} (الحالة: ${nextStatus})`, BLUEPRINT_LIMITS.adminNoteMax),
+        details: sanitizeStr(
+          `إعادة تفعيل حساب ${prev.email} (الحالة المتحققة من الخادم: ${primaryStatus})`,
+          BLUEPRINT_LIMITS.adminNoteMax
+        ),
         beforeState,
         afterState,
         createdAt: serverTimestamp(),
       });
     });
   } catch (err) {
+    if (err instanceof Error && err.message.includes("غير موقوف")) {
+      throw err;
+    }
+    if (isFirestorePermissionDenied(err)) {
+      throw new Error(
+        attemptedIsPaid
+          ? "انتهت مدة الاشتراك المدفوع لهذا الحساب حسب توقيت الخادم؛ لا يمكن إعادة تفعيله بدون تجديد جديد."
+          : "انتهت الفترة التجريبية لهذا الحساب حسب توقيت الخادم؛ يرجى تفعيل باقة مدفوعة أو تمديد التجربة."
+      );
+    }
     handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 
 /**
  * مراجعة طلب تفعيل CliQ داخل معاملة ذرية واحدة:
- * تمنع الموافقة المزدوجة على نفس الطلب، وتحدّث الطلب + الاشتراك + سجل التدقيق ذرياً.
+ * تمنع الموافقة المزدوجة على نفس الطلب، وتحدّث الطلب + الاشتراك + سجل التدقيق ذرياً
+ * بالاعتماد الحصري على توقيت الخادم (request.time) دون أي اعتماد على ساعة جهاز المدير.
  */
 export async function adminReviewActivationRequest(
   adminUser: User,
   req: ActivationRequestDoc,
   decision: "approved" | "rejected",
-  durationDays: AllowedSubscriptionDays,
-  serverNowMs = Date.now()
+  durationDays: AllowedSubscriptionDays
 ): Promise<void> {
   const reqPath = `activation_requests/${req.id}`;
   const logId = makeSafeDocId("log");
@@ -1343,15 +1396,12 @@ export async function adminReviewActivationRequest(
             });
           }
         } else {
+          // مسار الرفض: الخادم (Firestore Rules عبر request.time) يقرر هل يعود الحساب إلى حالته الفعّالة أم إلى expired
+          // يتم التعامل مع الرفض عبر دالة المعاملة أدناه؛ هنا ننفذ حالة عدم وجود تعديل على tenant أو الحالة المرشحة الأولى
           let nextStatus = prevTenant.subscriptionStatus;
           if (liveReq.requestType !== "extra_types_addon" && prevTenant.subscriptionStatus === "pending_payment") {
-            const { isServerTimed } = getSubscriptionExpiryMs(prevTenant);
-            const createdMs = tsToMs(prevTenant.createdAt) || serverNowMs;
-            const trialEndMs = createdMs + (prevTenant.trialDays || 0) * 86400000;
-            nextStatus =
-              !isServerTimed && prevTenant.activeUntil == null && trialEndMs > serverNowMs
-                ? "trialing"
-                : "expired";
+            const { primaryStatus } = resolveServerVerifiedStatusCandidates(prevTenant);
+            nextStatus = primaryStatus;
             tx.update(tenantRef, {
               subscriptionStatus: nextStatus,
               adminNote: sanitizeStr(`تم رفض طلب الدفع #${req.id.slice(-6)}`, BLUEPRINT_LIMITS.adminNoteMax),
@@ -1398,6 +1448,74 @@ export async function adminReviewActivationRequest(
     if (err instanceof Error && err.message.includes("معالجة هذا الطلب مسبقاً")) {
       throw err;
     }
+
+    // عند رفض طلب دفع لحساب pending_payment ورفض قواعد Firestore استعادة الحالة الفعّالة (لأن الخادم أثبت انتهاء المدة):
+    // ننفذ معاملة ذرية نظيفة تضبط الحالة إلى expired (والتي تتحقق القواعد بدورها من عدم وجود مدة صالحة).
+    if (decision === "rejected" && isFirestorePermissionDenied(err)) {
+      const fallbackLogId = makeSafeDocId("log");
+      try {
+        await runTransaction(db, async (tx) => {
+          const reqRef = doc(db, "activation_requests", req.id);
+          const tenantRef = doc(db, "tenants", req.tenantId);
+
+          const [reqSnap, tenantSnap] = await Promise.all([tx.get(reqRef), tx.get(tenantRef)]);
+          if (!reqSnap.exists()) {
+            throw new Error("لم يتم العثور على طلب الدفع.");
+          }
+          const liveReq = reqSnap.data() as Omit<ActivationRequestDoc, "id">;
+          if (liveReq.status !== "pending") {
+            throw new Error("تمت معالجة هذا الطلب مسبقاً ولا يمكن تأكيده أو تغييره مرتين.");
+          }
+
+          tx.update(reqRef, {
+            status: "rejected",
+            reviewedBy: adminUser.uid,
+            updatedAt: serverTimestamp(),
+          });
+
+          if (tenantSnap.exists()) {
+            const prevTenant = tenantSnap.data() as TenantAccount;
+            const beforeState = summarizeTenantState(prevTenant);
+            let nextStatus = prevTenant.subscriptionStatus;
+
+            if (liveReq.requestType !== "extra_types_addon" && prevTenant.subscriptionStatus === "pending_payment") {
+              nextStatus = "expired";
+              tx.update(tenantRef, {
+                subscriptionStatus: "expired",
+                adminNote: sanitizeStr(`تم رفض طلب الدفع #${req.id.slice(-6)}`, BLUEPRINT_LIMITS.adminNoteMax),
+                updatedAt: serverTimestamp(),
+              });
+            }
+
+            const afterState = summarizeTenantState({
+              ...prevTenant,
+              subscriptionStatus: nextStatus,
+            });
+
+            tx.set(doc(db, "audit_logs", fallbackLogId), {
+              actorUid: adminUser.uid,
+              actorEmail: sanitizeStr((adminUser.email || "").toLowerCase(), BLUEPRINT_LIMITS.emailMax),
+              action: "reject_payment_request",
+              targetTenantId: req.tenantId,
+              details: sanitizeStr(
+                `رفض طلب دفع ${liveReq.email} (${liveReq.planId})`,
+                BLUEPRINT_LIMITS.adminNoteMax
+              ),
+              beforeState,
+              afterState,
+              createdAt: serverTimestamp(),
+            });
+          }
+        });
+        return;
+      } catch (fallbackErr) {
+        if (fallbackErr instanceof Error && fallbackErr.message.includes("معالجة هذا الطلب مسبقاً")) {
+          throw fallbackErr;
+        }
+        handleFirestoreError(fallbackErr, OperationType.UPDATE, reqPath);
+      }
+    }
+
     handleFirestoreError(err, OperationType.UPDATE, reqPath);
   }
 }

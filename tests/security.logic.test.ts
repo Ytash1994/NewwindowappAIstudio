@@ -21,8 +21,11 @@ import {
   DEFAULT_PLANS,
   evaluateTenantAccess,
   getSubscriptionExpiryMs,
+  getTrialExpiryMs,
   isAllowedSubscriptionDays,
+  isAllowedTrialExtensionDays,
   resolvePlanLimits,
+  resolveServerVerifiedStatusCandidates,
 } from "../src/saas/types";
 import type { TenantAccount } from "../src/saas/types";
 import type { AppState } from "../src/types";
@@ -776,6 +779,136 @@ runTest("توقيت الاشتراكات الخادمي: activatedAt + subscript
   assert.ok(rulesText.includes("request.time <= tenantData.activatedAt + duration.value(tenantData.subscriptionDays, 'd')"));
   assert.ok(rulesText.includes("activatedAtUnchanged(incoming(), existing())"));
   assert.ok(rulesText.includes("subscriptionDaysUnchanged(incoming(), existing())"));
+});
+
+runTest("توحيد التحقق الزمني في العمليات الإدارية: إلغاء الاعتماد على ساعة جهاز المدير وتمديد التجربة الخادمي", () => {
+  const start = 1_760_000_000_000;
+
+  // 1. فحص مدد تمديد التجربة المعتمدة فقط [3, 7, 14, 30]
+  for (const okDays of [3, 7, 14, 30]) {
+    assert.equal(isAllowedTrialExtensionDays(okDays), true);
+  }
+  for (const badDays of [0, -7, 1, 5, 10, 45, 60, 365, 3650, 7.5, "7", null, undefined]) {
+    assert.equal(isAllowedTrialExtensionDays(badDays), false, `يجب رفض مدة تمديد غير صالحة: ${String(badDays)}`);
+  }
+
+  // 2. استنتاج الحالة المرشحة لإعادة التفعيل ورفض طلب الدفع يعتمد على البنية فقط (بمعزل تماماً عن أي ساعة جهاز: +365 يوم أو -365 يوم)
+  const paidServerTenant = makeTenant({
+    subscriptionStatus: "suspended",
+    planId: "pro",
+    activatedAt: Timestamp.fromMillis(start),
+    subscriptionDays: 30,
+    activeUntil: null,
+  });
+  const paidLegacyTenant = makeTenant({
+    subscriptionStatus: "suspended",
+    planId: "starter",
+    activeUntil: Timestamp.fromMillis(start + 30 * DAY_MS),
+  });
+  const pureTrialTenant = makeTenant({
+    subscriptionStatus: "pending_payment",
+    planId: "trial",
+    trialDays: 7,
+    activeUntil: null,
+  });
+
+  // بغض النظر عن اختلاف ساعة جهاز المدير (+365 يوماً أو -365 يوماً)، المرشح البنيوي لا يتأثر إطلاقاً
+  const candSrv = resolveServerVerifiedStatusCandidates(paidServerTenant);
+  assert.equal(candSrv.primaryStatus, "active");
+  assert.equal(candSrv.isPaidAccount, true);
+
+  const candLegacy = resolveServerVerifiedStatusCandidates(paidLegacyTenant);
+  assert.equal(candLegacy.primaryStatus, "active");
+  assert.equal(candLegacy.isPaidAccount, true);
+
+  const candTrial = resolveServerVerifiedStatusCandidates(pureTrialTenant);
+  assert.equal(candTrial.primaryStatus, "trialing");
+  assert.equal(candTrial.isPaidAccount, false);
+
+  // 3. تقييم تمديد التجربة الخادمي (trialExtendedAt + trialExtensionDays) مع بقاء trialDays == 7
+  const extendedTrial = makeTenant({
+    subscriptionStatus: "trialing",
+    planId: "trial",
+    trialDays: 7,
+    createdAt: Timestamp.fromMillis(start - 25 * DAY_MS), // التجربة الأصلية منتهية منذ 18 يوماً
+    trialExtendedAt: Timestamp.fromMillis(start),
+    trialExtensionDays: 7,
+    activeUntil: null,
+  });
+  const triInfo = getTrialExpiryMs(extendedTrial);
+  assert.equal(triInfo.hasExtension, true);
+  assert.equal(triInfo.trialEndsAtMs, start + 7 * DAY_MS);
+
+  const extDay3 = evaluateTenantAccess(extendedTrial, start + 3 * DAY_MS);
+  assert.equal(extDay3.allowed, true);
+  assert.equal(extDay3.state, "trialing");
+  assert.equal(extDay3.daysLeft, 4);
+
+  const extDay8 = evaluateTenantAccess(extendedTrial, start + 7 * DAY_MS + 1000);
+  assert.equal(extDay8.allowed, false);
+  assert.equal(extDay8.state, "expired");
+
+  // تمديد 14 يوماً يعرض أياماً متبقية دقيقة حتى 14 يوماً مع بقاء trialDays == 7
+  const extended14 = makeTenant({
+    subscriptionStatus: "trialing",
+    planId: "trial",
+    trialDays: 7,
+    createdAt: Timestamp.fromMillis(start - 20 * DAY_MS),
+    trialExtendedAt: Timestamp.fromMillis(start),
+    trialExtensionDays: 14,
+    activeUntil: null,
+  });
+  assert.equal(evaluateTenantAccess(extended14, start + 1 * DAY_MS).daysLeft, 13);
+  assert.equal(evaluateTenantAccess(extended14, start + 14 * DAY_MS + 1000).allowed, false);
+
+  // 4. التحقق الثابت من خلو الدوال الإدارية الثلاث من serverNowMs أو Date.now() لاتخاذ قرارات الصلاحية
+  const serviceText = fs.readFileSync(path.resolve("src/saas/service.ts"), "utf8");
+
+  const extendBlock = serviceText.slice(
+    serviceText.indexOf("export async function adminExtendTrial"),
+    serviceText.indexOf("export async function adminSuspendTenant")
+  );
+  assert.equal(extendBlock.includes("serverNowMs"), false, "adminExtendTrial يجب ألا يعتمد على serverNowMs");
+  assert.equal(extendBlock.includes("Date.now"), false, "adminExtendTrial يجب ألا يعتمد على Date.now()");
+  assert.equal(extendBlock.includes("elapsedDays"), false, "adminExtendTrial يجب ألا يحسب elapsedDays من ساعة المتصفح");
+  assert.ok(extendBlock.includes("trialExtendedAt: serverTimestamp()"));
+  assert.ok(extendBlock.includes("trialExtensionDays: extraDays"));
+  assert.ok(extendBlock.includes("hasPaidHistory"), "يجب منع تمديد التجربة للحسابات المدفوعة");
+
+  const reactivateBlock = serviceText.slice(
+    serviceText.indexOf("export async function adminReactivateTenant"),
+    serviceText.indexOf("export async function adminReviewActivationRequest")
+  );
+  assert.equal(reactivateBlock.includes("serverNowMs"), false, "adminReactivateTenant يجب ألا يعتمد على serverNowMs");
+  assert.equal(reactivateBlock.includes("Date.now"), false, "adminReactivateTenant يجب ألا يعتمد على Date.now()");
+  assert.ok(reactivateBlock.includes("resolveServerVerifiedStatusCandidates"));
+
+  const reviewBlock = serviceText.slice(
+    serviceText.indexOf("export async function adminReviewActivationRequest"),
+    serviceText.indexOf("export async function adminSavePlan")
+  );
+  assert.equal(reviewBlock.includes("serverNowMs"), false, "adminReviewActivationRequest يجب ألا يعتمد على serverNowMs");
+  assert.equal(reviewBlock.includes("Date.now"), false, "adminReviewActivationRequest يجب ألا يعتمد على Date.now()");
+  assert.ok(reviewBlock.includes("resolveServerVerifiedStatusCandidates"));
+
+  // 5. التحقق الثابت من AdminPanel.tsx بعدم تمرير serverNowMs للدوال الإدارية
+  const adminPanelText = fs.readFileSync(path.resolve("src/saas/AdminPanel.tsx"), "utf8");
+  assert.equal(adminPanelText.includes("adminExtendTrial(adminUser, t, days, serverNowMs)"), false);
+  assert.equal(adminPanelText.includes("adminReactivateTenant(adminUser, t, serverNowMs)"), false);
+  assert.equal(adminPanelText.includes("adminReviewActivationRequest(adminUser, req, decision, duration, serverNowMs)"), false);
+
+  // 6. التحقق الثابت من قواعد Firestore: Branch A1 و A2 و A3 وحماية حقول التوقيت
+  const rulesText = fs.readFileSync(path.resolve("firestore.rules"), "utf8");
+  assert.ok(rulesText.includes("function isValidTrialExtensionDays(d) {\n      return d is int && d in [3, 7, 14, 30];\n    }"));
+  assert.ok(rulesText.includes("function hasValidTrialAccess(tenantData)"));
+  assert.ok(rulesText.includes("incoming().trialExtendedAt == request.time"));
+  assert.ok(rulesText.includes("isValidTrialExtensionDays(incoming().trialExtensionDays)"));
+  assert.ok(rulesText.includes("trialExtendedAtUnchanged(incoming(), existing())"));
+  assert.ok(rulesText.includes("trialExtensionDaysUnchanged(incoming(), existing())"));
+  assert.ok(
+    rulesText.includes("incoming().subscriptionStatus == 'expired' &&\n                existing().subscriptionStatus in ['suspended', 'pending_payment', 'trialing', 'active'] &&\n                !hasValidPaidSubscription(existing()) &&\n                !hasValidTrialAccess(existing())"),
+    "يجب منع تحويل أي اشتراك مدفوع صالح أو تجربة صالحة إلى expired في قواعد Firestore"
+  );
 });
 
 console.log(`\nاكتملت جميع اختبارات الأمان والاشتراكات وخطة Spark بنجاح (${passed}/${passed}).`);

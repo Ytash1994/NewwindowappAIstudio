@@ -54,6 +54,8 @@
         "subscriptionStatus": { "type": "string", "enum": ["trialing", "pending_payment", "active", "expired", "suspended"] },
         "planId": { "type": "string", "maxLength": 40, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "trialDays": { "type": "number" },
+        "trialExtendedAt": { "type": "string", "format": "date-time" },
+        "trialExtensionDays": { "type": "number", "enum": [3, 7, 14, 30] },
         "activatedAt": { "type": "string", "format": "date-time" },
         "subscriptionDays": { "type": "number", "enum": [30, 90, 365] },
         "activeUntil": { "type": "string", "format": "date-time" },

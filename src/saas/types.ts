@@ -20,6 +20,8 @@ export type SubscriptionStatus =
 export type BillingCycle = "monthly" | "quarterly" | "yearly";
 export const ALLOWED_SUBSCRIPTION_DAYS = [30, 90, 365] as const;
 export type AllowedSubscriptionDays = (typeof ALLOWED_SUBSCRIPTION_DAYS)[number];
+export const ALLOWED_TRIAL_EXTENSION_DAYS = [3, 7, 14, 30] as const;
+export type AllowedTrialExtensionDays = (typeof ALLOWED_TRIAL_EXTENSION_DAYS)[number];
 export type ActivationStatus = "pending" | "approved" | "rejected";
 export type ActivationRequestType = "subscription" | "extra_types_addon";
 export type TenantRole = "owner" | "admin";
@@ -65,6 +67,10 @@ export interface TenantAccount {
   subscriptionStatus: SubscriptionStatus;
   planId: string;
   trialDays: number;
+  /** وقت بداية التمديد الإداري للتجربة المعتمد من الخادم (serverTimestamp / request.time) */
+  trialExtendedAt?: Timestamp | null;
+  /** مدة التمديد الإداري للتجربة بالأيام المعتمدة في القواعد: 3 أو 7 أو 14 أو 30 */
+  trialExtensionDays?: AllowedTrialExtensionDays | number | null;
   /** وقت التفعيل الرسمي المعتمد من الخادم (serverTimestamp / request.time) للحسابات الجديدة والمجددة */
   activatedAt?: Timestamp | null;
   /** مدة الاشتراك بالأيام المعتمدة في القواعد: 30 أو 90 أو 365 */
@@ -381,6 +387,14 @@ export function isAllowedSubscriptionDays(days: unknown): days is AllowedSubscri
   );
 }
 
+export function isAllowedTrialExtensionDays(days: unknown): days is AllowedTrialExtensionDays {
+  return (
+    typeof days === "number" &&
+    Number.isInteger(days) &&
+    (days === 3 || days === 7 || days === 14 || days === 30)
+  );
+}
+
 export const BLUEPRINT_LIMITS = {
   idMax: 128,
   planIdMax: 40,
@@ -441,6 +455,64 @@ export function getSubscriptionExpiryMs(
   return {
     endMs: tsToMs(tenant.activeUntil),
     isServerTimed: false,
+  };
+}
+
+/**
+ * استخراج وقت انتهاء الفترة التجريبية بالمللي ثانية:
+ * يأخذ الحد الأقصى بين نهاية التجربة الأصلية (createdAt + trialDays)
+ * ونهاية التمديد الإداري الخادمي (trialExtendedAt + trialExtensionDays) إن وُجد.
+ */
+export function getTrialExpiryMs(
+  tenant: Pick<TenantAccount, "createdAt" | "trialDays" | "trialExtendedAt" | "trialExtensionDays">
+): {
+  trialEndsAtMs: number | null;
+  hasExtension: boolean;
+  maxDisplayDays: number;
+} {
+  const trialDays = Math.max(0, Number(tenant.trialDays ?? DEFAULT_TRIAL_DAYS));
+  const createdMs = tsToMs(tenant.createdAt);
+  const baseEndsMs = createdMs !== null && trialDays > 0 ? createdMs + trialDays * 86400000 : null;
+
+  const extStartMs = tsToMs(tenant.trialExtendedAt);
+  const hasValidExt =
+    extStartMs !== null && isAllowedTrialExtensionDays(tenant.trialExtensionDays);
+  const extDays = hasValidExt ? (tenant.trialExtensionDays as AllowedTrialExtensionDays) : 0;
+  const extEndsMs = hasValidExt ? extStartMs + extDays * 86400000 : null;
+
+  const maxDisplayDays = Math.max(trialDays, extDays);
+
+  if (baseEndsMs !== null && extEndsMs !== null) {
+    return { trialEndsAtMs: Math.max(baseEndsMs, extEndsMs), hasExtension: true, maxDisplayDays };
+  }
+  if (extEndsMs !== null) {
+    return { trialEndsAtMs: extEndsMs, hasExtension: true, maxDisplayDays };
+  }
+  return { trialEndsAtMs: baseEndsMs, hasExtension: false, maxDisplayDays };
+}
+
+/**
+ * تحديد الحالة المرشحة لإعادة التفعيل أو رفض طلب الدفع بناءً على البنية فقط
+ * (دون أي اعتماد على ساعة جهاز المدير أو serverNowMs):
+ * الخادم عبر Firestore Rules (request.time) هو الحكم الوحيد الذي يقبل الحالة الفعّالة أو يرفضها.
+ */
+export function resolveServerVerifiedStatusCandidates(
+  tenant: Pick<TenantAccount, "planId" | "activatedAt" | "subscriptionDays" | "activeUntil">
+): {
+  primaryStatus: "active" | "trialing";
+  fallbackStatus: "expired";
+  isPaidAccount: boolean;
+} {
+  const isPaidAccount =
+    tenant.planId !== "trial" ||
+    (tenant.activatedAt !== undefined && tenant.activatedAt !== null) ||
+    (tenant.subscriptionDays !== undefined && tenant.subscriptionDays !== null) ||
+    tenant.activeUntil !== null;
+
+  return {
+    primaryStatus: isPaidAccount ? "active" : "trialing",
+    fallbackStatus: "expired",
+    isPaidAccount,
   };
 }
 
@@ -619,8 +691,8 @@ export function evaluateTenantAccess(
     }
 
     const trialDays = Math.max(0, Number(tenant.trialDays ?? DEFAULT_TRIAL_DAYS));
-    const createdMs = tsToMs(tenant.createdAt);
-    if (createdMs === null) {
+    const { trialEndsAtMs, hasExtension, maxDisplayDays } = getTrialExpiryMs(tenant);
+    if (trialEndsAtMs === null) {
       const approxEnds = nowMs + trialDays * 86400000;
       const approxDiff = trialDays * 86400000;
       return {
@@ -637,12 +709,12 @@ export function evaluateTenantAccess(
       };
     }
 
-    const trialEndsAtMs = createdMs + trialDays * 86400000;
     const diff = trialEndsAtMs - nowMs;
-    if (diff > 0 && trialDays > 0) {
-      const daysLeft = Math.min(trialDays, Math.max(1, Math.ceil(diff / 86400000)));
-      const hoursLeft = Math.min(trialDays * 24, Math.max(1, Math.ceil(diff / 3600000)));
-      const clampedDiff = Math.min(diff, trialDays * 86400000);
+    if (diff > 0 && (trialDays > 0 || hasExtension)) {
+      const capDays = Math.max(1, maxDisplayDays);
+      const daysLeft = Math.min(capDays, Math.max(1, Math.ceil(diff / 86400000)));
+      const hoursLeft = Math.min(capDays * 24, Math.max(1, Math.ceil(diff / 3600000)));
+      const clampedDiff = Math.min(diff, capDays * 86400000);
       return {
         allowed: true,
         state: "trialing",

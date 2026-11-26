@@ -39,6 +39,7 @@ import {
 import type {
   ActivationRequestDoc,
   AllowedSubscriptionDays,
+  AllowedTrialExtensionDays,
   AuditLogDoc,
   PlatformConfig,
   SubscriptionPlan,
@@ -296,15 +297,16 @@ export function AdminPanel({
     }
   };
 
-  const handleExtend = async (t: TenantAccount, days: number) => {
+  const handleExtend = async (t: TenantAccount, days: AllowedTrialExtensionDays) => {
     setBusyId(t.ownerUid);
     try {
-      await adminExtendTrial(adminUser, t, days, serverNowMs);
+      await adminExtendTrial(adminUser, t, days);
       auditLoadedRef.current = false;
       await loadCoreData();
       onToast(`تم تمديد التجربة +${days} أيام لـ ${t.workshopName || t.email} ✓`);
-    } catch {
-      onToast("تعذر تمديد التجربة");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      onToast(msg || "تعذر تمديد التجربة", 3800);
     } finally {
       setBusyId(null);
     }
@@ -327,12 +329,13 @@ export function AdminPanel({
   const handleReactivate = async (t: TenantAccount) => {
     setBusyId(t.ownerUid);
     try {
-      await adminReactivateTenant(adminUser, t, serverNowMs);
+      await adminReactivateTenant(adminUser, t);
       auditLoadedRef.current = false;
       await loadCoreData();
       onToast(`تمت إعادة تفعيل حساب ${t.workshopName || t.email} ✓`);
-    } catch {
-      onToast("تعذر إعادة تفعيل الحساب");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      onToast(msg || "تعذر إعادة تفعيل الحساب", 3800);
     } finally {
       setBusyId(null);
     }
@@ -357,7 +360,7 @@ export function AdminPanel({
     setBusyId(req.id);
     try {
       const duration = BILLING_CYCLE_LABELS[req.billingCycle]?.days || 30;
-      await adminReviewActivationRequest(adminUser, req, decision, duration, serverNowMs);
+      await adminReviewActivationRequest(adminUser, req, decision, duration);
       auditLoadedRef.current = false;
       await loadCoreData();
       const isAddon = req.requestType === "extra_types_addon";
